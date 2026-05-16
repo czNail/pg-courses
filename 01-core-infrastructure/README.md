@@ -12,3 +12,10 @@
 6. DSM / shm_toc / shm_mq / DSA。
 7. ParallelContext 与并行执行基础设施。
 8. CatCache / RelCache / Shared Invalidation。
+
+第 1 项 `Shmem 初始化与 shared state 边界` 建议先拆成 4 个独立主题，后续生成课程时按“一个主问题一课”处理：
+
+1. [启动期 sizing 与一次性 segment 创建](01-shmem-sizing-segment.md)：为什么 shared state 必须先声明大小，再由 postmaster 创建固定 shared memory segment？
+2. Shmem allocator 与 `ShmemIndex`：一个名字如何绑定到一块跨进程共享状态，为什么传统 shmem 只能分配、不能释放？
+3. request / init / attach 生命周期：postmaster、fork backend 和 `EXEC_BACKEND` 如何在不同进程中建立同一组 shared state 指针？
+4. 扩展与边界：`shared_preload_libraries`、`shmem_request_hook`、`shmem_startup_hook` 和 late allocation 的边界在哪里，什么时候该转向 DSM？

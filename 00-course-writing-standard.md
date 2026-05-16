@@ -1,12 +1,20 @@
-# PostgreSQL 内核课程编写标准
+# PostgreSQL 内核课程生成标准
 
-用途：后续新增、补写、重写 PostgreSQL 内核课程时，都按本文档做质量标准。
+用途：作为 AI 新增、补写、重写 PostgreSQL 内核课程时的生成约束。
 
-目标读者：有 PostgreSQL 使用经验，准备进入源码级内核研发、问题定位和性能诊断的工程师。
+生成目标：面向有 PostgreSQL 使用经验，准备进入源码级内核研发、问题定位和性能诊断的工程师。
 
 核心原则：
 
-> 课程不是源码百科，也不是 API 清单。课程要帮助内核研发人员建立稳定 mental model，能沿真实源码主链路定位问题，并理解模块边界、状态变化、生命周期、错误路径和观测手段。
+> 课程不是源码百科，也不是 API 清单。课程首先围绕一个核心内核矛盾展开，形成可线性阅读的推理链：问题 -> 状态 -> 主流程 -> 边界 -> 异常 -> 诊断。模板只是辅助，不是目标。
+
+课程组可以覆盖多个讨论主题，但每节课必须只有一个唯一主问题，并围绕一个“不可同时完全满足”的系统 tension 展开。如果出现第二个同等重要的问题，就拆成下一节课。课程不是覆盖率竞赛；如果一个状态、字段、函数不能帮助解释本节核心矛盾，就不要展开。
+
+不要把课程写成 systems research discussion。trade-off、演化和社区哲学只能服务一个可复现、可验证的 runtime 现象；否则删掉。
+
+也不要把课程写成 runtime case 堆积。每节课最后必须把具体 runtime 现象压缩回一个可迁移的系统规律，形成 `runtime -> reusable abstraction` 的闭环。
+
+允许课程从 bug、profiling、regression、commit、mailing list discussion 或异常 runtime 行为直接展开；不强制所有课程都先从抽象模型开始。
 
 一节课最终只沉淀三类长期有用的内容：
 
@@ -16,52 +24,75 @@
 | runtime | 一条真实生命周期或调用主链路 |
 | case | 一个可复现、可观测、能回到源码解释的问题 |
 
+好的课程要讲清楚 PostgreSQL 为什么形成今天的样子：很多设计是历史连续性、correctness、性能、扩展生态和兼容性的共同结果。
+
 ---
 
 ## 1. 合格课程的核心要求
 
-每节课至少回答 6 个问题：
+每节课至少回答这些问题：
 
 ```text
 这个机制解决什么内核问题？
+本节唯一主问题是什么？
+为什么需要这个 abstraction，而不是更简单的实现？
+课程是否沿一条线展开，而不是在清单项之间跳转？
+是否存在一个状态随时间推进的完整故事？
+本节可亲手复现并验证的 runtime 现象是什么？
 核心状态放在哪里，谁能访问？
 正常路径中状态如何变化？
 谁创建、谁持有、谁释放，ERROR/abort 时怎么办？
-它和哪些相邻模块形成正确性边界？
-线上或实验环境中如何观察、验证、诊断？
+它依赖哪些正确性机制：visibility、lock、pin、refcount、WAL、ordering？
+它的 hot path 成本如何随 backend 数、relation 数、tuple 数、WAL 量等因素扩张？
+它和哪些相邻模块形成边界或资源传播？
+如果涉及 shared state，哪些后台进程参与推进这个状态？
+哪些状态能观测、只能推断、完全不可见？
+是否能在 SQL、日志、pg_stat、perf、gdb 或断点中看到一个关键状态变化？
+哪些复杂性是 PostgreSQL 社区愿意接受的，哪些通常不值得？
+本节最后能沉淀出哪个可迁移的系统规律？
+哪些结论是 workload-dependent、hardware-dependent、version-dependent 或只能近似推断？
+哪些问题来自 kernel implementation，哪些来自 workload、schema、SQL pattern 或 operational configuration？
 ```
 
-如果一节课缺少以下任意三项，通常还没有达到内核研发培训标准：
+课程至少应包含：
 
 - 具体问题，而不是泛泛介绍模块。
+- 一个唯一主问题；其它内容只能服务这个问题。
 - 当前源码中真实存在的核心文件和入口函数。
 - 至少一条能跟到源码的主流程 walkthrough。
+- 至少一个状态随时间推进的完整故事。
+- 至少一个能“看到 -> 解释 -> 回到源码”的 runtime 现象。
+- 章节顺序能自然推进，后一节回答前一节留下的问题。
 - 关键数据结构的语义解释和状态边界。
 - 生命周期 / ownership / cleanup。
 - 至少一种异常路径或 fallback。
-- 跨模块连接。
+- 跨模块连接，以及主题相关的成本、资源或正确性机制层次。
 - 可执行的实验或源码练习。
-- 讨论题和本节小结。
+- 本节小结。
 
 ---
 
 ## 2. 推荐章节结构
 
-新课默认使用下面结构。可以按主题微调，但不要把“主链路、生命周期、异常路径、观测入口”省掉。
+新课默认使用下面结构。可以按主题微调，但不要把“核心矛盾、主链路、生命周期、异常路径、观测入口”省掉。
+
+章节结构必须服务线性阅读：先建立问题和状态，再进入主流程；正确性、异常路径、成本和观测都要回扣同一条主流程。不要把各节写成互不相干的资料卡片。
+
+章节顺序可以按课程材料调整。如果最好的入口是一个 bug、性能 regression、profiling 火焰图、错误 patch 或 mailing list 争论，可以先从现场现象讲起，再回到状态、边界和源码。
 
 ```text
 # PostgreSQL <主题>
 
 ## 课程定位
 ## 1. 本节在总主线中的位置
-## 2. 核心文件分工
-## 3. 一句话运行模型
+## 2. 核心矛盾与一句话运行模型
+## 3. 核心文件分工与阅读顺序
 ## 4. 关键数据结构与状态
 ## 5. 主流程源码 walkthrough
 ## 6. 生命周期 / ownership / cleanup
-## 7. 正确性边界：并发、锁、WAL、可见性或缓存
+## 7. 正确性机制层次
 ## 8. 错误路径 / 异常路径 / fallback
-## 9. 与其他模块的连接
+## 9. 成本、资源与跨模块传播
 ## 10. 观测与诊断入口
 ## 11. 常见误区
 ## 12. 课堂实验
@@ -69,7 +100,19 @@
 ## 14. 本节小结
 ```
 
+轻量 runtime note、profiling case study、bug investigation、single-path walkthrough 可以压缩结构；小而尖的材料不必扩成完整大课，但必须保留：
+
+```text
+唯一主问题
+  -> 可复现 runtime 现象
+  -> 关键源码入口
+  -> 状态变化 / 边界
+  -> 可迁移小结
+```
+
 有些主题不涉及并发、WAL 或观测指标，可以说明“不涉及的原因”。不要为了模板硬凑内容。
+
+写作时每节开头可以用一句话承接上一节，结尾用一句话引出下一节。避免频繁前后跳转、提前解释尚未定义的状态，或在后文才补上前文理解所需的关键概念。
 
 ---
 
@@ -79,39 +122,25 @@
 
 ```text
 前置知识是什么？
-本节解决哪个具体问题？
+本节唯一主问题是什么？
+本节围绕哪个核心内核矛盾？
 学完后能独立判断什么边界？
 ```
 
-推荐写法：
-
-````markdown
-## 课程定位
-
-前面课程解释了 ...
-本节继续回答：
-
-```text
-<一个具体问题>
-```
-
-学完后，应该能回答：
-
-- ...
-- ...
-
-一句话模型：
-
-> ...
-````
-
-好问题：
+课程问题要具体，例如：
 
 ```text
 已经不可见的旧 tuple version，什么时候可以真正移除？
+为什么 WAL 必须先于数据页落盘？
+为什么 buffer pin 和 buffer lock 必须分离？
+为什么 snapshot 获取会成为 ProcArray 的扩展性瓶颈？
 ```
 
-弱问题：
+好的问题应带有 tension，例如 reclaim vs visibility、latency vs crash safety、global visibility vs scalability、generic abstraction vs CPU efficiency。
+
+如果一个主题下有多个同等重要的问题，按问题拆成多节课。不要在一节课里同时讲多个主矛盾。
+
+不要写成：
 
 ```text
 学习 VACUUM 相关源码。
@@ -123,30 +152,25 @@
 
 每节课必须列核心源码文件。表里写职责，不写“实现相关函数”这种空话。
 
-````markdown
-## 核心文件分工
-
-| 文件 | 作用 |
-| --- | --- |
-| `src/backend/.../xxx.c` | ... |
-| `src/include/.../xxx.h` | ... |
-
-建议阅读顺序：
-
-```text
-xxx.h: 核心结构和状态位
-  -> xxx.c:init/create path
-  -> yyy.c:main runtime path
-  -> zzz.c:cleanup/error/invalidation path
-```
-````
-
 要求：
 
 - 文件和函数必须尽量对应当前本地 PostgreSQL 源码真实存在的位置。
 - 关键 `.h` 要列，因为内核研发经常先读状态结构和宏。
 - 阅读顺序按 mental model 展开，不按文件名排序。
 - 如果源码版本差异明显，要说明“本课基于哪个版本或分支”。
+- 区分稳定语义和当前版本实现路径；不要把当前调用链误写成系统本质。
+- 保留真实代码路径的 awkwardness：历史痕迹、重复逻辑、callback 链、double indirection、retry loop、状态耦合和 cleanup 顺序。不要把源码重写成理想化 architecture。
+- 源码阅读优先级：
+
+```text
+入口
+  -> 状态结构
+  -> ownership / cleanup
+  -> wait / retry / fallback
+  -> invalidation / stats / WAL
+```
+
+不要从函数顶部线性读到尾、背 API、孤立理解单文件。优先找 state transition、ownership、cleanup、invalidation、retry / fallback。
 
 ---
 
@@ -154,20 +178,12 @@ xxx.h: 核心结构和状态位
 
 不要整段复制结构体源码。只讲影响理解和诊断的字段组合。
 
-```markdown
-| 字段 / 状态 | 含义 | 边界 |
-| --- | --- | --- |
-| `xxx` | ... | ... |
-```
-
 必须优先讲清楚：
 
 - 这个状态是 backend-local、static shared memory、DSM，还是文件系统状态。
-- 是否有 owner、refcount、pin、generation、epoch、LSN、XID、SubXID。
-- 是否允许其他 backend 直接访问。
-- 指针能否跨进程使用，是否必须用 handle、offset 或 shared memory address。
-- 字段何时初始化、何时更新、何时失效。
-- 单个字段是否不能单独解释语义。
+- owner、refcount、pin、generation、epoch、LSN、XID、SubXID 等字段的组合语义。
+- 是否允许其他 backend 直接访问；指针能否跨进程使用。
+- 字段何时初始化、更新、失效，单个字段是否不能单独解释语义。
 
 内核课要强调：
 
@@ -180,7 +196,9 @@ field + flag + lifecycle state + lock/visibility context 才是语义。
 
 ## 6. 主流程 walkthrough
 
-每节课至少要有一条真实主流程。
+每节课至少要有一条真实主流程，并把“时间”作为主轴。优先讲一个对象或状态从创建、被引用、状态变化、并发观察、失效到 cleanup / reclaim 的过程。
+
+课程要在可观察行为和内部状态之间往返：SQL / runtime 现象 -> internal state transition -> 源码边界 -> 再回到可验证现象。避免停留在过高层概念，或陷入过低层字段细节。
 
 ```text
 入口函数()
@@ -212,14 +230,6 @@ ERROR / abort 时谁兜底？
 长期对象如何失效？
 ```
 
-推荐表格：
-
-```markdown
-| 对象 | 创建者 | owner | 释放 / 失效 |
-| --- | --- | --- | --- |
-| ... | ... | ... | ... |
-```
-
 必须区分这些机制：
 
 - MemoryContext 管内存生命周期。
@@ -229,37 +239,34 @@ ERROR / abort 时谁兜底？
 - WAL / redo 管 crash recovery。
 - lock / latch / condition variable 管并发等待。
 
-不要只写“事务结束时释放”。要尽量写到具体路径，例如：
-
-```text
-TopTransactionContext reset
-ResourceOwner release
-AtEOXact_* hook
-shared invalidation
-smgr close
-```
+不要只写“事务结束时释放”。要尽量写到具体路径，例如 `TopTransactionContext reset`、`ResourceOwner release`、`AtEOXact_*`、shared invalidation。
 
 ---
 
-## 8. 错误路径与异常路径
+## 8. 正确性机制层次
 
-内核研发课程必须讲非 happy path。按主题选择 1 到 3 个最关键的异常路径即可。
+PostgreSQL 的正确性通常不是一个机制单独保证的。课程要说明本节依赖哪些机制、各自保证什么、不能保证什么。
 
-常见异常路径：
+建议按主题选择说明：
 
-- `ereport(ERROR)` 后的 cleanup。
-- transaction abort / subtransaction abort。
-- OOM / critical section。
-- lock wait / deadlock / timeout。
-- cache invalidation / invalidation queue overflow。
-- WAL flush failure / crash recovery / redo。
-- replication disconnect / timeout / WAL removed。
-- snapshot overflow / subxid overflow。
-- hash / sort spill。
-- GEQO fallback。
-- checkpoint / fsync request failure。
+| 机制 | 主要保证 | 不要误解为 |
+| --- | --- | --- |
+| MVCC visibility / snapshot | 读到哪个版本 | 并发互斥 |
+| heavyweight lock | 逻辑对象级排他或兼容性 | 内存安全 |
+| LWLock / spinlock / atomic | shared memory 并发访问 | 事务语义 |
+| pin / refcount | 对象正在被使用 | 对象语义仍然有效 |
+| invalidation | 缓存语义过期通知 | 阻塞并发修改 |
+| WAL / redo | crash safety 和恢复顺序 | 前台延迟一定低 |
 
-推荐格式：
+如果涉及 memory ordering、critical section、WAL-before-data、ProcArray synchronization，要明确它们所在的边界。
+
+---
+
+## 9. 错误路径与异常路径
+
+内核研发课程必须讲非 happy path。按主题选择 1 到 3 个最关键的异常路径，例如 ERROR cleanup、abort、OOM、lock wait、cache invalidation、WAL failure、replication timeout、snapshot overflow、spill、fallback、fsync failure。
+
+不要把 fallback 当附录。要解释系统在压力、退化、overflow、信息不完整时，如何继续维持 correctness。
 
 ```text
 正常路径
@@ -273,57 +280,51 @@ smgr close
 
 ---
 
-## 9. 跨模块连接
+## 10. 成本、资源与跨模块传播
 
-每节课至少连接 2 到 4 个相邻模块，说明边界，而不是泛泛说“相关”。
+课程要说明这个机制为什么可能变慢，以及资源压力会如何扩散。不要把 correctness 讲完就结束。
 
-常见连接：
+性能成本模型按主题选择 2 到 4 项：
 
-- MemoryContext vs ResourceOwner。
-- PGPROC / ProcArray vs Snapshot / VACUUM horizon。
-- Buffer Manager vs WAL-before-data。
-- WAL writer / checkpointer vs foreground latency。
-- catcache / relcache vs Planner / Executor / logical decoding。
-- Planner estimated rows vs Executor actual rows。
-- Replication slot vs WAL retention / xmin retention。
-- wait event vs 源码里的 latch / LWLock / IO。
+- CPU：tuple deforming、visibility check、expression evaluation、hash lookup。
+- cache / branch：结构体布局、indirection、hash miss。
+- contention：LWLock、WALInsertLock、ProcArray、lock table。
+- slow path：spill、fallback、cache miss、redo、wait、retry。
+- amplification：行数、分区数、subxid 数、连接数、relation 数、WAL 量。
 
-推荐格式：
+讨论成本时要有数量级意识：说明它如何随 backend 数、relation 数、tuple 数、partition 数、WAL 量、subxid 数、cache miss 或 contention 扩张。
 
-```markdown
-| 本节机制 | 连接模块 | 为什么重要 |
-| --- | --- | --- |
-| ... | ... | ... |
-```
+如果当前瓶颈被优化，要说明新的瓶颈通常会迁移到哪里，避免把性能问题解释成单点问题。
+
+资源模型优先讲压力来源和传播路径：
+
+| 资源 | 常见传播 |
+| --- | --- |
+| shared memory / local memory | memory accounting、fragmentation、OOM、context reset |
+| WAL bandwidth / flush | foreground latency、replication lag、checkpoint pressure |
+| IO queue / temp file | sort / hash spill、vacuum、checkpoint burst |
+| xid horizon / snapshot | vacuum lag、bloat、clog retention |
+| lock / ProcArray | wait、snapshot scalability、backend fan-out |
+
+跨模块连接要说明边界，而不是泛泛说“相关”。每节课至少连接 2 到 4 个相邻模块。
+
+涉及 shared state 时，必须说明哪些后台进程参与状态推进，例如 bgwriter、checkpointer、walwriter、autovacuum、startup、logical launcher、archiver。
 
 ---
 
-## 10. 观测与诊断
+## 11. 观测与诊断
 
 只要主题能被观测，就要给入口，并说明指标粒度。
 
-常见入口：
+每节课必须锚定一个具体 runtime truth，而不只是给一组实验步骤。例如 snapshot scalability degradation、pin wait、spill、WAL flush stall、relcache invalidation、vacuum delay、ProcArray scan amplification。课程要让这个现象完成：
 
-- `EXPLAIN (ANALYZE, BUFFERS, WAL)`
-- `pg_stat_activity`
-- `pg_stat_io`
-- `pg_stat_wal`
-- `pg_stat_replication`
-- `pg_replication_slots`
-- `pg_locks`
-- `pg_stat_database`
-- wait event
-- server log
-- `MemoryContextStats()`
-- GUC / debug logging / injection point
-
-推荐格式：
-
-```markdown
-| 现象 | 先看 | 再回到源码 |
-| --- | --- | --- |
-| ... | ... | ... |
+```text
+看到现象
+  -> 用状态和边界解释
+  -> 回到源码验证
 ```
+
+常见入口包括 `EXPLAIN (ANALYZE, BUFFERS, WAL)`、`pg_stat_activity`、`pg_stat_io`、`pg_stat_wal`、`pg_locks`、wait event、server log、`MemoryContextStats()`、debug logging / injection point。
 
 必须说明粒度：
 
@@ -335,32 +336,28 @@ smgr close
 
 不要把统计指标解释成完整因果。课程要说明“能看到什么”和“看不到什么”。
 
+高级诊断必须区分三类状态：能直接观测、只能从现象推断、几乎不可见。不要让读者误以为 `pg_stat_*` 就等于 runtime reality。
+
+如果问题主要是 CPU / runtime overhead，要说明哪些现象必须依赖 `perf`、flamegraph、profiling 或断点实验，而不是只靠 `pg_stat_*`。
+
+真实系统分析经常是不完整信息下的近似推理。对 workload-dependent、hardware-dependent、timing-sensitive、版本相关或存在争议的解释，要明确标注推断边界，不要为了“完整解释”而伪确定化。
+
+不要把所有现象都解释成源码问题。课程应区分 kernel implementation、workload、schema shape、SQL pattern、xid age、checkpoint / autovacuum 配置、replication topology 等因素分别贡献了什么。
+
 ---
 
-## 11. 常见误区
+## 12. 常见误区
 
-误区不要求固定数量，优先选择 3 到 6 个真实研发风险。
-
-好误区：
+误区不要求固定数量，优先选择 3 到 6 个真实研发风险，例如：
 
 - 把 `xmax` 有值理解成 tuple 已删除。
-- 把 WalUsage 理解成 WAL fsync 时间。
 - 把 MemoryContext 当 ResourceOwner。
 - 把 invalidation 当 lock。
-- 把 estimated cost 当毫秒。
 - 把 wait event 当完整性能归因。
-
-推荐表格：
-
-```markdown
-| 误区 | 正确理解 |
-| --- | --- |
-| ... | ... |
-```
 
 ---
 
-## 12. 课堂实验
+## 13. 课堂实验
 
 每节课给 1 到 3 个实验，实验要服务源码理解，不要变成普通 DBA 操作题。
 
@@ -371,45 +368,13 @@ smgr close
 3. 边界实验：模拟 timeout、spill、slot retention、cache invalidation、long transaction。
 4. 修改源码实验：加日志、计数器或 assert，观察行为，不要求改产品代码。
 
-推荐格式：
-
-````markdown
-### 实验：<标题>
-
-操作：
-
-```sql
-...
-```
-
-观察：
-
-- ...
-
-回到源码：
-
-- `file.c:function()`
-````
-
 ---
 
-## 13. 讨论题
+## 14. 讨论题
 
 每节课给 4 到 8 个讨论题。题目要检查边界感，不考函数参数背诵。
 
-好问题：
-
-```text
-为什么 invalidation 到达时 refcount > 0 的 catcache entry 不能立即 free？
-```
-
-弱问题：
-
-```text
-SearchCatCacheInternal 的参数有哪些？
-```
-
-讨论题建议覆盖：
+讨论题优先覆盖：
 
 - 为什么需要这个机制。
 - 它和相邻模块的边界。
@@ -420,9 +385,27 @@ SearchCatCacheInternal 的参数有哪些？
 
 ---
 
-## 14. README 与课程顺序
+## 15. 可选深化段落
+
+不是每节课都需要这些段落；但如果主题天然相关，就应该显式写出来。
+
+| 段落 | 何时写 | 必须回答 |
+| --- | --- | --- |
+| 机制演化背景 | 设计明显有历史包袱或 trade-off | 最早解决什么问题，今天复杂性来自 correctness、性能、兼容性还是历史连续性 |
+| 替代方案未采用原因 | 存在明显更现代或更简单的方案 | PostgreSQL 为什么没有采用：compatibility、correctness、extension ABI、operational stability 还是 migration cost |
+| 社区工程取舍 | 本节涉及 patch design 或复杂性引入 | 哪些复杂性值得接受，哪些通常会因 contention、locality、maintainability 或 correctness cost 被拒绝 |
+| 版本演化注意 | PG14 到当前版本行为、入口或资料明显变化 | 哪些 patch 改变 runtime 行为，哪些旧资料不宜直接引用，本课基于哪个版本 |
+| extension / hook 边界 | 涉及 planner hook、executor hook、access method、logical decoding、background worker 等 | 哪些 API 稳定，哪些内部结构不能当 public contract |
+| 社区案例 | 有真实 bug、commit 或 mailing list discussion 能解释设计选择 | 当时的 trade-off，最终方案的代价 |
+| 未解决问题 / ongoing discussion | 当前实现仍有明显限制或社区争议 | 主要限制、扩展性问题、正在尝试改变它的 patch 或方向 |
+
+---
+
+## 16. README 与课程顺序
 
 每个目录的 `README.md` 保持简短，面向选课和导航，不写成长课程。
+
+一个目录可以规划多个讨论主题，但应按“一个主问题一节课”拆分。README 负责呈现这些问题之间的顺序关系，而不是把多个主问题塞进同一节。
 
 README 只需要包含：
 
@@ -434,54 +417,46 @@ README 只需要包含：
 
 ---
 
-## 15. 写作前检查
+## 17. AI 生成流程
 
-开始写课前先做：
+生成或重写课程时按顺序执行：
 
 ```text
 1. 打开本地 PostgreSQL 源码，确认文件真实存在。
 2. 用 rg 找主入口函数。
-3. 找关键结构体定义。
-4. 找 cleanup / error / invalidation / wait / stats 路径。
-5. 找和其他模块的连接点。
-6. 决定一条主 walkthrough。
-7. 决定 1-3 个课堂实验。
+3. 确认本节唯一主问题；如果问题过多，拆课。
+4. 找关键结构体定义。
+5. 找 cleanup / error / invalidation / wait / stats 路径。
+6. 找 hot path、slow path 和主要资源压力。
+7. 找成本随规模扩张的变量。
+8. 如果涉及 shared state，找参与状态推进的后台进程。
+9. 找和其他模块的连接点。
+10. 决定一个可复现、可验证的 runtime 现象。
+11. 决定一条主 walkthrough。
+12. 决定本节要压缩出的可迁移系统规律。
+13. 标注 workload / hardware / timing / version 相关的推断边界。
+14. 判断是否写成完整课程，还是轻量 runtime note / case study。
+15. 决定 1-3 个课堂实验。
 ```
 
-不要只凭记忆写源码课。
+不要只凭记忆生成源码课。
 
 ---
 
-## 16. 写作后检查
+## 18. AI 自动校验
 
-每次新增或大改课程后检查：
+生成后必须自动执行：
 
 ```bash
 rg -n '^```' <file>
 git diff --check -- <file>
 ```
 
-人工 review：
-
-```text
-[ ] 课程定位清楚，核心问题具体
-[ ] 核心文件、入口函数、阅读顺序可信
-[ ] 至少一条真实源码主链路
-[ ] 关键结构讲语义和边界，而不是字段清单
-[ ] 生命周期和 ownership 讲清楚
-[ ] 至少覆盖一种 ERROR / abort / overflow / fallback
-[ ] 和至少两个相邻模块建立连接
-[ ] 有观测或诊断入口，并说明指标粒度
-[ ] 有常见误区
-[ ] 有课堂实验
-[ ] 有讨论题
-[ ] 本节小结能沉淀 model / runtime / case
-[ ] Markdown 围栏和 diff check 通过
-```
+内容质量按第 1 节核心要求和第 2 节章节结构自检，不再保留单独勾选清单。
 
 ---
 
-## 17. 风格标准
+## 19. 风格标准
 
 - 使用中文。
 - 面向内核研发人员，不写成入门科普。
@@ -495,41 +470,18 @@ git diff --check -- <file>
 
 ---
 
-## 18. 课程结尾模板
+## 20. 课程结尾模板
 
 结尾不需要长，但必须把本节压缩成可复用的 mental model。
 
-````markdown
-## 本节小结
+小结至少沉淀：
 
-本节核心链路：
+- 本节核心链路。
+- 核心状态和边界。
+- ownership / cleanup / invalidation。
+- 错误路径如何收尾。
+- 哪些指标能观测，哪些不能。
+- 从本节 runtime 现象抽象出的可迁移系统规律。
+- 哪些判断仍然依赖 workload、硬件、版本或只能近似推断。
 
-```text
-入口
-  -> 核心状态变化
-  -> cleanup / invalidation / WAL / stats
-```
-
-核心边界：
-
-```text
-模块 A
-  -> 管 ...
-
-模块 B
-  -> 管 ...
-```
-
-继续追问：
-
-```text
-对象在哪里？
-谁拥有？
-谁释放？
-什么时候失效？
-错误路径如何收尾？
-哪些指标能观测？
-```
-````
-
-这个模板不是强制文案，但结尾必须让学员带走能迁移到下一节课的判断框架。
+不要重复正文；让学员带走能迁移到下一节课的判断框架。
