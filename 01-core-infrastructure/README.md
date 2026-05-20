@@ -27,3 +27,11 @@
 3. [事务、Portal 与长生命周期状态](07-memorycontext-transaction-portal.md)：为什么有些 backend-local 状态必须活过单条语句，但不能无限期挂在 `TopMemoryContext` 下？
 4. [ERROR 路径与 MemoryContext cleanup](08-memorycontext-error-cleanup.md)：`ERROR` longjmp 后，哪些内存会被 context reset/delete 自动回收，哪些资源不能只靠 MemoryContext 兜底？
 5. [allocator 类型、成本与内存诊断](09-memorycontext-allocator-diagnostics.md)：`AllocSet`、`Generation`、`Slab` 等 allocator 如何匹配分配模式，如何用 `pg_backend_memory_contexts`、`MemoryContextStats()` 和 gdb 区分 leak、retention 与正常峰值？
+
+第 3 项 `ResourceOwner 与 ERROR-safe cleanup` 建议先拆成 5 个独立主题，后续生成课程时按“一个主问题一课”处理：
+
+1. [ResourceOwner tree 与外部资源 ownership 边界](10-resourceowner-tree-ownership.md)：为什么内存可以交给 `MemoryContext` 批量 reset，而 buffer pin、lock、snapshot、文件句柄、cache ref 这类资源必须挂到独立的 `ResourceOwner` tree 上？
+2. [Remember / Forget hot path 与 acquire-before-ERROR 安全](11-resourceowner-remember-forget-hotpath.md)：为什么 `ResourceOwnerEnlarge()` 必须在真正获取资源前调用，`ResourceOwnerRemember()` / `ResourceOwnerForget()` 如何在 buffer pin、tupledesc refcount、临时文件等路径上把“获取成功但随后 ERROR”的窗口收住？
+3. [事务、子事务与 Portal owner 传播](12-resourceowner-xact-portal-propagation.md)：`CurrentResourceOwner` 如何在 top transaction、subtransaction 和 Portal 执行之间切换，为什么子事务提交时锁要转移给父 owner，而 abort 时必须释放？
+4. [三阶段 release 与锁释放顺序](13-resourceowner-release-ordering.md)：为什么 `ResourceOwnerRelease()` 要分成 before-locks、locks、after-locks 三段，buffer pin、relcache ref、DSM、JIT、catcache ref、snapshot、文件等资源的释放顺序如何服务并发可见性和 backend-local cleanup？
+5. [ERROR-safe cleanup、`PG_TRY` 与诊断边界](14-resourceowner-error-safe-cleanup.md)：`PG_TRY` / `PG_CATCH` 负责恢复 `CurrentResourceOwner` 等全局执行状态，事务 abort 和 `ResourceOwnerRelease()` 负责兜底释放资源；commit warning、`ResourceOwnerDesc` callback 和 gdb / 日志能看到什么、看不到什么？
