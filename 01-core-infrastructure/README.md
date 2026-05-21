@@ -35,3 +35,11 @@
 3. [事务、子事务与 Portal owner 传播](12-resourceowner-xact-portal-propagation.md)：`CurrentResourceOwner` 如何在 top transaction、subtransaction 和 Portal 执行之间切换，为什么子事务提交时锁要转移给父 owner，而 abort 时必须释放？
 4. [三阶段 release 与锁释放顺序](13-resourceowner-release-ordering.md)：为什么 `ResourceOwnerRelease()` 要分成 before-locks、locks、after-locks 三段，buffer pin、relcache ref、DSM、JIT、catcache ref、snapshot、文件等资源的释放顺序如何服务并发可见性和 backend-local cleanup？
 5. [ERROR-safe cleanup、`PG_TRY` 与诊断边界](14-resourceowner-error-safe-cleanup.md)：`PG_TRY` / `PG_CATCH` 负责恢复 `CurrentResourceOwner` 等全局执行状态，事务 abort 和 `ResourceOwnerRelease()` 负责兜底释放资源；commit warning、`ResourceOwnerDesc` callback 和 gdb / 日志能看到什么、看不到什么？
+
+第 4 项 `PGPROC / ProcArray 与 backend 状态` 建议先拆成 5 个独立主题，后续生成课程时按“一个主问题一课”处理：
+
+1. [PGPROC slot 与 backend identity 生命周期](15-pgproc-backend-identity.md)：为什么每个 backend 必须先获得一个 `PGPROC` 槽位，才能参与 shared memory 中的锁、等待、事务状态发布和退出清理？
+2. [ProcArray membership 与事务状态发布](16-procarray-membership-xact-state.md)：一个 backend 什么时候进入 `ProcArray`，如何把 XID、SubXID、xmin、vacuum flags 等事务状态发布给其它 backend，为什么这些字段不能只保存在 backend-local 状态里？
+3. [Snapshot 获取与 ProcArray scan 扩展性](17-procarray-snapshot-scalability.md)：为什么一个普通 snapshot 需要扫描全局 backend 状态，`GetSnapshotData()` 如何在 visibility correctness 与 `MaxBackends` 扩展性之间折中？
+4. [xmin horizon 与 cleanup 边界](18-procarray-xmin-horizon-cleanup.md)：为什么一个 backend 的 active snapshot、replication / recovery 相关状态会阻止 VACUUM 移除旧 tuple version，ProcArray 如何把局部 xmin 汇总成全局 cleanup horizon？
+5. [事务结束、backend 退出与 stale state 清理](19-pgproc-procarray-exit-cleanup.md)：commit、abort、FATAL exit 和 postmaster cleanup 如何把 `PGPROC` / `ProcArray` 状态恢复到可复用边界，哪些状态必须先对其它 backend 不再可见，哪些资源仍要交给后续 cleanup 阶段？
