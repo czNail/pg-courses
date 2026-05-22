@@ -43,3 +43,13 @@
 3. [Snapshot 获取与 ProcArray scan 扩展性](17-procarray-snapshot-scalability.md)：为什么一个普通 snapshot 需要扫描全局 backend 状态，`GetSnapshotData()` 如何在 visibility correctness 与 `MaxBackends` 扩展性之间折中？
 4. [xmin horizon 与 cleanup 边界](18-procarray-xmin-horizon-cleanup.md)：为什么一个 backend 的 active snapshot、replication / recovery 相关状态会阻止 VACUUM 移除旧 tuple version，ProcArray 如何把局部 xmin 汇总成全局 cleanup horizon？
 5. [事务结束、backend 退出与 stale state 清理](19-pgproc-procarray-exit-cleanup.md)：commit、abort、FATAL exit 和 postmaster cleanup 如何把 `PGPROC` / `ProcArray` 状态恢复到可复用边界，哪些状态必须先对其它 backend 不再可见，哪些资源仍要交给后续 cleanup 阶段？
+
+第 5 项 `SpinLock / LWLock / Latch / Condition Variable / Barrier` 建议先拆成 7 个独立主题，后续生成课程时按“一个主问题一课”处理：
+
+1. [SpinLock 与极短 shared state 临界区](20-spinlock-short-critical-section.md)：为什么 PostgreSQL 只允许 spinlock 保护几条指令级的共享字段更新，`s_lock.h` / `spin.h` / `s_lock.c` 如何在 CPU 原子指令、memory barrier、退避和 stuck spinlock PANIC 之间取舍？
+2. [LWLock state、tranche 与共享读写互斥](21-lwlock-state-tranche-rw.md)：为什么很多 shared memory 结构不能只靠 spinlock，而需要支持 shared / exclusive 模式、wait event 命名和 cache-line padding 的 `LWLock`，`LWLockAttemptLock()` 如何用一个 atomic state 表达读者数、独占持有者和等待标志？
+3. [LWLock 等待队列、唤醒协议与 ERROR-safe release](22-lwlock-waitqueue-wakeup-cleanup.md)：`LWLockAcquire()` 为什么必须“先尝试、入队、再尝试、再睡眠”，`PGPROC.lwWaiting`、process semaphore、`LW_FLAG_WAKE_IN_PROGRESS` 和 `held_lwlocks` 如何共同避免 missed wakeup、重复唤醒和 ERROR 后遗留锁？
+4. [Latch 与进程级异步唤醒](23-latch-process-wakeup.md)：为什么后台进程不能靠周期性 `pg_usleep()` 轮询信号和共享标志，`SetLatch()` / `ResetLatch()` / `WaitLatch()` 以及 `PGPROC.procLatch` 如何把 signal、postmaster death、timeout 和 socket readiness 统一成可靠可观测的等待点？
+5. [ConditionVariable 与谓词等待循环](24-condition-variable-predicate-wait.md)：为什么等待“某个条件变真”不能只暴露一个 latch，`ConditionVariableSleep()` / `Signal()` / `Broadcast()` 如何用 `PGPROC.cvWaitLink`、spinlock 保护的 wait list 和 spurious wakeup 规则，让 buffer I/O、checkpoint、replication slot 等路径等待共享状态变化？
+6. [Barrier 与多进程阶段推进](25-barrier-phase-synchronization.md)：并行 hash join 这类多阶段算法为什么需要所有参与者在阶段边界对齐，`BarrierArriveAndWait()`、`BarrierAttach()`、`BarrierDetach()` 如何用 `phase`、`participants`、`arrived` 和 condition variable 支持 static party 与 dynamic party？
+7. [同步原语选择与组合边界](26-sync-primitive-composition.md)：面对一个新的共享状态等待点，如何判断应该使用 spinlock、LWLock、latch、condition variable 还是 barrier，PostgreSQL 为什么经常把它们分层组合成“短临界区修改状态、长等待交给 latch/CV、阶段推进交给 barrier”的模式？
