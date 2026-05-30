@@ -53,3 +53,14 @@
 5. [ConditionVariable 与谓词等待循环](24-condition-variable-predicate-wait.md)：为什么等待“某个条件变真”不能只暴露一个 latch，`ConditionVariableSleep()` / `Signal()` / `Broadcast()` 如何用 `PGPROC.cvWaitLink`、spinlock 保护的 wait list 和 spurious wakeup 规则，让 buffer I/O、checkpoint、replication slot 等路径等待共享状态变化？
 6. [Barrier 与多进程阶段推进](25-barrier-phase-synchronization.md)：并行 hash join 这类多阶段算法为什么需要所有参与者在阶段边界对齐，`BarrierArriveAndWait()`、`BarrierAttach()`、`BarrierDetach()` 如何用 `phase`、`participants`、`arrived` 和 condition variable 支持 static party 与 dynamic party？
 7. [同步原语选择与组合边界](26-sync-primitive-composition.md)：面对一个新的共享状态等待点，如何判断应该使用 spinlock、LWLock、latch、condition variable 还是 barrier，PostgreSQL 为什么经常把它们分层组合成“短临界区修改状态、长等待交给 latch/CV、阶段推进交给 barrier”的模式？
+
+第 6 项 `DSM / shm_toc / shm_mq / DSA` 建议先拆成 8 个独立主题，后续生成课程时按“一个主问题一课”处理：
+
+1. [DSM segment 创建、attach 与 refcount 生命周期](27-dsm-segment-lifecycle.md)：为什么 PostgreSQL 需要运行期创建的共享内存段，`dsm_create()` / `dsm_attach()` / `dsm_detach()` 如何用 control segment、handle、refcount 和 `ResourceOwner` 在“跨进程可见”与“ERROR-safe cleanup”之间取得平衡？
+2. [DSM pin、detach callback 与长期共享状态边界](28-dsm-pin-callback-registry-boundary.md)：为什么 DSM 要区分 mapping pin 和 segment pin，`dsm_pin_mapping()`、`dsm_pin_segment()`、`on_dsm_detach()` 以及 postmaster cleanup 如何避免短事务资源释放、后台进程退出和长期共享对象互相踩边界？
+3. [shm_toc 与 DSM 内对象发现](29-shm-toc-object-discovery.md)：同一个 DSM 段在不同 backend 中可能映射到不同虚拟地址时，为什么不能直接共享普通指针，`shm_toc_create()` / `allocate()` / `insert()` / `lookup()` 如何用 magic、key 和相对 offset 完成最小 bootstrap？
+4. [shm_mq 单生产者单消费者 ring buffer](30-shm-mq-ring-buffer-flow-control.md)：为什么共享消息队列限定为 single-reader / single-writer，`mq_bytes_read`、`mq_bytes_written`、ring wrap、memory barrier 和 latch 唤醒如何在无锁数据搬运、背压和消息边界之间折中？
+5. [shm_mq attach、detach 与 worker 失败传播](31-shm-mq-attach-detach-failure.md)：发送方或接收方可能尚未启动、提前退出或 ERROR 时，`shm_mq_wait_for_attach()`、`BackgroundWorkerHandle`、`SHM_MQ_WOULD_BLOCK` / `SHM_MQ_DETACHED` 和 on-detach callback 如何把“等不到对端”变成可诊断的状态？
+6. [DSA area、dsa_pointer 与跨进程共享 heap](32-dsa-area-pointer-ownership.md)：为什么 DSM 只适合整段共享而不适合小对象动态分配，`dsa_create()` / `dsa_attach()` / `dsa_get_address()` 如何用 area handle、segment map 和 `dsa_pointer` 支持可在进程间传递但不能直接解引用的共享指针？
+7. [DSA allocator：size class、span 与 superblock](33-dsa-allocator-spans-superblocks.md)：`dsa_allocate()` / `dsa_free()` 如何把小对象、large allocation、FreePageManager、pagemap、span freelist 和 per-size-class LWLock 组合成一个共享 allocator，哪些锁竞争和碎片化成本会随 workload 放大？
+8. [DSA segment 增长、回收与 named DSM registry](34-dsa-segment-reclaim-registry.md)：DSA area 如何按需创建、pin、trim 和释放多个 DSM segment，`freed_segment_counter` 如何防止 segment slot 重用造成旧映射误读，`GetNamedDSMSegment()` / `GetNamedDSA()` 又如何把这种动态共享状态提升为可复用的命名基础设施？
