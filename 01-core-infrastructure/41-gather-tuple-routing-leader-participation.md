@@ -14,6 +14,8 @@ ExecParallelSetupTupleQueues()、ExecParallelCreateReaders()、TupleQueueReader
 
 核心矛盾：并行计划需要把多个 worker 产生的 tuple 汇聚回单个 leader 输出，但 worker 启动和 DSM 分配成本很高，worker 数可能不足，tuple queue 可能背压，leader 是否也执行子计划会影响吞吐和延迟。`Gather` 选择无序 funnel，`GatherMerge` 选择保持有序 merge，它们都必须在 worker stream 与 leader local execution 之间维持 executor 的 pull 模型。
 
+学完后应能判断：`Gather` 和 `GatherMerge` 何时启动 worker、何时只读 worker queue、何时由 leader 本地执行，以及 queue 背压、少 worker 和 leader participation 分别会把成本推到哪里。
+
 本课基于本地 `~/postgres-lab` 源码，分支 `master`，提交 `bd4bd30ce6a7`。
 
 ## 1. 本节在总主线中的位置
@@ -419,9 +421,23 @@ if parallel_leader_participation || nreaders == 0:
 
 与 `Gather` 相比，它没有 `single_copy` 条件，但本地执行产生的 tuple 也必须加入 merge 结构。leader 本地 stream 是有序输入之一。
 
-## 12. 错误路径 / 异常路径 / fallback
+## 12. 正确性机制层次
 
-### 12.1 worker 未启动
+本节的正确性不靠 tuple queue 单独保证，而是由几层边界叠加：
+
+| 层次 | 保证什么 | 不能保证什么 |
+| --- | --- | --- |
+| executor pull 模型 | 上层每次只消费一个 tuple，`Gather` / `GatherMerge` 能在 worker queue 与本地执行之间切换。 | 不保证 worker 一定及时产出。 |
+| shm_mq / TupleQueueReader | bounded queue、sender/receiver detach 和 reader done 语义。 | 不解释 tuple 可见性或排序正确性。 |
+| `ExecParallelFinish()` | tuple stream 结束后仍等待 worker finish，处理最后 ERROR 和 usage。 | 不释放 `ParallelContext`，也不替代 cleanup。 |
+| sort key / merge heap | `GatherMerge` 维持全局有序输出。 | 不消除 copy、compare 和 leader merge 成本。 |
+| `CHECK_FOR_INTERRUPTS()` | leader 在拉取过程中处理 parallel message。 | 不把普通 tuple data 变成 error queue 消息。 |
+
+因此，`Gather` 的主边界是“tuple stream 是否还能返回数据”，`GatherMerge` 还多一个“每个 stream 当前 tuple 是否仍能参与全局比较”的顺序边界。
+
+## 13. 错误路径 / 异常路径 / fallback
+
+### 13.1 worker 未启动
 
 `nworkers_launched == 0`：
 
@@ -432,7 +448,7 @@ node->need_to_scan_locally = true
 
 查询仍可由 leader 完成。
 
-### 12.2 worker 初始化失败
+### 13.2 worker 初始化失败
 
 `TupleQueueReaderNext()` 对未初始化 worker 可能返回 NULL / done。`Gather` 注释明确：
 
@@ -443,7 +459,7 @@ WaitForParallelWorkersToFinish() 会在后面报错。
 
 这避免 tuple routing 路径直接承担 bgworker startup diagnosis。
 
-### 12.3 leader 提前停止消费
+### 13.3 leader 提前停止消费
 
 上层 Limit 或客户端停止接收可能导致 leader 不再需要 worker tuple。`ExecParallelFinish()` 会尽快 detach tuple queues：
 
@@ -453,7 +469,7 @@ worker 发现 tuple queue detached
   -> finish / cleanup
 ```
 
-### 12.4 queue full 背压
+### 13.4 queue full 背压
 
 worker `tqueueReceiveSlot()`：
 
@@ -463,11 +479,11 @@ shm_mq_send(queue, tuple->t_len, tuple, false, false)
 
 如果 queue 满，worker 会等待 reader 进展。leader 如果忙于本地执行或上层输出，worker 可能被背压限制。这是 bounded memory 的代价。
 
-### 12.5 GatherMerge 顺序错误
+### 13.5 GatherMerge 顺序错误
 
 如果 worker 输入并非按预期 pathkeys 排序，`GatherMerge` 不会重新排序全部数据，只按比较器 merge 当前 stream。错误会表现为全局输出顺序不正确。这是 planner/executor contract，不能靠 GatherMerge 自行修复。
 
-## 13. 成本、资源与跨模块传播
+## 14. 成本、资源与跨模块传播
 
 资源：
 
@@ -507,7 +523,7 @@ nodeGather/nodeGatherMerge:
   汇聚和 leader participation 策略
 ```
 
-## 14. 观测与诊断入口
+## 15. 观测与诊断入口
 
 | 入口 | 能看到什么 |
 | --- | --- |
@@ -536,7 +552,7 @@ SELECT * FROM t_parallel_ctx WHERE id > 0;
 
 比较 worker rows、leader 行为和总耗时。
 
-## 15. 常见误区
+## 16. 常见误区
 
 1. 误以为 `Gather` 在 `ExecInitNode()` 时启动 worker。实际第一次 `ExecGather()` 才启动。
 2. 误以为 `Gather` 会保持 worker 输出顺序。普通 `Gather` 是无序 funnel。
@@ -544,9 +560,9 @@ SELECT * FROM t_parallel_ctx WHERE id > 0;
 4. 误以为 leader participation 永远更快。leader 也承担汇聚和上层输出，参与执行可能加重背压。
 5. 误以为 tuple queue 和 error queue 可以共用。它们协议、大小和生命周期不同。
 
-## 16. 课堂实验
+## 17. 课堂实验
 
-### 16.1 延迟启动观察
+### 17.1 延迟启动观察
 
 gdb：
 
@@ -559,7 +575,7 @@ break LaunchParallelWorkers
 
 确认 `ExecInitGather` 不启动 worker，第一次 `ExecGather` 才启动。
 
-### 16.2 reader 状态
+### 17.2 reader 状态
 
 ```gdb
 break ExecParallelCreateReaders
@@ -575,7 +591,7 @@ end
 
 观察 reader 被 done 后从数组中删除。
 
-### 16.3 GatherMerge copy 成本
+### 17.3 GatherMerge copy 成本
 
 对带 `ORDER BY` 的并行查询设置断点：
 
@@ -586,11 +602,11 @@ break heap_compare_slots
 
 观察 worker tuple 被 copy 到 merge slot，并参与 sort key 比较。
 
-### 16.4 queue 背压
+### 17.4 queue 背压
 
 在 `tqueueReceiveSlot()` 和 `TupleQueueReaderNext()` 设断点，或者用 perf 观察 worker 是否卡在 `shm_mq_send()`。如果 leader 慢，worker 会等待 queue 空间。
 
-## 17. 讨论题
+## 18. 讨论题
 
 1. 为什么 worker 启动延迟到第一次执行，而不是 node init？
 2. `Gather` 为什么先尝试 worker queue，再让 leader local scan？换顺序会怎样？
@@ -598,7 +614,7 @@ break heap_compare_slots
 4. 为什么 `GatherMerge` 必须 copy worker tuple，而普通 `Gather` 可以直接存入 funnel slot？
 5. queue 满造成 worker 阻塞，是缺陷还是必要的背压机制？
 
-## 18. 源码索引：Gather 和 GatherMerge 字段对照
+## 19. 源码索引：Gather 和 GatherMerge 字段对照
 
 | 语义 | Gather | GatherMerge |
 | --- | --- | --- |
@@ -615,7 +631,7 @@ break heap_compare_slots
 
 这个对照能解释为什么 `GatherMerge` 更重：它不只是“Gather 后排序”，而是在线维护多个有序 stream 的当前 tuple。
 
-## 19. 故障模式速查表
+## 20. 故障模式速查表
 
 | 现象 | 可能原因 | 排查 |
 | --- | --- | --- |
@@ -626,7 +642,7 @@ break heap_compare_slots
 | worker launched 但无 tuple | worker 初始化失败或任务分配为空 | finish 阶段错误、per-worker rows。 |
 | 有 LIMIT 但 worker 做了很多工作 | tuple bound / queue detach 时机 | `tuples_needed`、ExecParallelFinish 是否及时。 |
 
-## 20. 调参实验矩阵
+## 21. 调参实验矩阵
 
 可以用同一张表，分别测试：
 
@@ -665,7 +681,7 @@ SELECT count(*) FROM t_parallel_ctx WHERE id > 0;
 
 两者对 leader participation 的敏感性可能完全不同。前者 leader 汇聚/输出压力大，后者 worker 本地聚合后输出少，leader 参与可能更划算。
 
-## 21. 本节小结
+## 22. 本节小结
 
 `Gather` 和 `GatherMerge` 是 parallel query 从多 worker 回到单 leader executor pipeline 的汇聚边界。它们延迟到第一次执行才启动 worker，用 tuple queue 接收 worker MinimalTuple，并根据 worker 数、`single_copy` 和 `parallel_leader_participation` 决定 leader 是否也执行子计划。
 

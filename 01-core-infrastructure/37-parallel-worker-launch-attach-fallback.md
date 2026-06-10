@@ -14,6 +14,8 @@ WaitForParallelWorkersToAttach() 又如何把注册失败、启动失败和实�
 
 核心矛盾：并行计划希望获得若干 worker 来降低执行时间，但 worker slot、fork、初始化、DSM attach 都可能失败；leader 既不能假定 worker 一定存在，也不能在必须等待 worker 的地方无限等待。PostgreSQL 把“少 worker”作为正常 fallback，把“已注册但未成功初始化”作为可诊断错误。
 
+学完后应能判断：什么时候少 worker 是可继续执行的正常退化，什么时候必须等待 attach 或在 finish 阶段报错，以及 `nworkers_to_launch`、`nworkers_launched`、`known_attached_workers` 分别属于哪个生命周期边界。
+
 本课基于本地 `~/postgres-lab` 源码，分支 `master`，提交 `bd4bd30ce6a7`。
 
 ## 1. 本节在总主线中的位置

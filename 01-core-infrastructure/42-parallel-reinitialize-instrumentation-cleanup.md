@@ -14,6 +14,8 @@ ExecParallelFinish() / ExecParallelCleanup() 为什么要先 detach tuple queue�
 
 核心矛盾：一个 parallel plan subtree 可能被 rescan，多批 worker 复用同一个 DSM；但 worker 上一轮的 tuple queue、PARAM_EXEC、node shared state、usage 和 instrumentation 都必须在正确时机清理或汇总。过早释放 DSM 会丢指标，过晚 detach tuple queue 会让不再需要的 worker 继续阻塞，rescan 时不重置 shared state 会污染下一轮执行。
 
+学完后应能判断：rescan、finish 和 cleanup 分别负责重置哪些状态，哪些指标必须等 worker finish 后、DSM 释放前汇总，以及提前停止消费 tuple 时哪些 cleanup 顺序仍不能省略。
+
 本课基于本地 `~/postgres-lab` 源码，分支 `master`，提交 `bd4bd30ce6a7`。
 
 ## 1. 本节在总主线中的位置
@@ -345,7 +347,35 @@ DestroyParallelContext()
 
 所以顺序不能改成“先 destroy context，再汇总指标”。
 
-## 9. instrumentation 汇总
+## 9. 生命周期 / ownership / cleanup 与正确性机制层次
+
+这条链路的 ownership 边界可以压缩成三层：
+
+| 阶段 | owner | 必须保留的状态 | 正确性边界 |
+| --- | --- | --- | --- |
+| rescan | `ParallelExecutorInfo` 继续持有 `ParallelContext` / DSM / DSA。 | fixed state、TOC、DSA area、node shared state。 | 旧 worker 已 finish，新 `PARAM_EXEC` 和 node shared state 必须重新写入。 |
+| finish | leader 仍持有 DSM，worker 逐步退出。 | tuple queues、error queues、usage arrays。 | 先 detach tuple queue，再等 worker finish，避免遗漏最后 ERROR / usage。 |
+| cleanup | leader 最后释放 executor 并行资源。 | instrumentation、JIT、DSA param、`ParallelContext`。 | 指标先从 DSM 复制到 query context，再释放 DSA 和 destroy context。 |
+
+相关机制各管一层，不要互相替代：
+
+```text
+shm_mq detach:
+  告诉 worker tuple stream 不再被消费
+
+WaitForParallelWorkersToFinish():
+  等 worker 结束并处理 parallel messages
+
+ExecParallelRetrieveInstrumentation():
+  在 DSM 还活着时复制 worker 明细
+
+DestroyParallelContext():
+  最后释放 worker handle、error queue、DSM 和 pcxt_list ownership
+```
+
+因此，本节的正确性来自 ordering：finish 不能晚于 cleanup，instrumentation retrieve 不能晚于 DSM destroy，rescan 不能复用上一轮 worker-local progress。
+
+## 10. instrumentation 汇总
 
 worker 侧：
 
@@ -374,7 +404,7 @@ ExecParallelRetrieveInstrumentation(planstate, instrumentation)
 1. 聚合到 leader planstate 的总 instrumentation。
 2. 保存 per-worker detail，供 EXPLAIN 显示 worker 明细。
 
-### 9.1 为什么按 plan_node_id 匹配
+### 10.1 为什么按 plan_node_id 匹配
 
 leader 和 worker 是两棵不同 `PlanState`，指针地址不同。不能用 pointer identity，只能用 plan node id：
 
@@ -384,7 +414,7 @@ plan_node_id -> instrumentation array offset
 
 如果 plan node id 缺失或不一致，retrieve 会 ERROR。
 
-### 9.2 为什么分 per-query context 分配
+### 10.2 为什么分 per-query context 分配
 
 worker instrumentation 明细需要活到 EXPLAIN 输出阶段，而不是只在 cleanup 函数栈中有效。因此：
 
@@ -395,7 +425,7 @@ palloc worker_instrument
 
 这和课程早先讲的 MemoryContext 生命周期一致。
 
-## 10. JIT instrumentation 汇总
+## 11. JIT instrumentation 汇总
 
 worker 侧如果有 JIT：
 
@@ -415,9 +445,9 @@ ExecParallelRetrieveJitInstrumentation()
 
 JIT 指标和普通 plan node instrumentation 分开，因为它属于 executor/JIT 子系统，不是一棵 plan tree 上每个节点都有的 `NodeInstrumentation`。
 
-## 11. 错误路径 / 异常路径 / fallback
+## 12. 错误路径 / 异常路径 / fallback
 
-### 11.1 finish 被重复调用
+### 12.1 finish 被重复调用
 
 `ExecParallelFinish()` 幂等：
 
@@ -428,7 +458,7 @@ if (pei->finished)
 
 这是必要的，因为 `ExecShutdownGatherWorkers()` 可能从正常结束、rescan、executor shutdown 多个路径进入。
 
-### 11.2 cleanup 前未 finish
+### 12.2 cleanup 前未 finish
 
 正常调用方应先 finish 再 cleanup。`ExecShutdownGather()` 做：
 
@@ -445,13 +475,13 @@ usage/instrumentation 不完整
 DestroyParallelContext() 强杀 worker
 ```
 
-### 11.3 worker ERROR during finish
+### 12.3 worker ERROR during finish
 
 `WaitForParallelWorkersToFinish()` 会处理 parallel messages。如果 worker ERROR，leader 在 finish 中抛出 ERROR。随后事务 abort cleanup 会走 `DestroyParallelContext()` 兜底。
 
 这解释了为什么 finish 不是“无错误清理函数”。它仍可能把 worker late ERROR 反馈给用户。
 
-### 11.4 instrumentation retrieve 失败
+### 12.4 instrumentation retrieve 失败
 
 如果 plan node id 找不到：
 
@@ -461,11 +491,11 @@ elog(ERROR, "plan node %d not found")
 
 这通常说明 estimate/init/report/retrieve 的 plan tree 不一致，属于 executor bug 或扩展 custom scan bug。
 
-### 11.5 rescan 中 PARAM_EXEC 序列化失败
+### 12.5 rescan 中 PARAM_EXEC 序列化失败
 
 如果新参数 datum 无法序列化或 DSA 分配失败，rescan ERROR。旧 worker 已 finish，旧 param pointer 已 free 或即将 free；事务 cleanup 会销毁整个 context。
 
-## 12. 成本、资源与跨模块传播
+## 13. 成本、资源与跨模块传播
 
 finish / cleanup 成本包括：
 
@@ -501,7 +531,7 @@ DSA:
   管理动态 PARAM_EXEC 和 node shared object
 ```
 
-## 13. 观测与诊断入口
+## 14. 观测与诊断入口
 
 | 入口 | 能看到什么 |
 | --- | --- |
@@ -523,7 +553,7 @@ break ExecParallelRetrieveInstrumentation
 break ExecParallelCleanup
 ```
 
-## 14. 常见误区
+## 15. 常见误区
 
 1. 误以为 rescan 必须重新创建 DSM。实际复用 DSM，重置 queues、params 和 node shared state。
 2. 误以为 `ExecParallelFinish()` 会释放 `ParallelContext`。它只 finish worker 和 usage，释放在 cleanup。
@@ -531,9 +561,9 @@ break ExecParallelCleanup
 4. 误以为 `ReInitializeDSM` 和 `ReScan` 可以随意互相重置状态。一个管 shared state，一个管 local state。
 5. 误以为 `DestroyParallelContext()` 之前可以 detach DSA。node instrumentation 或 param cleanup 可能仍需要 DSA / DSM。
 
-## 15. 课堂实验
+## 16. 课堂实验
 
-### 15.1 rescan 路径
+### 16.1 rescan 路径
 
 构造会 rescan inner side 的计划，例如 nested loop + Gather 子计划，或用 cursor 重复扫描。gdb：
 
@@ -552,7 +582,7 @@ p fpes->param_exec
 p pei->pcxt->nworkers_launched
 ```
 
-### 15.2 finish / cleanup 顺序
+### 16.2 finish / cleanup 顺序
 
 ```gdb
 break ExecParallelFinish
@@ -567,7 +597,7 @@ end
 
 确认 finish 先于 cleanup，cleanup 先 retrieve instrumentation 再 destroy context。
 
-### 15.3 instrumentation
+### 16.3 instrumentation
 
 ```sql
 EXPLAIN (ANALYZE, VERBOSE, BUFFERS, WAL)
@@ -582,7 +612,7 @@ p instrumentation->num_plan_nodes
 p planstate->plan->plan_node_id
 ```
 
-### 15.4 JIT
+### 16.4 JIT
 
 打开 JIT 后执行并行查询：
 
@@ -595,7 +625,7 @@ SELECT sum(id) FROM t_parallel_ctx;
 
 在 `ExecParallelRetrieveJitInstrumentation()` 设断点，观察 worker JIT 指标汇总。
 
-## 16. 讨论题
+## 17. 讨论题
 
 1. 为什么 `ExecParallelFinish()` 要先 detach tuple queue，再等待 worker？
 2. `ExecParallelFinish()` 和 `ExecParallelCleanup()` 为什么拆成两个函数？
@@ -603,7 +633,7 @@ SELECT sum(id) FROM t_parallel_ctx;
 4. 为什么 instrumentation 用 plan node id 匹配，而不是 PlanState 指针？
 5. 如果新增 parallel-aware node，把 shared state reset 放在 `ExecReScan()` 会有什么问题？
 
-## 17. 源码索引：finish / cleanup 状态变化
+## 18. 源码索引：finish / cleanup 状态变化
 
 | 阶段 | `tqueue` | `reader` | worker | usage | instrumentation | DSA | pcxt |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -624,7 +654,7 @@ DestroyParallelContext() 会 detach DSM；
 worker exit wait 需要 bgworker handles；
 ```
 
-## 18. 源码检查清单：新增并行节点的 rescan 支持
+## 19. 源码检查清单：新增并行节点的 rescan 支持
 
 新增 parallel-aware node 时，rescan 支持经常被漏掉。检查：
 
@@ -637,7 +667,7 @@ ReInitializeDSM 和 ExecReScan 是否各司其职？
 如果 sendParams 变化，worker 是否能看到新参数？
 ```
 
-### 18.1 只重置 shared state 的例子
+### 19.1 只重置 shared state 的例子
 
 ```text
 parallel seq scan shared block counter
@@ -648,7 +678,7 @@ parallel hash join phase / batch state
 
 这些必须在 worker launch 前 reset，否则新 worker 会接着上一轮的进度跑。
 
-### 18.2 只重置 local state 的例子
+### 19.2 只重置 local state 的例子
 
 ```text
 leader PlanState 当前 slot
@@ -659,13 +689,13 @@ leader PlanState 当前 slot
 
 这些不应放进 `Exec*ReInitializeDSM()`，否则 worker 看不到或会造成跨进程不一致。
 
-### 18.3 两者都依赖的状态
+### 19.3 两者都依赖的状态
 
 如果某个状态同时依赖 shared reset 和 local rescan，不要在任一阶段提前消费它。让第一次 `ExecProcNode()` 在两者完成后初始化。
 
 这正是 `nodeGather.c` 注释给出的规则。
 
-## 19. 故障模式速查表
+## 20. 故障模式速查表
 
 | 现象 | 可能原因 | 排查 |
 | --- | --- | --- |
@@ -677,7 +707,7 @@ leader PlanState 当前 slot
 | worker 卡住 | tuple queue 未 detach | finish 是否先 detach `pei->tqueue`。 |
 | cleanup ERROR 后 context 泄漏 | destroy 未执行或重复销毁 | `pcxt_list`、`pei->pcxt`。 |
 
-## 20. 诊断实验：提前停止消费
+## 21. 诊断实验：提前停止消费
 
 构造 LIMIT：
 
@@ -718,7 +748,7 @@ break ExecParallelCleanup
 可以跳过 worker finish
 ```
 
-## 21. 本节小结
+## 22. 本节小结
 
 并行执行的结束不是一个简单 free。`ExecParallelReinitialize()` 支持同一 parallel DSM 重新发起 worker 批次；`ExecParallelFinish()` 负责停止 tuple 传输、等待 worker、汇总 Buffer/WAL usage；`ExecParallelCleanup()` 在 DSM 仍有效时取回 instrumentation/JIT，释放 DSA 参数，最后销毁 `ParallelContext`。
 

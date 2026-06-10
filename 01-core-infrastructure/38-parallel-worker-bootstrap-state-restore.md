@@ -15,6 +15,8 @@ serializable xact 与 lock group membership，
 
 核心矛盾：worker 必须在足够早的时候把错误回传 leader，但又必须按严格顺序恢复 leader 的身份、事务、snapshot、GUC 和 catalog 相关状态；顺序错了，轻则诊断丢失，重则 catalog lookup、锁、可见性或安全上下文与 leader 不一致。
 
+学完后应能判断：worker bootstrap 中哪些状态必须先于 error queue、transaction、snapshot、GUC 或 entrypoint 恢复，哪些失败能经 error queue 回传，哪些早期失败只能表现为 attach/startup failure。
+
 本课基于本地 `~/postgres-lab` 源码，分支 `master`，提交 `bd4bd30ce6a7`。
 
 ## 1. 本节在总主线中的位置
