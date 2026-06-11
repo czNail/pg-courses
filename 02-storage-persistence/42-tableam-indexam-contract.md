@@ -1,6 +1,7 @@
 # PostgreSQL TableAM 与 IndexAM 的持久化契约
+
 ## 课程定位
-本节主题：TableAM 与 IndexAM 的持久化契约。
+
 上一组课程已经讲过 heap tuple version、HOT、B-tree split、dedup 和 index cleanup。
 现在把视角从某一个 AM 的页格式，移动到 TableAM 和 IndexAM 之间的接口边界。
 前置知识：
@@ -40,41 +41,14 @@ TableAM 负责把候选解释成 visible tuple、HOT 后续版本、all-dead hin
 - 为什么 `table_index_delete_tuples()` 要返回 `snapshotConflictHorizon`。
 - 为什么 index vacuum callback 和 bottom-up deletion 都必须回到 TableAM 判断 heap TID。
 - 为什么 `TableScanDesc`、`IndexScanDesc` 和 `IndexFetchTableData` 的 owner、pin 和 cleanup 顺序不能混用。
-## 源码基线
-源码仓库：
-```text
-/home/nail/postgres-lab
-```
-基线：
-```text
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
-```
-行号来自：
-```text
-nl -ba <source-file>
-```
-本节重点阅读：
-```text
-src/include/access/tableam.h
-src/include/access/amapi.h
-src/include/access/relscan.h
-src/backend/access/index/indexam.c
-src/backend/access/heap/heapam_handler.c
-src/backend/executor/nodeIndexscan.c
-src/backend/executor/nodeBitmapHeapscan.c
-```
-辅助阅读：
-```text
-src/include/access/genam.h
-src/include/access/heapam.h
-src/backend/access/index/genam.c
-src/backend/access/heap/heapam_indexscan.c
-src/backend/access/heap/heapam.c
-```
+
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。行号来自 `nl -ba <source-file>`；重点源码和辅助阅读统一放在第 3 节的阅读顺序里。
+
 辅助文件不是为了扩展本节主题。
 它们只用于确认 callback 类型、scan descriptor 初始化、heap HOT fetch 和 index tuple deletion 的真实实现位置。
+
 ## 1. 本节在总主线中的位置
+
 前面课程已经说明一个 heap tuple version 如何被插入、更新、删除、prune 和 vacuum。
 也已经说明 B-tree 如何把 key 和 heap TID 组织成可搜索的页结构。
 这些课程容易让人形成一个错误直觉：
@@ -90,7 +64,9 @@ TID 只是一个可被 TableAM 解释的定位 token。
 本节也不完整展开 `ambuild`、`aminsert`、`ambulkdelete`、`amvacuumcleanup`。
 它们将在后续课程展开。
 本节只抓住扫描和删除判断两个最能暴露契约边界的路径。
+
 ## 2. 核心矛盾与一句话运行模型
+
 核心矛盾可以压缩成一句话：
 IndexAM 需要高效持久化 access path，TableAM 需要独占解释 row version 语义，而 executor 需要把二者组合成一个看起来像“扫描表”的算子。
 如果没有这个边界，最简单的实现是：
@@ -110,16 +86,20 @@ TableAM 再说“这个 TID 对这个 snapshot 是否能产生一个 tuple，以
 IndexAM 可以说“我怀疑这些 index tuple 对应的 table TID 可删”。
 TableAM 再说“这些 TID 指向的 table tuple 是否 vacuumable，以及对应删除 WAL 需要的 conflict horizon 是什么”。
 本节一句话运行模型：
+
 ```text
 executor 给 index AM scan key 和 snapshot -> index AM 返回候选 TID 或 bitmap -> table AM 用 snapshot、page pin、buffer lock 和版本链解释 TID -> executor 做 recheck 和 qual -> cleanup 路径再把 all-dead/vacuumable 结果回传给 index AM。
 ```
+
 注意这个模型中有两个方向的数据流。
 读路径是 index 到 table。
 IndexAM 产生候选，TableAM 解释候选。
 清理路径是 table 到 index。
 TableAM 判断候选是否可删除，IndexAM 修改自己的 page。
 这两个方向共享 TID，但语义完全不同。
+
 ## 3. 核心文件分工与阅读顺序
+
 建议先读 `src/include/access/relscan.h`。
 原因是 scan descriptor 是状态边界，而不是实现细节。
 `relscan.h:33-74` 定义 `TableScanDescData`。
@@ -154,6 +134,7 @@ heap 的实现就是 `IndexFetchHeapData`。
 它不是某个索引的实现。
 它把 executor、relcache、predicate lock、TableAM fetch、parallel scan 和 index AM callback 串起来。
 关键入口：
+
 ```text
 index_insert()                 indexam.c:213
 index_beginscan()              indexam.c:257
@@ -168,6 +149,7 @@ index_getbitmap()              indexam.c:743
 index_bulk_delete()            indexam.c:772
 index_vacuum_cleanup()         indexam.c:793
 ```
+
 第五读 `src/backend/access/heap/heapam_handler.c`。
 这个文件定义 heap table AM 的 callback 表。
 `heapam_handler.c:2665-2721` 把 heap 的函数挂到 `TableAmRoutine` 上。
@@ -193,7 +175,9 @@ index_vacuum_cleanup()         indexam.c:793
 `src/backend/access/index/genam.c` 的 `RelationGetIndexScan()` 初始化 `IndexScanDescData`。
 `src/backend/access/heap/heapam_indexscan.c` 实现 heap index fetch 和 HOT chain walk。
 `src/backend/access/heap/heapam.c` 的 `heap_index_delete_tuples()` 实现 `table_index_delete_tuples()` 的 heap AM 侧裁决。
+
 ## 4. 关键数据结构与状态
+
 第一组状态是 `IndexAmRoutine`。
 它是 server-lifetime 的静态 callback 表。
 `amapi.h:230-232` 明确 core code 不复制也不释放它。
@@ -267,10 +251,14 @@ bitmap heap scan 中是 `BitmapHeapScanState.recheck`，由 `table_scan_bitmap_n
 它不是可见性。
 TableAM 已经在返回 tuple 前做了 snapshot visibility。
 recheck 是 index predicate/key semantics 的边界。
+
 ## 5. 主流程源码 walkthrough
+
 本节主流程选普通 `IndexScan`。
 原因是它完整经过 IndexAM、generic index layer、TableAM、executor recheck 和 cleanup hint。
+
 ### 5.1 executor 初始化 scan
+
 入口是 `ExecIndexScan()`。
 `nodeIndexscan.c:525-543` 判断是否有 runtime key。
 如果 runtime key 还没准备好，先 `ExecReScan()`。
@@ -280,9 +268,11 @@ recheck 是 index predicate/key semantics 的边界。
 它先从 `IndexScanState` 中取出 `EState`、scan direction、`IndexScanDesc`、`ExprContext` 和 result slot。
 如果 `node->iss_ScanDesc == NULL`，说明这是第一次执行。
 它调用：
+
 ```text
 index_beginscan(heap rel, index rel, estate snapshot, instrumentation, scan key count, orderby count, flags)
 ```
+
 源码位置是 `nodeIndexscan.c:111-118`。
 这里传入的是 executor 的 snapshot。
 这很重要。
@@ -302,7 +292,9 @@ IndexAM 能看到 `scan->xs_snapshot`，但最终 table tuple visibility 仍由 
 `indexam.c:288-289` 是这一行的关键。
 从这一刻开始，一个 index scan descriptor 中同时挂着 IndexAM scan state 和 TableAM fetch state。
 它们生命周期不同，但由同一个 `index_endscan()` 收尾。
+
 ### 5.2 把 scan key 交给 IndexAM
+
 第一次建立 scan 后，`IndexNext()` 会在 `nodeIndexscan.c:126-129` 调用 `index_rescan()`。
 `index_rescan()` 在 `indexam.c:368-387`。
 它检查 `amrescan`，确认 key 数量没有变化。
@@ -316,7 +308,9 @@ heap AM 的 `heapam_index_fetch_reset()` 在 `heapam_indexscan.c:41-51`。
 注释说，避免丢掉 `xs_cbuf` 和 `xs_vmbuffer` 中的 pin，可以在某些 tight nested loop join 中减少重复 pin/unpin。
 这说明 reset 不等于 release。
 cleanup 语义要看具体 callback。
+
 ### 5.3 IndexAM 返回候选 TID
+
 `IndexNext()` 的核心循环在 `nodeIndexscan.c:135-155`。
 它调用 `index_getnext_slot(scandesc, direction, slot)`。
 `index_getnext_slot()` 在 `indexam.c:698-727`。
@@ -324,9 +318,11 @@ cleanup 语义要看具体 callback。
 `index_getnext_tid()` 在 `indexam.c:599-636`。
 它检查 `amgettuple` 必须存在。
 然后调用：
+
 ```text
 scan->indexRelation->rd_indam->amgettuple(scan, direction)
 ```
+
 具体 IndexAM 在这个 callback 中搜索自己的索引结构。
 它把候选 TID 放入 `scan->xs_heaptid`。
 它还可以设置 `xs_recheck`，也可以填充 index-only scan 需要的 `xs_itup` 或 `xs_hitup`。
@@ -336,11 +332,14 @@ generic layer 在这里不 fetch heap。
 IndexAM 说“这个 index entry 满足索引层条件，并指向这个 TID”。
 IndexAM 没有说“这个 tuple 对当前 snapshot 可见”。
 IndexAM 也没有说“这个 TID 没有 HOT 后续版本”。
+
 ### 5.4 TableAM 解释 TID
+
 回到 `index_getnext_slot()`。
 拿到 TID 后，它调用 `index_fetch_heap(scan, slot)`。
 `index_fetch_heap()` 在 `indexam.c:657-680`。
 核心调用是：
+
 ```text
 table_index_fetch_tuple(scan->xs_heapfetch,
                         &scan->xs_heaptid,
@@ -349,6 +348,7 @@ table_index_fetch_tuple(scan->xs_heapfetch,
                         &scan->xs_heap_continue,
                         &all_dead)
 ```
+
 `table_index_fetch_tuple()` 是 `tableam.h:1304-1314` 的 inline wrapper。
 真正工作交给 table relation 的 `rd_tableam->index_fetch_tuple`。
 heap AM 的实现是 `heapam_index_fetch_tuple()`。
@@ -369,7 +369,9 @@ IndexAM 不参与这件事。
 TableAM 负责把 index entry 的 TID 解释成当前 snapshot 下的 tuple。
 对 heap 来说，这包括 page pin、buffer lock、visibility check、HOT redirect、HOT chain traversal、predicate lock 和 all-dead 判断。
 IndexAM 不知道这些细节。
+
 ### 5.5 all-dead hint 回流给 IndexAM
+
 `index_fetch_heap()` 调用 TableAM 后，如果 `found` 为 true，就统计 heap fetch。
 然后它处理 `all_dead`。
 `indexam.c:669-677` 说明：
@@ -384,7 +386,9 @@ recovery 中不能使用这个 hint。
 standby 上的 snapshot horizon 可能早于 primary。
 primary 认为没人需要看的 tuple，standby 上的查询可能还需要看。
 所以 killed hint 不是持久化正确性机制。
+
 ### 5.6 executor recheck
+
 `index_getnext_slot()` 返回 true 后，控制回到 `IndexNext()`。
 `nodeIndexscan.c:139-151` 检查 `scandesc->xs_recheck`。
 如果为 true，executor 用 `indexqualorig` 对已经 fetch 出来的 tuple 再跑一次 `ExecQualAndReset()`。
@@ -395,14 +399,18 @@ recheck 处理的是 index AM 匹配语义可能 lossy、operator recheck 或 or
 在 GiST、GIN、BRIN 等 AM 中，这个边界尤其重要。
 一个 index entry 命中可能只表示“可能匹配”。
 必须把 tuple 取出后用 executor 表达式再判定。
+
 ### 5.7 返回 tuple
+
 如果不需要 recheck，或者 recheck 通过，`IndexNext()` 返回 slot。
 上层 `ExecScan()` 再处理 scan qual、projection、instrumentation 等通用逻辑。
 注意 slot 中的 tuple 生命周期和底层 buffer pin 有关。
 heap index fetch 使用 `ExecStoreBufferHeapTuple()`。
 后续 `index_getnext_tid()`、`index_fetch_heap()` 或 `index_endscan()` 会释放旧 pin。
 调用者不能把 slot 背后的 buffer pin 语义误解成长期 ownership。
+
 ## 6. Bitmap Heap Scan 的旁路 walkthrough
+
 bitmap 路径是同一个契约的另一种组合方式。
 它不是一边从 index 取一个 TID 一边 fetch heap。
 它先把候选 TID 聚合成 `TIDBitmap`，再按 heap block 访问表页。
@@ -451,7 +459,9 @@ IndexAM 生产候选集合。
 TableAM 在访问表页时解释候选。
 executor 对 lossy index semantics 做 recheck。
 bitmap 只是改变访问顺序和资源模型，不改变语义 ownership。
+
 ## 7. 生命周期 / ownership / cleanup
+
 先看普通 index scan。
 `ExecInitIndexScan()` 创建 `IndexScanState`。
 它打开 scan relation 和 index relation，准备 scan key、orderby key、runtime key context、slot 和 instrumentation。
@@ -525,7 +535,9 @@ buffer pin、relcache refcount、snapshot registration 等外部资源应由正�
 relation descriptor、opclass support function、relcache 中的 `rd_indam` 和 `rd_tableam` 会受到 relcache invalidation 影响。
 scan 开始后通常持有 relation refcount 和锁，防止 scan 期间对象被并发 drop 或重写成不可访问状态。
 relation 文件的物理替换、truncate、VACUUM cleanup 和 page deletion 则靠更低层的 lock、buffer pin、WAL 和 smgr 规则保证。
+
 ## 8. 正确性机制层次
+
 第一层是 snapshot visibility。
 TableAM 用 snapshot 解释 table tuple。
 heap AM 中，普通 index fetch 最终调用 `HeapTupleSatisfiesVisibility()`。
@@ -571,7 +583,9 @@ Hot Standby redo 时可能需要据此产生 recovery conflict。
 generic layer 对 index relcache entry 增加 reference count。
 这保护的是对象身份和 metadata 生命周期。
 它不替代 buffer lock，也不替代 snapshot visibility。
+
 ## 9. 错误路径 / 异常路径 / fallback
+
 第一个异常路径是 IndexAM 不支持某个 callback。
 `indexam.c` 中的 `CHECK_REL_PROCEDURE` 和 `CHECK_SCAN_PROCEDURE` 会在 callback 为 NULL 时 `elog(ERROR)`。
 普通 index scan 要求 `amgettuple`。
@@ -617,7 +631,9 @@ heap AM 必须扫描整页 line pointer，找出对 snapshot 可见的 tuple。
 executor 还必须做 qual recheck。
 这是资源压力下的 correctness fallback。
 它把 memory pressure 转换成更多 CPU 和 heap page filtering。
+
 ## 10. 成本、资源与跨模块传播
+
 第一类成本是 callback indirection。
 一次普通 index tuple 命中至少经过 executor、generic index layer、IndexAM、generic index layer、TableAM、heap visibility、executor recheck。
 这比单个硬编码 heap-btree path 多了函数指针和状态跳转。
@@ -674,13 +690,17 @@ Bitmap heap scan instrumentation 能统计 exact/lossy pages 和 I/O。
 这些不是免费的。
 只有 executor 开启对应 instrumentation 时，相关 flags 才会传播到 table scan。
 例如 `BitmapTableScanSetup()` 在 `nodeBitmapHeapscan.c:152-153` 根据 `INSTRUMENT_IO` 设置 `SO_SCAN_INSTRUMENT`。
+
 ## 11. 观测与诊断入口
+
 第一类现象：index scan returned rows 少，但 heap fetch 很多。
 观察入口：
+
 ```sql
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT * FROM t WHERE indexed_col = 42;
 ```
+
 能看到的：
 - plan node 的实际 rows。
 - shared/local/temp buffer hit/read/dirtied。
@@ -696,10 +716,12 @@ SELECT * FROM t WHERE indexed_col = 42;
 如果 rows 很少但 buffer 访问多，候选 TID 被 visibility、recheck 或 qual 过滤的概率高。
 第二类现象：Bitmap Heap Scan 出现 lossy pages。
 观察入口：
+
 ```sql
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT * FROM t WHERE a BETWEEN 100 AND 200 OR b BETWEEN 100 AND 200;
 ```
+
 能看到 `Heap Blocks: lossy=...`。
 lossy pages 表示 `TIDBitmap` 退化到 page 粒度。
 源码解释是：
@@ -710,10 +732,12 @@ lossy 不是 index corruption。
 它通常是 bitmap 内存压力、候选分布或 bitmap 操作复杂度导致的 fallback。
 第三类现象：standby 上 index scan 比 primary 多做 heap check。
 观察入口：
+
 ```sql
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT ...;
 ```
+
 同时看 standby 是否在 recovery。
 源码解释是：
 `RelationGetIndexScan()` 在 recovery-started transaction 中不忽略 killed tuples。
@@ -721,27 +745,33 @@ SELECT ...;
 因此 standby 上不能把 primary 侧的 killed hint 当成可见性真相。
 第四类现象：VACUUM 或前台 bottom-up deletion 访问大量 heap blocks。
 观察入口：
+
 ```sql
 VACUUM (VERBOSE) t;
 EXPLAIN (ANALYZE, BUFFERS) UPDATE ...;
 ```
+
 如果能用 `perf` 或断点，重点看：
+
 ```text
 heap_index_delete_tuples
 heap_hot_search_buffer
 index_delete_sort
 bottomup_sort_and_shrink
 ```
+
 源码解释是：
 IndexAM 删除候选 index tuple 前，需要 TableAM 根据 heap TID 判断 vacuumable。
 候选分布越离散，heap block 访问越多。
 bottom-up deletion 会 shrink 和排序候选，试图限制成本。
 第五类现象：`Index Cond` 命中但 `Rows Removed by Index Recheck` 增加。
 观察入口：
+
 ```sql
 EXPLAIN (ANALYZE)
 SELECT ...;
 ```
+
 源码解释是：
 IndexAM 设置 `xs_recheck` 或 bitmap scan 设置 `recheck`。
 executor 用 `indexqualorig` 或 `bitmapqualorig` 重新验证。
@@ -755,6 +785,7 @@ IndexAM 可以返回 index tuple data。
 这仍是 TableAM/visibility 边界，不是 IndexAM 单独能证明的事情。
 第七类现象：gdb 中观察主链路。
 可以设置断点：
+
 ```text
 break IndexNext
 break index_getnext_tid
@@ -762,7 +793,9 @@ break index_fetch_heap
 break heapam_index_fetch_tuple
 break heap_hot_search_buffer
 ```
+
 观察对象：
+
 ```text
 scan->xs_heaptid
 scan->xs_heap_continue
@@ -771,10 +804,13 @@ scan->kill_prior_tuple
 ((IndexFetchHeapData *) scan->xs_heapfetch)->xs_blk
 ((IndexFetchHeapData *) scan->xs_heapfetch)->xs_cbuf
 ```
+
 注意断点会显著改变 timing。
 不要用断点实验判断微观性能。
 它适合验证状态迁移。
+
 ## 12. 常见误区
+
 误区一：把 index TID 当成可见 row。
 TID 只是定位候选。
 普通 index scan 必须经 `table_index_fetch_tuple()`。
@@ -804,8 +840,11 @@ index page 上的 TID 是否可删，需要 TableAM 判断 table tuple 是否 va
 误区八：把 callback 表当成 scan 状态。
 `IndexAmRoutine` 和 `TableAmRoutine` 是静态能力表。
 `IndexScanDesc`、`TableScanDesc` 和 `IndexFetchTableData` 才是每次 scan 的 runtime state。
+
 ## 13. 课堂实验
+
 ### 实验一：跟普通 index scan 的 TID 到 tuple 转换
+
 目标：
 观察 `xs_heaptid` 如何从 IndexAM 返回，又如何被 heap AM 用 snapshot 和 HOT chain 解释。
 准备：
@@ -813,6 +852,7 @@ index page 上的 TID 是否可删，需要 TableAM 判断 table tuple 是否 va
 插入若干行。
 对非索引列做多次 UPDATE，制造 HOT chain。
 建议 SQL：
+
 ```sql
 CREATE TABLE t_contract(id int primary key, payload text) WITH (fillfactor = 70);
 INSERT INTO t_contract
@@ -823,13 +863,16 @@ UPDATE t_contract SET payload = payload || 'c' WHERE id BETWEEN 1 AND 1000;
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT * FROM t_contract WHERE id = 42;
 ```
+
 源码断点：
+
 ```text
 break index_getnext_tid
 break index_fetch_heap
 break heapam_index_fetch_tuple
 break heap_hot_search_buffer
 ```
+
 观察：
 - `scan->xs_heaptid` 在 `amgettuple` 后是什么。
 - `heap_hot_search_buffer()` 是否修改 TID offset。
@@ -838,13 +881,16 @@ break heap_hot_search_buffer
 回到源码解释：
 IndexAM 返回的是候选 root TID。
 heap AM 才能沿 HOT chain 找到 snapshot 可见版本。
+
 ### 实验二：制造 bitmap lossy recheck
+
 目标：
 观察 bitmap scan 中候选集合如何退化成 lossy page，以及 recheck 如何回到 executor。
 准备：
 降低 `work_mem`。
 构造低选择性 bitmap 条件。
 建议 SQL：
+
 ```sql
 SET work_mem = '64kB';
 CREATE TABLE t_bitmap(a int, b int, payload text);
@@ -857,7 +903,9 @@ ANALYZE t_bitmap;
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT * FROM t_bitmap WHERE a BETWEEN 1 AND 80 OR b BETWEEN 1 AND 160;
 ```
+
 源码断点：
+
 ```text
 break index_getbitmap
 break BitmapTableScanSetup
@@ -865,6 +913,7 @@ break BitmapHeapScanNextBlock
 break heapam_scan_bitmap_next_tuple
 break BitmapHeapNext
 ```
+
 观察：
 - `node->tbm` 什么时候建立。
 - `tbmres->lossy` 是否出现。
@@ -874,19 +923,23 @@ break BitmapHeapNext
 IndexAM 只生产 bitmap。
 heap AM 负责在 page 上做 visibility。
 executor 负责 bitmap qual recheck。
+
 ### 实验三：观察 index deletion 回到 TableAM
+
 目标：
 理解 index AM 删除候选 index tuple 前，为什么还要让 TableAM 裁决。
 准备：
 使用频繁 UPDATE/DELETE 后执行 VACUUM，或在 B-tree insert path 中制造 bottom-up deletion。
 不要求修改产品代码。
 如果可以使用断点，设置：
+
 ```text
 break table_index_delete_tuples
 break heap_index_delete_tuples
 break index_delete_check_htid
 break heap_hot_search_buffer
 ```
+
 观察：
 - `delstate->bottomup` 是 true 还是 false。
 - `delstate->ndeltids` 调用前后是否变化。
@@ -896,7 +949,9 @@ break heap_hot_search_buffer
 IndexAM 提供候选 TID 和 index page offset。
 TableAM 判断 table tuple 是否 vacuumable。
 IndexAM 根据 TableAM 改写后的 `delstate` 修改自己的 index page。
+
 ## 14. 讨论题
+
 1. 为什么 `amgettuple` 只返回 `xs_heaptid`，而不是直接返回 `TupleTableSlot`？
 2. 如果一个新的 TableAM 不支持 HOT，它仍然必须如何实现 `table_index_fetch_tuple()`？
 3. `table_index_fetch_tuple()` 为什么允许修改传入的 `tid`？
@@ -905,7 +960,9 @@ IndexAM 根据 TableAM 改写后的 `delstate` 修改自己的 index page。
 6. `xs_recheck`、snapshot visibility 和 scan qual 三者分别由谁负责？
 7. `table_index_delete_tuples()` 返回 `snapshotConflictHorizon`，这说明 index deletion 和 standby 查询之间有什么关系？
 8. heap AM 的 `table_index_fetch_reset()` 为什么可以选择不释放 buffer pin？这带来什么性能收益和 cleanup 风险？
+
 ## 15. 本节小结
+
 本节唯一主问题是：
 IndexAM 为什么只能持久化和返回定位候选，而不能独立决定 tuple visibility、all-dead 和 deletion safety。
 核心链路是：

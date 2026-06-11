@@ -1,9 +1,11 @@
 # PostgreSQL B-tree insert、unique check 与 speculative insertion
+
 ## 课程定位
-本节主题：B-tree insert、unique check 与 speculative insertion。
+
 上一组课程已经讲到 heap tuple、HOT、FSM/VM 和 heap 写入边界。
 本节从 heap tuple 已经拿到 TID 之后继续向索引层推进。
 前置知识：已经理解 MVCC tuple version、heap page、buffer content lock、WAL-before-data、B-tree leaf page、HOT chain 和 executor insert/update 的基本流程。
+
 本节唯一主问题：
 两个事务同时插入同一个 unique key 时，PostgreSQL 如何保证最终不会出现两个可见的重复 key？
 本节围绕的核心矛盾：
@@ -31,51 +33,17 @@ unique check 发现冲突时，executor 可以杀死这个 speculative tuple，�
 - heap speculative insert、confirm、abort 各自写什么 WAL。
 - B-tree simple insert、page split、incomplete split 和 duplicate error 的错误边界在哪里。
 - `pg_stat_activity`、`pg_locks`、isolation test、gdb 分别能看到哪些状态。
-## 源码基线
-源码仓库：
-```text
-/home/nail/postgres-lab
-```
-基线：
-```text
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
-```
-行号来自：
-```text
-nl -ba <source-file>
-```
-本节重点阅读：
-```text
-src/backend/access/nbtree/nbtinsert.c
-src/backend/access/nbtree/nbtsearch.c
-src/backend/access/nbtree/nbtree.c
-src/backend/executor/execIndexing.c
-src/backend/access/heap/heapam.c
-src/include/access/nbtree.h
-```
-为了讲清 speculative token 和 heap visibility，本节还会辅助引用：
-```text
-src/backend/executor/nodeModifyTable.c
-src/backend/access/heap/heapam_handler.c
-src/backend/access/heap/heapam_visibility.c
-src/backend/access/heap/heapam_indexscan.c
-src/backend/access/table/tableam.c
-src/backend/storage/lmgr/lmgr.c
-src/include/access/genam.h
-src/include/access/tableam.h
-src/include/access/htup_details.h
-src/include/storage/itemptr.h
-src/include/storage/locktag.h
-```
-辅助文件不是本节主角。
-它们只用于解释 B-tree unique check 读到的 heap 状态来自哪里，以及等待 token 的 lock tag 如何形成。
+
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。行号来自 `nl -ba <source-file>`；重点源码和辅助引用统一放在第 3 节的阅读顺序里。
+
 ## 1. 本节在总主线中的位置
+
 heap insert 的结果是一个已经落到 heap page 上的 tuple。
 这个 tuple 有自己的 `ItemPointer`，也就是 index entry 里要保存的 heap TID。
 对普通非唯一索引来说，executor 形成 index datum 后调用 index AM 插入即可。
 对 unique index 来说，插入动作同时承担约束检查。
 这就是本节的位置：
+
 ```text
 executor
   -> heap tuple 已插入或 speculative 插入
@@ -86,6 +54,7 @@ executor
   -> _bt_check_unique()
   -> _bt_insertonpg()
 ```
+
 这个链路的关键不是“怎么把 tuple 塞进 B-tree page”。
 关键是“什么时候可以认定同一个 key 没有另一个会变成可见的版本”。
 B-tree 只能保护局部页结构。
@@ -95,7 +64,9 @@ B-tree 只能保护局部页结构。
 本节只讲 insert path。
 index build、`CREATE UNIQUE INDEX CONCURRENTLY` 的完整流程留到后续课程。
 但 `_bt_check_unique()` 里为了支持 recheck 和 HOT chain 的边界会被点到为止。
+
 ## 2. 核心矛盾与一句话运行模型
+
 一句话运行模型：
 B-tree 在“第一个可能出现该 key 的 leaf page”上短暂串行化并发插入，用 dirty heap visibility 把同 key entry 分类为 dead、committed conflict、in-progress conflict 或 speculative conflict；遇到不确定状态就释放页锁等待并重查，`ON CONFLICT` 则把本事务的新 tuple 放入可撤销的 speculative 状态。
 这个模型里有三层唯一性。
@@ -114,65 +85,89 @@ SQL 约束关心的是某个 MVCC 未来状态下，会不会有两个 live tupl
 物理 B-tree 可以容纳重复。
 unique constraint 不能容纳两个最终可见的重复。
 speculative insertion 可以临时容纳一个可撤销的重复。
+
 ## 3. 核心文件分工与阅读顺序
+
 建议按下面顺序读源码。
 不要从 `nbtinsert.c` 顶部线性背函数。
 先抓住状态和等待边界。
+
 ```text
 src/include/access/genam.h
 ```
+
 定义 `IndexUniqueCheck`。
 `genam.h:103-129` 是 executor 和 index AM 之间的 unique check 合同。
+
 ```text
 src/backend/executor/execIndexing.c
 ```
+
 决定每个 index insert 用哪种 unique check 模式。
 `execIndexing.c:7-26` 说明 unique index 的原子检查由 index AM 负责。
 `execIndexing.c:53-96` 说明 speculative insertion 的设计目标。
 `execIndexing.c:410-457` 把 immediate、deferred、speculative 分派成不同 `checkUnique`。
+
 ```text
 src/backend/executor/nodeModifyTable.c
 ```
+
 驱动 `INSERT ... ON CONFLICT` 的 speculative lifecycle。
 `nodeModifyTable.c:1131-1269` 是本节最重要的 executor 主链路。
+
 ```text
 src/backend/access/nbtree/nbtree.c
 ```
+
 B-tree AM 的 public insert 入口。
 `nbtree.c:200-223` 形成 index tuple，填入 heap TID，调用 `_bt_doinsert()`。
+
 ```text
 src/backend/access/nbtree/nbtinsert.c
 ```
+
 本节主文件。
 `_bt_doinsert()` 负责 search、unique check、wait/retry、insert。
 `_bt_check_unique()` 负责同 key 扫描和 heap visibility 判断。
 `_bt_findinsertloc()` 和 `_bt_insertonpg()` 负责物理插入、split、WAL。
+
 ```text
 src/backend/access/nbtree/nbtsearch.c
 ```
+
 解释 `_bt_search()`、`_bt_moveright()`、`_bt_binsrch_insert()`。
 这些函数决定“第一个可能包含 key 的 leaf page”和“恢复 heap TID tiebreaker 后的物理位置”。
+
 ```text
 src/include/access/nbtree.h
 ```
+
 定义 heapkeyspace、posting list、`BTScanInsertData`、`BTInsertStateData`。
 本节只用其中和 unique insert 相关的字段。
+
 ```text
 src/backend/access/heap/heapam.c
 ```
+
 普通 heap insert、speculative confirm、speculative abort 的 WAL 和错误边界。
+
 ```text
 src/backend/access/heap/heapam_visibility.c
 ```
+
 `HeapTupleSatisfiesDirty()` 如何把 in-progress XID 和 speculative token 返回给 caller。
+
 ```text
 src/backend/storage/lmgr/lmgr.c
 ```
+
 speculative insertion lock 的 token 生成、等待和释放。
 读完这些文件后，再回到 SQL 现象。
 否则很容易把 `ON CONFLICT` 理解成 executor 层的简单 retry。
 实际上 retry 的前提是 heap、B-tree、lock manager 已经提供了可等待、可撤销、可重查的状态边界。
+
 ## 4. 关键状态与边界
+
 先列本节只需要的状态。
 不要把它们孤立背成字段。
 每个字段的语义都依赖 lifecycle 和锁上下文。
@@ -220,7 +215,9 @@ B-tree leaf page write lock 保护的是局部 key range 的检查与插入窗�
 遇到未提交 heap tuple 后，`_bt_doinsert()` 会释放 buffer lock 再等待。
 等待结束后重新搜索。
 这就是 unique insert 的核心并发边界。
+
 ## 5. Executor 如何选择 unique check 模式
+
 `ExecInsertIndexTuples()` 是普通 insert/update 后写 index 的主入口。
 `execIndexing.c:274-318` 说明它为每个 index 形成 index tuple，并同时处理 unique/exclusion constraint。
 它在 `execIndexing.c:410-436` 决定 `checkUnique`：
@@ -244,7 +241,9 @@ speculative insertion 则会在当前 statement 内根据 `specConflict` 重试�
 它只是选择 AM 行为并收集返回结果。
 真正的 atomic unique check 在 B-tree AM 里。
 这就是 executor 和 index AM 的第一条边界。
+
 ## 6. 普通 B-tree insert 入口
+
 `btinsert()` 在 `src/backend/access/nbtree/nbtree.c:200-223`。
 它做的事很少。
 它调用 `index_form_tuple()` 形成 index tuple。
@@ -269,7 +268,9 @@ unique index 的物理 entry 指向 heap tuple。
 这也是为什么 `UNIQUE (a)` 可以有多行 `a IS NULL`。
 如果 index 是 NULLS NOT DISTINCT，则这个优化路径不会按默认 NULL distinct 语义跳过。
 本节重点是默认 B-tree unique insert 主链路，不展开 NULLS NOT DISTINCT 的全部实现。
+
 ## 7. `_bt_doinsert()` 的时间线
+
 `_bt_doinsert()` 的注释在 `nbtinsert.c:82-104`。
 它说明：
 `UNIQUE_CHECK_NO` 和 `UNIQUE_CHECK_PARTIAL` 会允许 duplicate index tuple 插入。
@@ -305,6 +306,7 @@ unique index 的物理 entry 指向 heap tuple。
 如果不是 `UNIQUE_CHECK_EXISTING`，先做 SSI conflict-in 检查，再调用 `_bt_findinsertloc()` 和 `_bt_insertonpg()`。
 如果是 `UNIQUE_CHECK_EXISTING`，只释放 buffer，不插入。
 这个流程可以压缩为：
+
 ```text
 _bt_doinsert()
   -> build insertion scankey
@@ -316,9 +318,12 @@ _bt_doinsert()
   -> _bt_findinsertloc() 找物理 offset
   -> _bt_insertonpg() 修改 page, 写 WAL, release buffer
 ```
+
 这条时间线必须记住。
 本节后面所有错误路径和观测实验都回到它。
+
 ## 8. `_bt_search()` 为什么只找到起点
+
 `_bt_search()` 在 `src/backend/access/nbtree/nbtsearch.c:76-99`。
 它不是“找到唯一的插入页”。
 它更准确地说是找到这个 scankey 第一个可能所在的 leaf page。
@@ -338,7 +343,9 @@ B-tree 的 Lehman-Yao rightlink 机制允许 search 在并发 split 下继续正
 这就是 `_bt_doinsert()` 先清空 `scantid` 的原因。
 如果一开始就带 heap TID tiebreaker，两个不同 heap TID 可能落到相邻页或不同 offset。
 那就不能用同一个 leaf page write lock 串行化“同用户 key”的检查窗口。
+
 ## 9. `_bt_check_unique()` 的扫描对象
+
 `_bt_check_unique()` 的注释在 `nbtinsert.c:388-409`。
 它返回需要等待的 xid。
 如果冲突 tuple 仍处于 speculative insertion，则通过 `*speculativeToken` 返回 token。
@@ -359,9 +366,11 @@ unique check 的语义不能被 posting list 压缩破坏。
 每一个 heap TID 都要拿出来回 heap 判定。
 `nbtinsert.c:524-544` 从普通 non-pivot tuple 或 posting list tuple 中取出 `htid`。
 然后进入最关键的 heap 检查：
+
 ```text
 table_index_fetch_tuple_check(heapRel, &htid, &SnapshotDirty, &all_dead)
 ```
+
 这行在 `nbtinsert.c:563-565`。
 它不是普通 heap fetch。
 它走 table AM index fetch 路径。
@@ -377,7 +386,9 @@ leaf page 上有没有相同 key 的 index tuple？
 dead index tuple 可以留在 B-tree 中。
 HOT chain 可能让一个 index entry 间接代表多个 heap versions。
 speculative tuple 可能当前存在但稍后被杀死。
+
 ## 10. `SnapshotDirty` 如何表达未定状态
+
 `HeapTupleSatisfiesDirty()` 是 dirty snapshot 的核心。
 `heapam_visibility.c:739-756` 的注释是本节必须读的段落。
 它说这个 visibility 函数把 open transactions 的 effects 也算进去。
@@ -404,7 +415,9 @@ speculative insertion：
 `speculativeToken != 0`。
 caller 等 speculative token lock。
 这是等待对象的根本区别。
+
 ## 11. definite conflict 的错误边界
+
 如果 `table_index_fetch_tuple_check()` 返回 true，且没有 in-progress xid，那么 `_bt_check_unique()` 认为这是 definite conflict。
 但它在报错前还有一个边界：
 `nbtinsert.c:603-633` 会检查自己要插入的 tuple 是否已经 committed dead。
@@ -427,7 +440,9 @@ heap tuple 是否已经插入取决于更上层的流程。
 speculative insertion 中，index AM 不会直接报错，而是返回 possible conflict 给 executor。
 executor 决定杀死 speculative heap tuple。
 这两个错误边界不能混在一起。
+
 ## 12. `UNIQUE_CHECK_PARTIAL` 的边界
+
 `UNIQUE_CHECK_PARTIAL` 让 AM 做“可能冲突”的检测。
 `genam.h:110-116` 要求 AM 不报错、不阻塞、不阻止插入。
 如果确定 unique，返回 true。
@@ -447,7 +462,9 @@ executor 立刻用 `specConflict` 决定 confirm 还是 abort speculative tuple�
 这一点很关键。
 `UNIQUE_CHECK_PARTIAL` 不是降低 correctness。
 它只是改变谁在什么时间承担最终结论。
+
 ## 13. `ON CONFLICT` 的 speculative 主链路
+
 `INSERT ... ON CONFLICT` 的主流程在 `nodeModifyTable.c:1131-1269`。
 它先进入 `vlock:` label。
 第一步是 non-conclusive pre-check。
@@ -458,9 +475,11 @@ executor 立刻用 `specConflict` 决定 confirm 还是 abort speculative tuple�
 这还没进入 speculative insert。
 第二步是获取 speculative insertion lock。
 `nodeModifyTable.c:1225-1232` 调用：
+
 ```text
 SpeculativeInsertionLockAcquire(GetCurrentTransactionId())
 ```
+
 注释说其他 backend 可以用这个 lock 等待本事务决定保留还是放弃插入。
 第三步是 heap speculative insert。
 `nodeModifyTable.c:1234-1239` 调用 `table_tuple_insert_speculative()`。
@@ -473,9 +492,11 @@ heap AM handler 在 `heapam_handler.c:169-185` 里把 token 写入 tuple header�
 如果 unique check 发现 potential conflict，就设置 `specConflict`。
 第五步是完成 speculative tuple。
 `nodeModifyTable.c:1247-1249` 调用：
+
 ```text
 table_tuple_complete_speculative(..., specToken, !specConflict)
 ```
+
 如果没有冲突，heap tuple 被 confirm。
 如果有冲突，heap tuple 被 abort_speculative 杀死。
 第六步是释放 speculative insertion lock。
@@ -489,7 +510,9 @@ table_tuple_complete_speculative(..., specToken, !specConflict)
 这不是无限乐观循环。
 每次循环都重新做 pre-check。
 并且 speculative token 等待避免了两个 backend 在同一个“未定 tuple”上互相死锁。
+
 ## 14. speculative token lock 的 ownership
+
 speculative token lock 在 lock manager 中实现。
 `src/backend/storage/lmgr/lmgr.c:30-45` 定义每个 backend 一个 `speculativeInsertionToken` 计数器。
 它可以 wrap around。
@@ -516,7 +539,9 @@ locktag type 是 `LOCKTAG_SPECULATIVE_TOKEN`。
 这就是 token lock 的 happens-before 语义。
 它不是 WAL 语义。
 它是 backend 间的等待协议。
+
 ## 15. speculative token 在 heap tuple 中的生命周期
+
 heap speculative tuple 的创建在 `heapam_handler.c:169-185`。
 handler 把 token 写入 `t_ctid`。
 然后调用普通 `heap_insert()`，但带 `HEAP_INSERT_SPECULATIVE`。
@@ -543,6 +568,7 @@ critical section 中把 `xmin` 设为 `InvalidTransactionId`。
 `heapam.c:6237-6263` 写 WAL。
 注释说这里生成的 WAL records match `heap_delete()`，redo 复用 delete recovery。
 所以 speculative heap tuple 的状态图是：
+
 ```text
 not present
   -> heap_insert(... HEAP_INSERT_SPECULATIVE)
@@ -553,7 +579,9 @@ not present
        WAL: XLOG_HEAP_CONFIRM
   -> commit 后成为普通 tuple
 ```
+
 或者：
+
 ```text
 not present
   -> heap_insert(... HEAP_INSERT_SPECULATIVE)
@@ -564,13 +592,16 @@ not present
        WAL: XLOG_HEAP_DELETE style record
   -> 对所有 snapshot 都像不存在
 ```
+
 index tuple 的生命周期不完全同步。
 speculative path 中 index tuple 可能已经插入。
 如果 heap tuple 被 abort_speculative 杀死，index tuple 变成 dead pointer。
 后续 scan、simple deletion、VACUUM 或 bottom-up deletion 会清理。
 正确性不要求立刻删除 index tuple。
 正确性只要求 unique check 回 heap 后不会把 killed speculative tuple 当作 live conflict。
+
 ## 16. B-tree physical insertion 与 WAL 边界
+
 唯一性建立后，或者 `UNIQUE_CHECK_PARTIAL` 选择继续插入后，进入物理 insertion。
 `_bt_findinsertloc()` 在 `nbtinsert.c:790-827`。
 它的输入 buffer 已经 exclusive locked。
@@ -611,7 +642,9 @@ split 前可以在 local temp pages 上准备 left/right page。
 这和 unique wait/retry 的思想相似：
 不要长时间占住所有资源。
 把中间状态做成可识别、可恢复、可重查。
+
 ## 17. 为什么等待后必须重查
+
 在 `_bt_doinsert()` 中，等待前释放 `insertstate.buf`。
 这一步之后有三件事可能发生。
 第一，冲突事务 commit。
@@ -636,7 +669,9 @@ blocked backend 醒来后，不是直接插入。
 它会重新进入 `_bt_search_insert()` 和 `_bt_check_unique()`。
 如果 blocker committed，它随后报 duplicate key error。
 如果 blocker rolled back，它重新证明唯一性并插入。
+
 ## 18. unique index 为什么可以有物理重复
+
 这是本节最容易出错的 mental model。
 unique index 并不意味着 leaf page 上每个用户 key 只出现一次。
 它意味着任意时刻不能有两个对同一唯一约束冲突的 live heap tuples。
@@ -660,7 +695,9 @@ posting list 压缩多个相同 key 的 heap TID。
 B-tree 维护物理有序性。
 unique check 维护用户可见唯一性。
 heap visibility 决定某个 physical duplicate 是否是冲突。
+
 ## 19. NULL、partial index 与表达式 index 的边界
+
 默认 unique index 允许多个 NULL。
 `_bt_doinsert()` 在 `nbtinsert.c:127-140` 遇到 `anynullkeys` 会绕过 checkingunique。
 原因是 core code 认为 NULL 不等于任何值，包括 NULL。
@@ -677,7 +714,9 @@ partial index 的 predicate 在 executor 层处理。
 `nbtinsert.c:768-780` 的 internal error hint 就提到 non-immutable index expression。
 这说明 unique check 的正确性依赖 operator class equality、index expression 稳定性和 heap visibility 的组合。
 不是只有 B-tree page lock。
+
 ## 20. Serializable 与 predicate lock 边界
+
 本节不展开 SSI。
 但 unique insert path 里有两个入口要认识。
 `index_insert()` 在 `src/backend/access/index/indexam.c:214-235`。
@@ -690,7 +729,9 @@ B-tree AM 支持自己的 predicate lock 处理。
 unique violation 是一个错误路径。
 但错误路径不能随意跳过其他 correctness 机制。
 有些机制即使最终抛错，也要在抛错前维护可观察的事务冲突语义。
+
 ## 21. lifecycle / ownership / cleanup
+
 executor 持有 `ResultRelInfo` 中打开的 index relations。
 `ExecOpenIndices()` 在 `execIndexing.c:162-231` 打开每个 index，并拿 `RowExclusiveLock`。
 如果 speculative path 需要 unique index 额外信息，`execIndexing.c:219-223` 调用 `BuildSpeculativeIndexInfo()`。
@@ -720,7 +761,9 @@ heap speculative tuple 的 cleanup 分两种。
 如果整个 transaction ERROR/abort，普通事务 abort 机制会让本事务插入的 heap/index effects 对未来 visibility 失效，后续清理再回收空间。
 但源码注释强调不应带着未完成的 speculative insertion commit。
 `heapam.c:6054-6060` 说明必须显式 finish 或 abort。
+
 ## 22. 错误路径与异常路径
+
 第一类错误路径是 definite duplicate。
 `UNIQUE_CHECK_YES` 下 `_bt_check_unique()` 发现 committed live conflict。
 它释放 B-tree buffers。
@@ -751,7 +794,9 @@ AM 不等待、不报错。
 这些错误说明 heap TID tiebreaker 是物理不变量。
 用户级 unique conflict 和物理 index corruption 是不同错误。
 不要把所有 duplicate 相关错误都解释成 unique violation。
+
 ## 23. 成本、资源与跨模块传播
+
 unique insert 的 hot path 成本主要来自四个变量。
 第一，相同 key 的物理 duplicates 数量。
 `_bt_check_unique()` 需要扫描 equal tuples。
@@ -774,7 +819,9 @@ index bloat 受到 aborted speculative tuples、failed duplicates、MVCC churn �
 checkpoint 和 replication lag 只看到 WAL 后果，不知道这是 unique check slow path 还是普通 insert burst。
 所以诊断 unique insert 性能时，不能只看一个 wait event。
 需要把 `pg_stat_activity` wait、`pg_locks` locktype、`pg_stat_wal`、`EXPLAIN WAL`、heap/index bloat 和 workload SQL pattern 放在一起解释。
+
 ## 24. 观测入口：能看见什么
+
 普通 unique conflict 等待最容易看。
 session 2 通常会在 `transactionid` lock 上等待 session 1。
 这是 `_bt_doinsert()` 走 `XactLockTableWait()` 的现象。
@@ -803,49 +850,65 @@ SQL 层 `EXPLAIN (ANALYZE, WAL)` 只能看到 WAL records/bytes 的累计数量�
 `pg_stat_all_tables` 可能看到 speculative insert/abort 的 insert/delete 计数影响。
 但统计是异步累计，且普通 committed conflict pre-check 可能根本不会进入 heap speculative insert。
 不要把这个指标当成精确因果。
+
 ## 25. 课堂实验一：普通 unique wait
+
 目标：
 看到普通 unique insert 如何等待未提交 tuple，并在 blocker commit/rollback 后走不同结果。
 准备：
+
 ```sql
 DROP TABLE IF EXISTS u_demo;
 CREATE TABLE u_demo (k int PRIMARY KEY, payload text);
 ```
+
 session 1：
+
 ```sql
 BEGIN;
 INSERT INTO u_demo VALUES (1, 's1');
 ```
+
 不要 commit。
 session 2：
+
 ```sql
 INSERT INTO u_demo VALUES (1, 's2');
 ```
+
 session 2 会阻塞。
 session 3 观察：
+
 ```sql
 SELECT pid, state, wait_event_type, wait_event, query
 FROM pg_stat_activity
 WHERE query LIKE '%u_demo%'
 ORDER BY pid;
 ```
+
 再看 lock：
+
 ```sql
 SELECT pid, locktype, transactionid, mode, granted
 FROM pg_locks
 WHERE locktype = 'transactionid'
 ORDER BY pid, granted;
 ```
+
 然后分两次做结论。
 第一次让 session 1：
+
 ```sql
 COMMIT;
 ```
+
 session 2 应报 duplicate key error。
 第二次重新开始，让 session 1：
+
 ```sql
 ROLLBACK;
 ```
+
 session 2 应继续成功。
 源码解释：
 session 2 在 `_bt_check_unique()` 中通过 `SnapshotDirty` 看到 session 1 的 heap tuple。
@@ -855,37 +918,48 @@ session 2 在 `_bt_check_unique()` 中通过 `SnapshotDirty` 看到 session 1 �
 等待结束后跳回 `search` 重查。
 commit 后变 definite conflict。
 rollback 后 tuple 被认为 dead，session 2 可以插入。
+
 ## 26. 课堂实验二：观察 speculative token
+
 目标：
 稳定看到 `spectoken` lock。
 普通 SQL 很难捕获它。
 建议用 gdb 或 PostgreSQL 自带 isolation spec。
 先准备表：
+
 ```sql
 DROP TABLE IF EXISTS upsert_demo;
 CREATE TABLE upsert_demo (k int PRIMARY KEY, payload text);
 ```
+
 在 backend 进程上设置断点。
 最直接的断点是：
+
 ```gdb
 break heap_finish_speculative
 break heap_abort_speculative
 break SpeculativeInsertionWait
 continue
 ```
+
 session 1 执行：
+
 ```sql
 INSERT INTO upsert_demo VALUES (1, 's1')
 ON CONFLICT (k) DO NOTHING;
 ```
+
 当 session 1 停在 `heap_finish_speculative()` 时，tuple 已经 speculative 插入，token lock 还没释放。
 session 2 执行：
+
 ```sql
 INSERT INTO upsert_demo VALUES (1, 's2')
 ON CONFLICT (k) DO NOTHING;
 ```
+
 session 2 可能停在 `SpeculativeInsertionWait()` 或在 SQL 层等待。
 观察：
+
 ```sql
 SELECT a.pid, a.wait_event_type, a.wait_event,
        l.locktype, l.transactionid, l.objid, l.mode, l.granted
@@ -894,6 +968,7 @@ JOIN pg_stat_activity a USING (pid)
 WHERE l.locktype IN ('spectoken', 'transactionid')
 ORDER BY a.pid, l.locktype, l.granted;
 ```
+
 你应该看到 `spectoken`。
 holder 是 speculative inserter 的 `ExclusiveLock`。
 waiter 是另一个 backend 的 `ShareLock`。
@@ -905,16 +980,21 @@ session 2 的 `_bt_check_unique()` 通过 `HeapTupleSatisfiesDirty()` 读到 `Sn
 session 1 complete_speculative 后释放 token lock。
 session 2 醒来重查。
 如果不想手动 gdb，可以看源码自带 isolation spec：
+
 ```text
 src/test/isolation/specs/insert-conflict-specconflict.spec
 ```
+
 这个测试用 advisory lock 控制两个 session 的进度。
 其中 `controller_print_speculative_locks` 查询 `pg_locks` 的 `spectoken` 和 `transactionid`。
 这比手工 SQL 更稳定。
+
 ## 27. 课堂实验三：WAL 与错误边界
+
 目标：
 区分 duplicate error 前没有 B-tree insert，和 speculative abort 后留下可清理 index pointer。
 普通 duplicate：
+
 ```sql
 DROP TABLE IF EXISTS wal_u_demo;
 CREATE TABLE wal_u_demo (k int PRIMARY KEY, payload text);
@@ -922,6 +1002,7 @@ INSERT INTO wal_u_demo VALUES (1, 'ok');
 EXPLAIN (ANALYZE, WAL)
 INSERT INTO wal_u_demo VALUES (1, 'dup');
 ```
+
 第二条会报 unique violation。
 因为报错，`EXPLAIN` 不会像正常完成语句一样给你完整输出。
 这本身就是一个边界：
@@ -931,14 +1012,17 @@ definite conflict 在 `_bt_check_unique()` 报错。
 speculative abort：
 用实验二的方法制造 concurrent `ON CONFLICT DO NOTHING`。
 在 gdb 中观察：
+
 ```gdb
 break heap_abort_speculative
 break heap_finish_speculative
 break _bt_check_unique
 break _bt_insertonpg
 ```
+
 重点记录顺序。
 可能的顺序是：
+
 ```text
 heap speculative insert
 btree index insert with UNIQUE_CHECK_PARTIAL
@@ -947,13 +1031,17 @@ heap_abort_speculative
 SpeculativeInsertionLockRelease
 retry or ON CONFLICT action
 ```
+
 源码解释：
 普通 duplicate 的 error boundary 在 B-tree insertion 前。
 speculative conflict 的 cleanup boundary 在 heap complete_speculative(false)。
 两者都能产生“用户看到没有插入第二行”的结果。
 但 WAL、index garbage 和 stats 行为不同。
+
 ## 28. gdb 源码跟读练习
+
 建议断点：
+
 ```gdb
 break ExecInsertIndexTuples
 break _bt_doinsert
@@ -964,7 +1052,9 @@ break SpeculativeInsertionWait
 break heap_finish_speculative
 break heap_abort_speculative
 ```
+
 普通 unique wait 时，画出：
+
 ```text
 session 1 heap tuple xmin = xid1
 session 2 _bt_check_unique sees SnapshotDirty.xmin = xid1
@@ -972,7 +1062,9 @@ session 2 speculativeToken = 0
 session 2 waits transactionid
 session 2 retries _bt_search_insert
 ```
+
 speculative wait 时，画出：
+
 ```text
 session 1 token lock = (xid1, tokenN)
 session 1 heap tuple t_ctid = speculative token
@@ -982,13 +1074,17 @@ session 2 waits spectoken
 session 1 confirms or aborts tuple
 session 2 retries
 ```
+
 在 `_bt_check_unique()` 里重点看三个变量：
+
 ```text
 SnapshotDirty.xmin
 SnapshotDirty.xmax
 SnapshotDirty.speculativeToken
 ```
+
 在 `_bt_doinsert()` 里重点看：
+
 ```text
 checkUnique
 checkingunique
@@ -997,16 +1093,21 @@ insertstate.buf
 xwait
 speculativeToken
 ```
+
 在 heap confirm/abort 里重点看：
+
 ```text
 tuple->t_ctid
 tuple xmin
 WAL record type
 page LSN
 ```
+
 不要只看函数调用栈。
 要把每个断点上的状态写成时间线。
+
 ## 29. 常见误区
+
 误区一：
 unique index leaf page 里不会有重复 key。
 实际是：
@@ -1047,7 +1148,9 @@ duplicate key error 表示本次已经写了 index tuple。
 实际是：
 `UNIQUE_CHECK_YES` definite duplicate 在 `_bt_insertonpg()` 前报错。
 speculative conflict 则可能已经写了 index tuple，但 heap tuple 被 abort_speculative 杀死。
+
 ## 30. 讨论题
+
 1. 为什么 unique check 期间要把 `itup_key->scantid` 设为 NULL？
 2. 为什么等事务结束前必须释放 B-tree buffer lock？
 3. 等待后如果不重新 `_bt_search_insert()`，可能错过哪些并发变化？
@@ -1056,7 +1159,9 @@ speculative conflict 则可能已经写了 index tuple，但 heap tuple 被 abor
 6. speculative tuple abort 后，为什么不要求立即删除已经写入的 index tuple？
 7. B-tree insert WAL 和 heap confirm WAL 分别保护什么？
 8. 如果 `pg_stat_activity` 只看到 `transactionid` wait，你能断言瓶颈一定在 B-tree page lock 吗？
+
 ## 31. 本节小结
+
 本节的核心链路是：
 heap tuple 先获得 TID。
 executor 为每个 index 选择 unique check 模式。

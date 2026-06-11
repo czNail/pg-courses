@@ -1,50 +1,62 @@
 # PostgreSQL WAL segment、switch、recycle 与 archive 边界
+
 ## 课程定位
-本节主题：PostgreSQL 怎样把连续 WAL byte stream 切成 `pg_wal` 里的 segment 文件，又怎样在 switch、checkpoint、replication slot、archive 和 recovery 之间判断一个 segment 应该保留、预创建、回收、删除，还是交给 archiver。
-前置知识：已理解 WAL byte stream、record end LSN、checkpoint redo pointer 和 replication slot 的基本作用。
-本节唯一主问题：一个 WAL segment 什么时候可以从当前写入对象变成可归档、可回收、可删除，或者仍必须保留？
-本节核心矛盾：系统希望尽快复用和删除旧 WAL 以控制磁盘；但 crash recovery、PITR、归档和复制 slot 都可能仍然需要同一段 WAL。
-本节主流程：LSN 映射到 segment -> switch 推进边界 -> `XLogWrite()` 完成 segment -> archiver 标记 `.ready/.done` -> checkpoint/restartpoint 依据保留边界 recycle/remove -> recovery 按 timeline 和来源读取。
-观测与诊断入口是 `pg_wal` 文件名、`archive_status`、`pg_stat_archiver`、replication slot retained WAL、checkpoint 日志、`pg_waldump` 和 restore_command 日志。
-本节不讲 WAL record 的 rmgr 语义，也不展开 WAL insertion lock 的完整协议。我们只盯住 segment 边界。
-读完本节，你应该能回答：
-- 一个 `XLogRecPtr` 怎样映射到 WAL segment number 和 segment 内 offset。
-- `XLogFileName()` 生成的 24 字符文件名由哪几部分组成。
-- `XLogSegmentOffset()` 为什么可以用位运算。
-- `XLByteToSeg()` 和 `XLByteToPrevSeg()` 在边界 LSN 上有什么差异。
-- `pg_switch_wal()` 为什么有时不写真实 switch record。
-- switch record 为什么要消耗当前 segment 剩余空间。
-- `XLogWrite()` 在 segment 完成时除了写文件还做什么。
-- WAL segment 的 create、preallocate、recycle、remove 分别在哪里发生。
-- `archive_status/*.ready` 和 `*.done` 是谁创建、谁消费、谁清理。
-- checkpoint、`wal_keep_size`、replication slot、`max_slot_wal_keep_size` 怎样影响保留边界。
-- crash recovery 和 archive recovery 读取 WAL segment 的边界有什么不同。
-- timeline history 怎样限制恢复时能读取哪些 segment。
-## 源码基线
-源码仓库：
-`/home/nail/postgres-lab`
-基线：
+
+前置知识：已理解 WAL byte stream、`XLogRecPtr`、record end LSN、checkpoint redo pointer、archive 和 replication slot 的基本作用。
+
+本节唯一主问题：
+
 ```text
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
+一个 WAL segment 什么时候可以从当前写入对象变成可归档、可回收、可删除，或者仍必须保留？
 ```
-本节重点阅读：
+
+核心矛盾：系统希望尽快复用和删除旧 WAL 以控制磁盘；但 crash recovery、PITR、归档、timeline 和复制 slot 都可能仍然需要同一段 WAL。
+
+一句话运行模型：
+
 ```text
-src/include/access/xlog_internal.h
-src/backend/access/transam/xlog.c
-src/backend/access/transam/xlogarchive.c
-src/backend/access/transam/xlogrecovery.c
-src/backend/access/transam/timeline.c
+WAL 逻辑上是一条连续 byte stream，pg_wal segment 只是固定大小切片；switch 推进 segment 边界，XLogWrite() 完成 segment 并通知归档，checkpoint/restartpoint 再综合 redo、slot、wal_keep_size、archive gate 和 timeline 决定保留、回收或删除。
 ```
-辅助核对 archiver 边界：
+
+学完后应能判断：`XLByteToSeg()` 与 `XLByteToPrevSeg()` 的边界差异；switch record 为什么消耗剩余空间；`.ready/.done` 谁创建和消费；slot / checkpoint / archive 如何共同推迟删除。
+
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。
+
+## 1. 本节在总主线中的位置
+
+前面课程主要关注一条 WAL record 如何产生、插入和 flush。本节把视角扩大到 WAL 文件生命周期：连续 WAL byte stream 如何落到 `pg_wal` 的 segment 文件，又如何在写完后进入归档、回收、删除或恢复读取路径。
+
+它不讲 rmgr 语义，也不重新展开 insertion lock。我们只盯住 segment 边界和保留条件。
+
+## 2. 核心矛盾与一句话运行模型
+
+WAL segment 管理的难点在于，一个旧文件对当前写入者可能已经无用，但对 crash recovery、PITR、standby、replication slot、archive_command 或 timeline history 仍可能是必需品。删除和回收必须在所有这些边界之后发生。
+
+最短模型如下：
+
 ```text
-src/backend/postmaster/pgarch.c
-src/include/postmaster/pgarch.h
+LSN -> segment/offset
+  -> switch 推进边界
+  -> XLogWrite() 完成 segment
+  -> archive_status 标记 ready/done
+  -> checkpoint/restartpoint 计算保留边界
+  -> recycle/remove 或 recovery 继续读取
 ```
-行号来自：
-`nl -ba <source-file>`
----
-## 1. 先给结论
+
+## 3. 核心文件分工与阅读顺序
+
+| 阅读顺序 | 文件 | 本节读什么 |
+| --- | --- | --- |
+| 1 | `src/include/access/xlog_internal.h` | `XLogRecPtr` 到 segment number、file name、offset 的宏和边界。 |
+| 2 | `src/backend/access/transam/xlog.c` | switch、`XLogWrite()`、segment create/preallocate/recycle/remove、checkpoint 清理入口、`KeepLogSeg()`。 |
+| 3 | `src/backend/access/transam/xlogarchive.c` | `XLogArchiveNotify()`、`XLogArchiveCheckDone()`、`.ready/.done` gate。 |
+| 4 | `src/backend/postmaster/pgarch.c` | archiver 如何消费 `.ready` 并生成 `.done`。 |
+| 5 | `src/backend/access/transam/xlogrecovery.c` | recovery 读取 WAL segment、来源状态机和 record 合法性检查。 |
+| 6 | `src/backend/access/transam/timeline.c` | timeline history 如何限制恢复读取。 |
+| 7 | `src/include/postmaster/pgarch.h` | archiver 边界的头文件入口。 |
+
+## 4. 关键结论：segment 边界
+
 WAL 在逻辑上是一条单调增长的 byte stream。
 `XLogRecPtr` 是这条 byte stream 上的位置。
 `pg_wal` 里的 segment 文件只是把同一条 byte stream 按固定 `wal_segment_size` 切片后的外部形态。
@@ -67,12 +79,14 @@ WAL 在逻辑上是一条单调增长的 byte stream。
 第三段是 segment number 在这个 4GB 组内的余数。
 默认 16MB segment 时，每 4GB 有 256 个 segment。
 所以 timeline 1 上：
+
 ```text
 segno 0   -> 000000010000000000000000
 segno 1   -> 000000010000000000000001
 segno 255 -> 0000000100000000000000FF
 segno 256 -> 000000010000000100000000
 ```
+
 segment switch 的本质不是“创建一个新文件”。
 它是把 WAL insert position 推到下一个 segment 的开头。
 如果当前位置已经在 segment 开头，`ReserveXLogSwitch()` 返回 false，不需要写真实 switch record。
@@ -95,8 +109,9 @@ checkpoint 删除或回收前调用 `XLogArchiveCheckDone()`，看到 `.done` �
 恢复侧不能只看文件名。
 它要检查 checkpoint redo、timeline history、WAL page header、record 合法性和 WAL 来源状态机。
 相关代码在 `xlogrecovery.c:456-966`、`xlogrecovery.c:3108-3498`、`xlogrecovery.c:3533-4375`。
----
-## 2. 核心名词
+
+## 5. 核心名词
+
 `XLogRecPtr`：WAL byte stream 上的位置，通常显示为 `X/Y`。
 `wal_segment_size`：每个 WAL segment 文件的大小。它是集群级属性，不是普通在线可改 GUC。
 `XLogSegNo`：segment number，从 byte stream 开头按 `wal_segment_size` 编号。
@@ -111,8 +126,9 @@ checkpoint 删除或回收前调用 `XLogArchiveCheckDone()`，看到 `.done` �
 `.done`：archiver 已成功归档。
 `wal_recycle`：允许把旧 segment 重命名成未来 segment，而不是直接删除。
 `replication slot restart_lsn`：slot 仍需要的最老 WAL 位置，会推后删除边界。
----
-## 3. byte stream 到文件名和 offset
+
+## 6. byte stream 到文件名和 offset
+
 先读 `xlog_internal.h:86-120`。
 这里把 WAL 地址体系压缩成几个宏：
 - `IsValidWalSegSize`
@@ -124,17 +140,21 @@ checkpoint 删除或回收前调用 `XLogArchiveCheckDone()`，看到 `.done` �
 `XLogSegmentsPerXLogId(wal_segment_size)` 表示 4GB 地址空间内有多少 segment。
 默认 16MB 时是 256。
 从 LSN 找文件名和 offset 的过程是：
+
 ```text
 XLByteToSeg(lsn, segno, wal_segment_size)
 XLogFileName(fname, tli, segno, wal_segment_size)
 offset = XLogSegmentOffset(lsn, wal_segment_size)
 ```
+
 从文件名找 byte stream 范围的过程是：
+
 ```text
 XLogFromFileName(fname, &tli, &segno, wal_segment_size)
 start = segno * wal_segment_size
 end = start + wal_segment_size
 ```
+
 手工例子，假设 `wal_segment_size = 16MB = 0x01000000`。
 LSN：
 `0/02000188`
@@ -153,8 +173,9 @@ LSN：
 这个差异会在 `XLogWrite()` 中直接出现。
 当 `LogwrtResult.Write` 正好是下一个 segment 开头，写入路径仍然要 fsync 刚完成的前一个 segment。
 所以代码使用 previous segment 语义，见 `xlog.c:2381-2397`。
----
-## 4. segment 不是 WAL page
+
+## 7. segment 不是 WAL page
+
 segment 是外部文件边界。
 WAL page 是 segment 内部的页边界。
 `CopyXLogRecordToWAL()` 写 record 时会跨 WAL page 拷贝，见 `xlog.c:1266-1344`。
@@ -163,14 +184,17 @@ segment 第一页使用 long page header，其他页使用 short page header。
 所以 `XLogSegmentOffset()` 只回答“在 segment 文件中的 offset”。
 它不回答“当前 WAL page 剩多少 payload 空间”。
 理解时可以建立两层模型：
+
 ```text
 XLogRecPtr byte stream
   -> 按 XLOG_BLCKSZ 分 WAL page
   -> 按 wal_segment_size 分 segment file
 ```
+
 switch 会同时触碰这两层：它要把 byte stream 推到下一个 segment，同时还要让剩余 WAL page 进入可写出状态。
----
-## 5. segment switch
+
+## 8. segment switch
+
 `RequestXLogSwitch()` 在 `xlog.c:8605-8617`。
 它发起一条 `RM_XLOG_ID / XLOG_SWITCH` WAL insert。
 真正特殊处理在 `ReserveXLogSwitch()` 和 `CopyXLogRecordToWAL()`。
@@ -193,14 +217,16 @@ switch 会同时触碰这两层：它要把 byte stream 推到下一个 segment�
 所以被 switch 出来的 WAL segment 后半段有大片零，不表示损坏。
 它表示这个 segment 被人为关闭。
 switch 的关键结论：
+
 ```text
 switch 关闭当前 segment 的 WAL address space。
 它不等于一定新建文件。
 它不等于旧 segment 可以删除。
 它不等于 archive 已完成。
 ```
----
-## 6. `XLogWrite()` 和 segment 完成点
+
+## 9. `XLogWrite()` 和 segment 完成点
+
 `XLogWrite()` 在 `xlog.c:2325-2601`。
 它负责把 WAL buffers 写入 segment 文件，并按请求 fsync 到指定 LSN。
 循环开始时，它从 `LogwrtResult.Write` 所在 WAL buffer page 写起。
@@ -221,13 +247,16 @@ switch 关闭当前 segment 的 WAL address space。
 但普通 flush 只保证写到某个 LSN 并 fsync，不会创建 `.ready`。
 创建 `.ready` 的时机是完整 segment 完成。
 因此：
+
 ```text
 commit flush 解决事务持久性。
 finishing_seg 解决 segment 完整性和归档通知。
 ```
+
 这两个边界不能混用。
----
-## 7. WAL 文件创建和预创建
+
+## 10. WAL 文件创建和预创建
+
 WAL segment 文件创建入口之一是 `XLogFileInit()`，内部调用 `XLogFileInitInternal()`。
 关键代码在 `xlog.c:3243-3415`。
 它先尝试打开目标文件。
@@ -250,16 +279,19 @@ recovery 或 walreceiver 某些阶段会关闭安装能力，避免本地预创�
 checkpoint 尾部会在清理旧 WAL 后调用它，见 `xlog.c:7866-7871`。
 这样可以优先利用刚 recycle 出来的文件。
 重要边界：
+
 ```text
 文件存在不等于文件里有有效 WAL 到末尾。
 预创建文件也可能还没承载真实 WAL record。
 恢复必须验证 page header、record、timeline。
 ```
----
-## 8. recycle、remove 与 `XLOGfileslop()`
+
+## 11. recycle、remove 与 `XLOGfileslop()`
+
 旧 WAL segment 的处理入口是 checkpoint 或 restartpoint。
 普通 checkpoint 的路径在 `xlog.c:7830-7871`。
 大致顺序是：
+
 ```text
 SyncPostCheckpoint()
 UpdateCheckPointDistanceEstimate()
@@ -270,6 +302,7 @@ KeepLogSeg() again if needed
 RemoveOldXlogFiles()
 PreallocXlogFiles()
 ```
+
 `RedoRecPtr` 是 crash recovery 所需的基本下界。
 早于这个 redo 边界的 WAL 才可能成为删除候选。
 但它只是第一层边界。
@@ -298,14 +331,16 @@ replication slots、`wal_keep_size`、WAL summarization 都可能要求保留更
 无论 recycle 还是 remove，成功后都会调用 `XLogArchiveCleanup(segname)` 清理 `.done` 和残留 `.ready`。
 见 `xlog.c:4133` 和 `xlogarchive.c:713-724`。
 所以清理链条是：
+
 ```text
 checkpoint 选候选
   -> archive gate
   -> recycle 或 remove
   -> cleanup archive_status
 ```
----
-## 9. `archive_status` 与 archiver 边界
+
+## 12. `archive_status` 与 archiver 边界
+
 `XLogArchiveNotify()` 在 `xlogarchive.c:445-487`。
 它创建：
 `pg_wal/archive_status/<name>.ready`
@@ -320,6 +355,7 @@ timeline history 写完也会 notify，见 `timeline.c:448-452`。
 `XLogArchiveCheckDone()` 在 `xlogarchive.c:565-607`。
 它用于删除或回收前检查。
 逻辑是：
+
 ```text
 archiving off -> true
 archive recovery 且不是 archive_mode=always -> true
@@ -327,6 +363,7 @@ archive recovery 且不是 archive_mode=always -> true
 存在 .ready -> false
 两者都没有 -> 补建 .ready，然后 false
 ```
+
 补建 `.ready` 很重要。
 如果第一次归档通知创建失败，后续 checkpoint 还会重试通知，而不是冒险删除。
 `XLogArchiveIsBusy()` 在 `xlogarchive.c:619-651`。
@@ -343,13 +380,15 @@ archiver 本身在 `pgarch.c`。
 这个 rename 不是 durable rename。
 源码要求 archive command 或 archive library 能容忍 crash 后重复归档。
 最重要边界：
+
 ```text
 WAL writer 只负责创建 .ready。
 archiver 成功后才创建 .done。
 checkpoint cleanup 看到 .done 才能删除或回收旧 WAL。
 ```
----
-## 10. checkpoint、slot 与保留边界
+
+## 13. checkpoint、slot 与保留边界
+
 `CalculateCheckpointSegments()` 在 `xlog.c:2191-2218`。
 它根据 `max_wal_size_mb` 和 `checkpoint_completion_target` 估算触发 checkpoint 的 WAL 距离。
 `XLogCheckpointNeeded()` 在 `xlog.c:2300-2310`。
@@ -381,13 +420,15 @@ WAL summarization 也可能推后删除。
 - `WALAVAIL_INVALID_LSN`
 其中 `UNRESERVED` 表示不再被保留，但文件可能还没被 checkpoint 删除。
 所以：
+
 ```text
 不再 reserved 不等于立刻 removed。
 max_wal_size 不是硬删除上限。
 archive 未完成也会阻止删除。
 ```
----
-## 11. crash recovery 边界
+
+## 14. crash recovery 边界
+
 `InitWalRecovery()` 在 `xlogrecovery.c:456-966`。
 它分析 control file、recovery signal、backup label，并决定是否需要 recovery、从哪里开始读 WAL。
 如果有 `backup_label`，恢复从 backup label 指向的 checkpoint 开始，见 `xlogrecovery.c:532-648`。
@@ -401,6 +442,7 @@ archive 未完成也会阻止删除。
 `PerformWalRecovery()` 在 `xlogrecovery.c:1611-1828`。
 它从 checkpoint redo 或 checkpoint 后的下一条 record 开始主 redo loop。
 主循环做：
+
 ```text
 检查 pause
 检查 recovery target before
@@ -410,11 +452,13 @@ ApplyWalRecord()
 检查 recovery target after
 ReadRecord() 下一条
 ```
+
 见 `xlogrecovery.c:1707-1806`。
 crash recovery 的结束不是“读完某个文件名”。
 它是“从选定 redo 点开始，按 WAL record 连续 replay，直到没有下一条有效 record 或达到 recovery target”。
----
-## 12. recovery 读取 WAL segment
+
+## 15. recovery 读取 WAL segment
+
 `ReadRecord()` 在 `xlogrecovery.c:3108-3240`。
 它调用 WAL reader/prefetcher 读取下一条 record。
 如果读到 record，会检查 WAL page 的 timeline 是否在 expected history 中。
@@ -431,6 +475,7 @@ standby 模式下，如果 segment 第一页 header 无效，会立刻换来源�
 这是为了处理本地 `pg_wal` 中存在同名但内容已经 recycle 的文件。
 `WaitForWALToBecomeAvailable()` 在 `xlogrecovery.c:3533-3829`。
 它实现 WAL 来源状态机：
+
 ```text
 archive 或 pg_wal
 promotion trigger check
@@ -438,6 +483,7 @@ stream
 rescan timelines
 sleep and retry
 ```
+
 不在 archive recovery 时，读 `pg_wal`。
 在 archive recovery 时，通常优先 archive。
 standby 模式下，archive/pg_wal 失败后可以转向 stream。
@@ -450,8 +496,9 @@ archive 来源会调用 `RestoreArchivedFile()`。
 所以 recovery 读取 segment 的判断是：
 `segment number + timeline history + source priority + WAL page/record validation`
 不是“目录里存在这个文件就读”。
----
-## 13. archive restore 边界
+
+## 16. archive restore 边界
+
 `RestoreArchivedFile()` 在 `xlogarchive.c:54-283`。
 它只在 `ArchiveRecoveryRequested` 且存在 `restore_command` 时尝试 restore。
 见 `xlogarchive.c:68-77`。
@@ -466,12 +513,14 @@ PITR 的常见模式就是一直 roll forward，直到 restore command 找不到
 源码在 `xlogarchive.c:241-270` 明确把这种失败视为恢复流程的一部分。
 但信号、硬 shell 错误、错误大小等情况会升级为更高错误级别。
 所以 archive restore 的边界是：
+
 ```text
 找不到下一个 WAL 可以是正常结束。
 找到了但大小不对、命令异常或信号中断，可能是错误。
 ```
----
-## 14. timeline history 边界
+
+## 17. timeline history 边界
+
 timeline history 由 `timeline.c` 处理。
 文件格式在 `timeline.c:1-22`。
 文件名类似：
@@ -494,8 +543,9 @@ promotion 或 end-of-recovery 会创建新 timeline history。
 如果 archiving active，会立即通知 archiver，见 `timeline.c:448-452`。
 `RemoveNonParentXlogFiles()` 在 `xlog.c:3990-4044`。
 切到新 timeline 时，它清理不属于新 timeline history 的未来 WAL segment，避免旧 timeline 上预创建或 recycle 出来的垃圾文件被错误归档。
----
-## 15. 成本、资源与常见误区：四个常见误读
+
+## 18. 成本、资源与常见误区：四个常见误读
+
 误读一：
 `switch 就是创建新 WAL 文件。`
 不准确。switch 是 WAL insert position 推进到下一个 segment。目标文件可能已经预创建，也可能 recycle 得来，也可能稍后才创建。
@@ -508,8 +558,9 @@ promotion 或 end-of-recovery 会创建新 timeline history。
 误读四：
 `文件存在就能用于 recovery。`
 错误。文件可能是预创建、recycle 后残留、来自 base backup 的部分文件，或属于另一个 timeline。recovery 必须验证 page header、record、timeline 和来源状态。
----
-## 16. 源码跟读练习一：LSN 到文件
+
+## 19. 源码跟读练习一：LSN 到文件
+
 目标：
 `给一个 LSN，手算文件名和 offset。`
 步骤：
@@ -519,20 +570,25 @@ promotion 或 end-of-recovery 会创建新 timeline history。
 4. 读 `xlog_internal.h:164-205`。
 5. 用默认 16MB segment 手算 `0/02000188`。
 预期：
+
 ```text
 segno = 2
 offset = 0x188
 timeline 1 file = 000000010000000000000002
 ```
+
 边界题：
+
 ```text
 0/02000000
 XLByteToSeg -> 2
 XLByteToPrevSeg -> 1
 ```
+
 解释时必须说明“从这里读”和“刚写完哪里”是两个问题。
----
-## 17. 源码跟读练习二：switch
+
+## 20. 源码跟读练习二：switch
+
 目标：
 `解释 pg_switch_wal() 为什么有时不产生新 segment。`
 步骤：
@@ -542,12 +598,14 @@ XLByteToPrevSeg -> 1
 4. 继续读 `xlog.c:1347-1406`。
 5. 画出 `StartPos`、switch record header、`EndPos` 的关系。
 检查点：
+
 ```text
 ReserveXLogSwitch() 返回 false 不是错误；
 它表示当前 WAL insert position 已经在 segment 边界。
 ```
----
-## 18. 源码跟读练习三：segment 完成
+
+## 21. 源码跟读练习三：segment 完成
+
 目标：
 `找出完整 segment 写完时发生的副作用。`
 步骤：
@@ -557,6 +615,7 @@ ReserveXLogSwitch() 返回 false 不是错误；
 4. 列出 `finishing_seg` 分支中的动作。
 5. 对照 `xlogarchive.c:493-501`。
 必须列出：
+
 ```text
 fsync
 walsender wakeup
@@ -565,8 +624,9 @@ archive notify
 last switch time/LSN
 maybe checkpoint request
 ```
----
-## 19. 源码跟读练习四：checkpoint 删除边界
+
+## 22. 源码跟读练习四：checkpoint 删除边界
+
 目标：
 `解释 checkpoint 为什么不能只按 RedoRecPtr 删除。`
 步骤：
@@ -577,12 +637,14 @@ maybe checkpoint request
 5. 回到 `xlog.c:7851-7861`。
 6. 解释 slot invalidation 后为什么要重新计算。
 一句话答案：
+
 ```text
 RedoRecPtr 是 crash recovery 下界；
 KeepLogSeg() 把它调整为所有保留需求中的最老边界。
 ```
----
-## 20. 源码跟读练习五：archive_status
+
+## 23. 源码跟读练习五：archive_status
+
 目标：
 `区分 .ready、.done、删除前检查和 archiver 完成。`
 步骤：
@@ -598,8 +660,9 @@ KeepLogSeg() 把它调整为所有保留需求中的最老边界。
 10. 确认 recycle/remove 后清理状态文件。
 一句话答案：
 `.ready 是任务队列，.done 是完成标记，checkpoint 是删除候选的最终消费者。`
----
-## 21. 源码跟读练习六：恢复读 segment
+
+## 24. 源码跟读练习六：恢复读 segment
+
 目标：
 `解释 recovery 为什么不能只按文件名读 pg_wal。`
 步骤：
@@ -614,18 +677,22 @@ KeepLogSeg() 把它调整为所有保留需求中的最老边界。
 9. 读 `timeline.c:76-217` 和 `timeline.c:544-592`。
 10. 说明 timeline history 如何限制候选文件。
 结论：
+
 ```text
 文件名只给出候选 segment；
 recovery 还要验证 timeline、page、record、source 和 target。
 ```
----
-## 22. 实验一：观察 LSN、文件名、offset
+
+## 25. 实验一：观察 LSN、文件名、offset
+
 在测试实例中执行：
+
 ```sql
 select pg_current_wal_lsn();
 select pg_walfile_name(pg_current_wal_lsn());
 select * from pg_walfile_name_offset(pg_current_wal_lsn());
 ```
+
 练习：
 1. 记录 LSN。
 2. 确认实例实际 `wal_segment_size`。
@@ -634,55 +701,73 @@ select * from pg_walfile_name_offset(pg_current_wal_lsn());
 5. 回到 `xlog_internal.h:99-120` 核对公式。
 注意：
 `不要假设所有实例都是 16MB segment。`
----
-## 23. 实验二：观察 switch
+
+## 26. 实验二：观察 switch
+
 执行：
+
 ```sql
 select pg_current_wal_lsn();
 select pg_switch_wal();
 select pg_current_wal_lsn();
 select pg_switch_wal();
 ```
+
 观察：
+
 ```text
 $PGDATA/pg_wal
 $PGDATA/pg_wal/archive_status
 ```
+
 如果 archiving 没开，可能没有 `.ready`。
 如果第二次 switch 时已经在 segment 开头，可能不会产生新的 WAL segment。
 对应源码：
+
 ```text
 xlog.c:1205-1258
 xlog.c:1347-1406
 xlog.c:8605-8617
 ```
----
-## 24. 实验三：观察 archive_status
+
+## 27. 实验三：观察 archive_status
+
 配置测试归档：
+
 ```text
 archive_mode = on
 archive_command = 'test ! -f /tmp/pg-archive/%f && cp %p /tmp/pg-archive/%f'
 ```
+
 创建目录：
+
 ```sh
 mkdir -p /tmp/pg-archive
 ```
+
 重启实例后执行：
+
 ```sql
 select pg_switch_wal();
 ```
+
 观察：
+
 ```sh
 ls -l "$PGDATA/pg_wal/archive_status"
 ls -l /tmp/pg-archive
 ```
+
 成功时 `.ready` 会变成 `.done`。
 执行：
+
 ```sql
 checkpoint;
 ```
+
 再次观察 `.done` 是否被清理。
 对应源码链：
+
 ```text
 XLogWrite()
 XLogArchiveNotifySeg()
@@ -691,8 +776,9 @@ pgarch_archiveDone()
 RemoveXlogFile()
 XLogArchiveCleanup()
 ```
----
-## 25. 诊断矩阵：segment 没有按预期出现、归档或删除
+
+## 28. 诊断矩阵：segment 没有按预期出现、归档或删除
+
 排查 WAL segment 问题时，先把现象归到具体边界，不要直接从文件名推断结论。
 
 现象一：
@@ -729,7 +815,7 @@ recovery 读到文件名匹配的 segment 仍然失败。
 recovery 还要验证 WAL page header、record CRC、continuation、timeline history 和 source state。
 如果来自 archive、`pg_wal`、stream 的切换边界不清楚，先跟 `XLogPageRead()`，再看 `ReadRecord()` 对 invalid record 的处理。
 
-## 26. 讨论题
+## 29. 讨论题
 
 1. 为什么 segment switch 的本质是推进 WAL insert position，而不是“创建一个新文件”？
 2. `XLByteToSeg()` 和 `XLByteToPrevSeg()` 只在边界 LSN 上不同，这个差异分别服务“从哪里读”和“刚写完哪里”两个问题，为什么不能混用？
@@ -739,9 +825,11 @@ recovery 还要验证 WAL page header、record CRC、continuation、timeline his
 6. archive recovery 读不到 archive 中的下一段 WAL 时，什么时候可以 fallback 到 `pg_wal` 或等待 stream，什么时候意味着恢复结束或错误？
 7. timeline history 为什么也是 recovery contract 的一部分，而不只是文件名装饰？
 8. 本节的可迁移规律是什么：文件生命周期什么时候不能由“文件是否存在”决定，而必须由多方消费进度共同决定？
----
-## 27. 调试断点建议
+
+## 30. 调试断点建议
+
 优先断这些函数：
+
 ```text
 RequestXLogSwitch
 ReserveXLogSwitch
@@ -762,12 +850,14 @@ XLogFileReadAnyTLI
 readTimeLineHistory
 writeTimeLineHistory
 ```
+
 建议先跟 switch。
 再跟 checkpoint cleanup。
 最后跟 recovery。
 不要一开始就在全量 recovery 上打太多断点，WAL replay 调用频率很高。
----
-## 28. 本节小结
+
+## 31. 本节小结
+
 WAL segment 是 WAL byte stream 的文件化切片。
 `XLogFileName()` 把 timeline 和 segment number 编码成 24 字符文件名。
 `XLogSegmentOffset()` 给出 LSN 在 segment 内的 offset。
@@ -795,6 +885,7 @@ archive recovery 通常优先 archive。
 timeline history 文件本身也要归档。
 promotion 后的新 timeline 依赖 history 文件让后续恢复判断哪些 WAL segment 合法。
 本节最重要的一句话：
+
 ```text
 WAL segment 的正确性不在单个文件名里，而在 byte stream 位置、timeline、
 flush/archive 状态、checkpoint 保留边界和 recovery 验证共同形成的边界里。

@@ -1,7 +1,7 @@
 # PostgreSQL checkpoint lifecycle 与 redo pointer
 
 ## 课程定位
-本节主题：PostgreSQL checkpoint 的生命周期，以及 checkpoint record 中的 redo pointer 到底保护什么。
+
 上一组课程已经讲过 WAL record、WAL flush、segment、full-page writes 和 rmgr redo contract。
 这一节把这些线索收束到 checkpoint。
 checkpoint 不是简单的“把脏页刷到磁盘”。
@@ -30,19 +30,41 @@ checkpoint 对外发布新的恢复起点时，PostgreSQL 怎样保证这个起�
 - 哪些错误会导致 checkpoint 失败，哪些会导致 PANIC/FATAL。
 - timeline history 为什么也属于 checkpoint/recovery 的安全边界。
 
-## 源码基线
-源码仓库：
+源码基线：本课使用当前实际源码路径 `/home/highgo/postgres`，branch `master`，commit `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`；核心源码分工见第 3 节。
+
+## 1. 本节在总主线中的位置
+
+前面几节分别讲了 WAL record、WAL flush、full-page writes、segment write 和 fsync queue。本节把这些机制合到 checkpoint 生命周期里：checkpoint 不是一个单纯刷脏页动作，而是发布 crash recovery 新入口的跨模块协议。
+
+## 2. 核心矛盾与一句话运行模型
+
+一句话运行模型：
+
 ```text
-/home/nail/postgres-lab
+在线 checkpoint 先写 XLOG_CHECKPOINT_REDO 固定 redo pointer，再写出并 fsync 本轮需要覆盖的数据状态，最后插入并 flush checkpoint record、更新 pg_control，让 crash recovery 能从 CheckPoint.redo 开始重放。
+```
+
+核心矛盾是：系统想推进 redo pointer 来缩短恢复和释放 WAL，但 control file 一旦指向新 checkpoint，recovery 就会相信从该 redo 起点开始足够恢复；checkpoint 必须把性能窗口和恢复安全边界同时固定住。
+
+## 3. 核心文件分工与阅读顺序
+
+本节把源码基线、重点入口和辅助核对路径集中放在这里，避免课程定位之后再漂一个未编号大节。
+
+源码仓库：
+
+```text
+/home/highgo/postgres
 ```
 
 基线：
+
 ```text
 branch: master
 commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
 ```
 
 本节重点阅读：
+
 ```text
 src/backend/access/transam/xlog.c
 src/backend/access/transam/xlogrecovery.c
@@ -53,6 +75,7 @@ src/backend/access/transam/timeline.c
 ```
 
 为讲清 checkpoint record 和 dirty page flush，本节还辅助核对：
+
 ```text
 src/include/catalog/pg_control.h
 src/common/controldata_utils.c
@@ -62,13 +85,13 @@ src/backend/storage/smgr/md.c
 ```
 
 行号来自：
+
 ```text
 nl -ba <source-file>
 ```
 
----
+## 4. 运行模型：checkpoint record 与 redo pointer
 
-## 1. 先给结论
 PostgreSQL 的在线 checkpoint 是一个两阶段 WAL 标记。
 第一阶段是 checkpoint 开始时插入 `XLOG_CHECKPOINT_REDO`。
 这条 record 的起始 LSN 成为新的 redo pointer。
@@ -76,12 +99,14 @@ PostgreSQL 的在线 checkpoint 是一个两阶段 WAL 标记。
 这个 online checkpoint record 的 payload 是 `CheckPoint`。
 其中 `CheckPoint.redo` 指回第一阶段的 redo pointer。
 最后，`pg_control` 才被更新为：
+
 ```text
 ControlFile->checkPoint = checkpoint record 的起始 LSN
 ControlFile->checkPointCopy = CheckPoint payload 的拷贝
 ```
 
 所以在线 checkpoint 有两个重要 LSN：
+
 ```text
 redo pointer      = XLOG_CHECKPOINT_REDO record 的起始 LSN
 checkpoint record = XLOG_CHECKPOINT_ONLINE record 的起始 LSN
@@ -98,6 +123,7 @@ shutdown checkpoint 不需要两个 record。
 `CreateCheckPoint()` 对 shutdown checkpoint 计算下一条 WAL record 的位置作为 `checkPoint.redo`。
 随后插入 `XLOG_CHECKPOINT_SHUTDOWN`。
 源码还要求：
+
 ```text
 shutdown && checkPoint.redo == ProcLastRecPtr
 ```
@@ -106,6 +132,7 @@ shutdown && checkPoint.redo == ProcLastRecPtr
 见 `xlog.c:7770-7776`。
 
 redo pointer 的核心含义是：
+
 ```text
 从这个 WAL 位置开始 replay，足以把数据文件恢复到 checkpoint 之后的一致状态。
 ```
@@ -150,6 +177,7 @@ checkpointer 之后调用 `CreateRestartPoint()`，如果这个 checkpoint 比 `
 也不能在存在 unresolved invalid page references 时建立。
 
 checkpoint cause 在本基线里只有两个“cause bit”：
+
 ```text
 CHECKPOINT_CAUSE_XLOG
 CHECKPOINT_CAUSE_TIME
@@ -159,9 +187,8 @@ CHECKPOINT_CAUSE_TIME
 手动 CHECKPOINT、shutdown、end-of-recovery、force、fast、wait、flush-unlogged 是请求或行为标志，不是独立 cause bit。
 `CheckpointFlagsString()` 会把这些 bit 拼到日志里，见 `xlog.c:7145-7165`。
 
----
+## 5. 核心结构和名词
 
-## 2. 核心结构和名词
 先读 `src/include/access/xlog.h`。
 `xlog.h:144-162` 定义 checkpoint request flag。
 这些 flag 可以 OR 在一起。
@@ -247,6 +274,7 @@ checkpoint record 的主体结构不在 `xlog.h`。
 - `data_checksum_version`
 
 所以本节会区分两种 record：
+
 ```text
 XLOG_CHECKPOINT_REDO    payload = xl_checkpoint_redo
 XLOG_CHECKPOINT_ONLINE  payload = CheckPoint
@@ -271,9 +299,8 @@ XLOG_CHECKPOINT_SHUTDOWN payload = CheckPoint
 `ControlFile->checkPointCopy.redo` 才是 redo pointer。
 `pg_controldata` 输出里常见的 checkpoint location 和 REDO location，就是这两类信息。
 
----
+## 6. `RequestCheckpoint()`：请求不是执行
 
-## 3. `RequestCheckpoint()`：请求不是执行
 入口在 `src/backend/postmaster/checkpointer.c:1051-1196`。
 函数注释说它由 backend process 调用，用于请求 checkpoint。
 它不是 checkpoint 执行器。
@@ -286,6 +313,7 @@ standalone 没有其它 backend，所以没有必要慢慢 checkpoint。
 第二，在共享内存中 OR 上请求 flag。
 `checkpointer.c:1092-1107` 先记录旧的 `ckpt_failed` 和 `ckpt_started`。
 然后：
+
 ```text
 ckpt_flags |= flags | CHECKPOINT_REQUESTED
 ```
@@ -320,6 +348,7 @@ OR 合并后，checkpointer 看到的是更强的合并请求。
 它解析 `mode=spread|fast` 和 `flush_unlogged`。
 权限要求是 `pg_checkpoint`。
 最后调用：
+
 ```text
 RequestCheckpoint(CHECKPOINT_WAIT | ... | CHECKPOINT_FORCE)
 ```
@@ -328,17 +357,18 @@ RequestCheckpoint(CHECKPOINT_WAIT | ... | CHECKPOINT_FORCE)
 因为 recovery 中请求的是 restartpoint。
 restartpoint 是否能建立取决于是否已经 replay 到新的安全 checkpoint record。
 
----
+## 7. `CheckpointerMain()`：合并请求、时间和 recovery 状态
 
-## 4. `CheckpointerMain()`：合并请求、时间和 recovery 状态
 `CheckpointerMain()` 在 `checkpointer.c:205-664`。
 它是 checkpointer 进程主循环。
 本节只关心 checkpoint 相关路径。
 
 启动时，checkpointer 把自己的 pid 写入共享内存：
+
 ```text
 CheckpointerShmem->checkpointer_pid = MyProcPid
 ```
+
 见 `checkpointer.c:214`。
 
 共享内存结构在 `checkpointer.c:118-143`。
@@ -372,6 +402,7 @@ fsync request ring buffer 受 `CheckpointerCommLock` 保护。
 
 如果要做 checkpoint，checkpointer 先判断当前是否在 recovery。
 `checkpointer.c:428-430`：
+
 ```text
 do_restartpoint = RecoveryInProgress()
 ```
@@ -396,6 +427,7 @@ do_restartpoint = RecoveryInProgress()
 注意它只对 WAL 消耗触发的普通 checkpoint 做这个 warning。
 
 真正执行在 `checkpointer.c:498-504`：
+
 ```text
 if (!do_restartpoint)
     CreateCheckPoint(flags)
@@ -420,9 +452,8 @@ checkpointer 把下一次尝试推到约 15 秒后。
 `ShutdownXLOG()` 会创建 shutdown checkpoint 或 shutdown restartpoint。
 见 `checkpointer.c:620-639` 和 `xlog.c:7101-7142`。
 
----
+## 8. `CreateCheckPoint()`：在线 checkpoint 的主流程
 
-## 5. `CreateCheckPoint()`：在线 checkpoint 的主流程
 `CreateCheckPoint()` 在 `xlog.c:7398-7896`。
 函数注释在 `xlog.c:7361-7396`，值得完整读。
 它明确说：
@@ -514,9 +545,8 @@ shutdown checkpoint 的 redo pointer 在这里计算。
 数据页也还没有全刷完。
 所以这个 checkpoint 还不可作为启动 recovery 的最新 checkpoint。
 
----
+## 9. checkpoint record：不是 redo record
 
-## 6. checkpoint record：不是 redo record
 `XLOG_CHECKPOINT_REDO` 是 checkpoint lifecycle 的开始标记。
 它的 payload 很小。
 本基线只有 wal level 和 checksum state。
@@ -570,13 +600,13 @@ OID 计数器则更信任后续 `XLOG_NEXTOID` record。
 两种 checkpoint redo 结束时都会调用 `RecoveryRestartPoint()`。
 也就是说，recovery replay 到 checkpoint record 后，才可能把它作为 restartpoint 的候选。
 
----
+## 10. redo pointer：三层含义
 
-## 7. redo pointer：三层含义
 第一层含义是 recovery start。
 `pg_control` 记录的 checkpoint record 只是入口。
 真正 replay 从 `ControlFile->checkPointCopy.redo` 开始。
 `InitWalRecovery()` 在 `xlogrecovery.c:718-724` 从 control file 取：
+
 ```text
 CheckPointLoc = ControlFile->checkPoint
 RedoStartLSN = ControlFile->checkPointCopy.redo
@@ -610,9 +640,8 @@ restartpoint 也类似，见 `xlog.c:8301-8346`。
 
 不要把它理解成单纯的“checkpoint record LSN”。
 
----
+## 11. dirty page flush 与 WAL record 顺序
 
-## 8. dirty page flush 与 WAL record 顺序
 `CreateCheckPoint()` 在构造 checkpoint payload 后退出 critical section。
 见 `xlog.c:7655-7663`。
 原因是接下来要做大量 I/O。
@@ -690,6 +719,7 @@ checkpoint WAL 之前必须 force 数据文件 changes 到磁盘。
 然后才 `smgrwrite()` 写数据页。
 
 所以顺序是：
+
 ```text
 page modification -> WAL record insert -> page LSN set
 data page flush   -> XLogFlush(page LSN) -> write page
@@ -722,14 +752,14 @@ shutdown checkpoint 或 crash recovery 结束时不需要。
 最后才写 checkpoint record 并 flush。
 再最后才更新 control file。
 
----
+## 12. control file 更新顺序
 
-## 9. control file 更新顺序
 `pg_control` 更新有三类场景。
 本节重点是 checkpoint 完成时。
 
 先看工具函数。
 `xlog.c:4630-4637` 的 `UpdateControlFile()` 只是包装：
+
 ```text
 update_controlfile(DataDir, ControlFile, true)
 ```
@@ -752,6 +782,7 @@ backend 内所有写错、fsync 错、close 错都是 PANIC 级别。
 然后持有 `ControlFileLock`。
 如果是 shutdown，设置 `ControlFile->state = DB_SHUTDOWNED`。
 然后写：
+
 ```text
 ControlFile->checkPoint = ProcLastRecPtr
 ControlFile->checkPointCopy = checkPoint
@@ -791,11 +822,11 @@ shutdown checkpoint 还有开始状态更新。
 成功完成后再写成 `DB_SHUTDOWNED`。
 这让下次启动能区分 clean shutdown 和 shutdown interrupted。
 
----
+## 13. checkpoint cause 与日志
 
-## 10. checkpoint cause 与日志
 checkpoint request flag 的定义在 `xlog.h:144-162`。
 源码把 cause bit 单独列在 `xlog.h:160-162`：
+
 ```text
 CHECKPOINT_CAUSE_XLOG
 CHECKPOINT_CAUSE_TIME
@@ -828,6 +859,7 @@ promotion 后会请求一次 checkpoint。
 
 end-of-recovery checkpoint 由 recovery 结束路径请求。
 `xlog.c:6818-6822` 调：
+
 ```text
 RequestCheckpoint(CHECKPOINT_END_OF_RECOVERY | CHECKPOINT_FAST | CHECKPOINT_WAIT)
 ```
@@ -852,9 +884,8 @@ restartpoint 日志是 `restartpoint starting:...`。
 它记录 wrote buffers、SLRU buffers、WAL files added/removed/recycled、write/sync/total time、sync files、distance、estimate、checkpoint lsn 和 redo lsn。
 对理解 checkpoint 很有帮助。
 
----
+## 14. crash recovery 从 checkpoint 开始
 
-## 11. crash recovery 从 checkpoint 开始
 启动入口在 `StartupXLOG()`。
 本节关注 `xlog.c:5868-6199` 和 `xlogrecovery.c:456-970`。
 
@@ -875,12 +906,14 @@ restartpoint 日志是 `restartpoint starting:...`。
 见 `xlog.c:5983-5993` 和 `xlogrecovery.c:436-456`。
 
 没有 backup label 时，`InitWalRecovery()` 从 control file 取最新 checkpoint：
+
 ```text
 CheckPointLoc = ControlFile->checkPoint
 CheckPointTLI = ControlFile->checkPointCopy.ThisTimeLineID
 RedoStartLSN = ControlFile->checkPointCopy.redo
 RedoStartTLI = ControlFile->checkPointCopy.ThisTimeLineID
 ```
+
 见 `xlogrecovery.c:718-724`。
 
 随后调用 `ReadCheckpointRecord()`。
@@ -927,10 +960,12 @@ shutdown checkpoint 必须自洽。
 见 `xlog.c:5995-6004`。
 
 然后设置 redo pointer：
+
 ```text
 RedoRecPtr = XLogCtl->RedoRecPtr = XLogCtl->Insert.RedoRecPtr = checkPoint.redo
 doPageWrites = lastFullPageWrites
 ```
+
 见 `xlog.c:6116-6119`。
 
 如果 `InRecovery`，`StartupXLOG()` 会把 control file 写回磁盘，标记正在 recovery。
@@ -967,9 +1002,11 @@ doPageWrites = lastFullPageWrites
 
 如果 record 属于 XLOG rmgr，先调用 `xlogrecovery_redo()` 做 recovery 相关特殊处理。
 然后调用通用 rmgr redo：
+
 ```text
 GetRmgr(record->xl_rmid).rm_redo(xlogreader)
 ```
+
 见 `xlogrecovery.c:1958-1966`。
 
 redo 成功后，`ApplyWalRecord()` 才更新 `lastReplayedReadRecPtr`、`lastReplayedEndRecPtr` 和 replay TLI。
@@ -978,13 +1015,13 @@ redo 成功后，`ApplyWalRecord()` 才更新 `lastReplayedReadRecPtr`、`lastRe
 
 错误上下文在 `xlogrecovery.c:2248-2267`。
 redo 出错时，日志会带上：
+
 ```text
 WAL redo at <ReadRecPtr> for <record desc and block info>
 ```
 
----
+## 15. restartpoint：recovery 中的 checkpoint 类似物
 
-## 12. restartpoint：recovery 中的 checkpoint 类似物
 restartpoint 用于 recovery 期间缩短下次恢复时间。
 它的入口是 `CreateRestartPoint()`。
 源码在 `xlog.c:8116-8387`。
@@ -1014,6 +1051,7 @@ startup process 在 redo 到 checkpoint record 时调用 `RecoveryRestartPoint()
 
 第四，如果没有新的 safe checkpoint record，restartpoint 会跳过。
 `xlog.c:8176-8192` 判断：
+
 ```text
 !valid(lastCheckPointRecPtr) ||
 lastCheckPoint.redo <= ControlFile->checkPointCopy.redo
@@ -1032,6 +1070,7 @@ lastCheckPoint.redo <= ControlFile->checkPointCopy.redo
 
 第七，restartpoint 更新 `pg_control` 时使用的是 replay 到的 checkpoint record。
 `xlog.c:8248-8292`：
+
 ```text
 ControlFile->checkPoint = lastCheckPointRecPtr
 ControlFile->checkPointCopy = lastCheckPoint
@@ -1051,14 +1090,14 @@ ControlFile->checkPointCopy = lastCheckPoint
 普通 checkpoint 没这个动作。
 
 所以 restartpoint 可以总结为：
+
 ```text
 把已经 replay 到的 checkpoint record 变成新的 control-file recovery 起点，
 但不创造新的 checkpoint record。
 ```
 
----
+## 16. timeline 边界
 
-## 13. timeline 边界
 checkpoint record 里有 timeline。
 recovery 不能只看 LSN。
 同一个 LSN 可以在不同 timeline 上有不同历史。
@@ -1100,9 +1139,8 @@ recovery 不能只看 LSN。
 
 这解释了为什么 checkpoint record 中的 `ThisTimeLineID` 和 `PrevTimeLineID` 是 recovery correctness 的一部分。
 
----
+## 17. 正确性与错误边界
 
-## 14. 正确性与错误边界
 checkpoint/recovery 的错误边界可以按阶段看。
 
 第一类是请求阶段错误。
@@ -1173,23 +1211,24 @@ replay 中 checkpoint/end-of-recovery 记录的 timeline switch 不合法时，`
 错误上下文会说明 WAL record 的 ReadRecPtr、rmgr 描述、block references。
 见 `xlogrecovery.c:1888-1892` 和 `xlogrecovery.c:2248-2267`。
 
----
+## 18. 成本、资源与跨模块传播
 
-## 15. 成本、资源与跨模块传播
 checkpoint 的成本来自三段：写脏页、fsync 已写文件、写并 flush checkpoint record 和 control file。它随 dirty buffer 数、SLRU 脏页数、pending fsync entry 数、WAL 产生速度、磁盘 flush latency、replication/recovery timeline 状态扩张。
 
 资源压力会跨模块传播。WAL 产生快会触发 WAL cause checkpoint；dirty buffer 多会拉长 write phase；fsync request 多或存储 flush 慢会拉长 sync phase；redo pointer 推进慢会增加 WAL 保留和 recovery replay 距离；checkpoint I/O burst 又会影响前台延迟和 bgwriter/checkpointer 调度。
 
 shared state 的推进者包括 backend、checkpointer、bgwriter、walwriter、startup process 和 archiver。backend 推动 WAL insert 和 dirty page 产生；bgwriter 预写 dirty buffer；checkpointer 完成 checkpoint/restartpoint；walwriter 负责 WAL flush 背景推进；startup process 在 recovery 中 replay checkpoint record 并产生 restartpoint 候选；archiver 和 WAL recycling 受 redo horizon 约束。
 
-## 16. 观测与诊断入口
+## 19. 观测与诊断入口
+
 本节的 runtime truth 是：一次 completed checkpoint 对外发布了一个 checkpoint record location 和一个 redo pointer，二者在线 checkpoint 中通常不同。
 
 能直接观测的是 `log_checkpoints` 里的 starting/complete、`lsn` 和 `redo lsn`，`pg_controldata` 的 Latest checkpoint location 和 REDO location，`pg_stat_checkpointer`/`pg_stat_bgwriter` 累计，`pg_stat_wal` 的 WAL 量，以及 `pg_waldump` 中的 `CHECKPOINT_REDO`、`CHECKPOINT_ONLINE`、`CHECKPOINT_SHUTDOWN`。能间接推断的是 dirty page 集合、fsync pending 数和 full-page image 变化。几乎不可见的是 `RedoRecPtr` 更新瞬间、critical section 边界和 timeline history 校验内部状态，需要断点或源码插桩。
 
 诊断 checkpoint 变慢时先区分 write time、sync time 和 total time；再判断是 dirty buffer、fsync latency、WAL pressure、control file/WAL flush、restartpoint 限制还是 timeline/recovery 边界。不要把 checkpoint complete 日志里的 `lsn` 当成 redo start；要同时看 `redo lsn`。
 
-## 17. 常见误区
+## 20. 常见误区
+
 - checkpoint 不是单纯“刷脏页”；它还包含 fsync request、checkpoint record、control file 和 WAL recycling/restartpoint 边界。
 - 在线 checkpoint 的 checkpoint record location 不等于 redo pointer；redo pointer 指向 `XLOG_CHECKPOINT_REDO`。
 - shutdown checkpoint 不需要两条 record，是因为不应再有并发 WAL insert。
@@ -1198,11 +1237,12 @@ shared state 的推进者包括 backend、checkpointer、bgwriter、walwriter、
 - restartpoint 不会创造新的 checkpoint record；它只能选择 recovery 已 replay 到的安全 checkpoint。
 - checkpoint I/O 失败和 control-file/WAL 关键状态失败的错误级别不同，不能一概 PANIC 或一概重试。
 
-## 18. 课堂实验
+## 21. 课堂实验
+
 实验 1：画在线 checkpoint 时序图。
 
 ```bash
-cd /home/nail/postgres-lab
+cd /home/highgo/postgres
 nl -ba src/backend/access/transam/xlog.c | sed -n '7378,7810p'
 ```
 
@@ -1232,7 +1272,8 @@ pg_waldump -p "$PGDATA/pg_wal" <segment>
 
 找到 `rmgr: XLOG` 下的 `CHECKPOINT_REDO`、`CHECKPOINT_ONLINE` 或 `CHECKPOINT_SHUTDOWN`。在线 checkpoint 中记录两条 record 的 LSN，确认 online checkpoint payload 指向 redo LSN。
 
-## 19. 讨论题
+## 22. 讨论题
+
 1. 在线 checkpoint 为什么需要 `XLOG_CHECKPOINT_REDO` 和 `XLOG_CHECKPOINT_ONLINE` 两条 record？
 2. `CheckPoint.redo` 为什么不能简单等于 checkpoint record location？
 3. `pg_control` 为什么必须在 checkpoint record flush 后才更新？
@@ -1242,7 +1283,8 @@ pg_waldump -p "$PGDATA/pg_wal" <segment>
 7. 哪些 checkpoint 错误可以放弃本次 checkpoint，哪些必须 PANIC/FATAL？
 8. 日志中的 `lsn`、`redo lsn`、`pg_controldata` 的 REDO location 分别对应源码里的什么字段？
 
-## 20. 本节小结
+## 23. 本节小结
+
 本节核心链路是：在线 checkpoint 开始时写 `XLOG_CHECKPOINT_REDO` 并形成新的 redo pointer；完成 dirty page、SLRU 和 fsync request 后，写并 flush `XLOG_CHECKPOINT_ONLINE`；最后更新并 fsync `pg_control`。shutdown checkpoint 因为没有并发 WAL insert，只需要一条 shutdown checkpoint record。
 
 核心状态边界是：`ControlFile->checkPoint` 保存 checkpoint record location，`ControlFile->checkPointCopy.redo` 保存 recovery replay start。redo pointer 还影响 WAL insert 端是否需要 full-page image。

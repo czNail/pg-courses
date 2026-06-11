@@ -1,7 +1,9 @@
 # PostgreSQL Checkpoint 调优、写放大与延迟尖刺
+
 ## 课程定位
-本节主题：Checkpoint 调优、写放大与延迟尖刺。
+
 前置知识：已经理解 buffer dirty/page LSN、WAL-before-data、full-page image、checkpoint redo pointer、fsync request queue 和 checkpoint lifecycle。
+
 本节唯一主问题：
 为什么同一套业务写入，在某些 checkpoint 参数组合下会表现为周期性写入突刺、WAL/FPI 量上升、WAL 目录膨胀和 crash recovery 时间变长？
 本节围绕的核心矛盾：
@@ -17,45 +19,17 @@ PostgreSQL 希望把脏页尽早、平滑地写到数据文件，降低 crash re
 本节不是 DBA 参数调优清单。
 它是一节 runtime 诊断课。
 我们从能看到的现象开始，再回到源码解释参数为什么会改变这个现象。
-## 源码基线
-源码仓库：
-```text
-/home/nail/postgres-lab
-```
-基线：
-```text
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
-```
-本节重点阅读：
-```text
-src/backend/postmaster/checkpointer.c
-src/backend/access/transam/xlog.c
-src/backend/access/transam/xloginsert.c
-src/backend/access/transam/xlogrecovery.c
-src/backend/storage/buffer/bufmgr.c
-src/backend/storage/sync/sync.c
-src/backend/storage/smgr/md.c
-src/backend/utils/misc/guc_parameters.dat
-src/backend/utils/activity/pgstat_checkpointer.c
-src/backend/utils/activity/pgstat_wal.c
-src/backend/catalog/system_views.sql
-src/include/access/xlog.h
-src/include/pgstat.h
-```
-本基线里，用户可见 GUC 定义主要在 `guc_parameters.dat`。
-`guc_tables.c` 是 GUC 静态表相关实现文件，但本节参数的名字、上下文、单位、默认值和 assign hook 应以 `guc_parameters.dat` 为准。
-行号来自：
-```text
-nl -ba <source-file>
-```
----
-## 1. 从 runtime 现象开始
+
+源码基线：本课使用当前实际源码路径 `/home/highgo/postgres`，branch `master`，commit `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`；核心源码分工见第 3 节。
+
+## 1. 本节在总主线中的位置
+
 先看一个现场。
 业务写入量没有突增。
 但磁盘写吞吐每隔几分钟冲上去。
 同时，延迟 P99 出现尖刺。
 server log 里能看到类似信息：
+
 ```text
 checkpoint starting: time
 checkpoint complete: wrote ... buffers (...%); wrote ... SLRU buffers;
@@ -63,11 +37,14 @@ checkpoint complete: wrote ... buffers (...%); wrote ... SLRU buffers;
 longest=... s, average=... s; distance=... kB, estimate=... kB;
 lsn=..., redo lsn=...
 ```
+
 或者：
+
 ```text
 checkpoint starting: wal
 checkpoints are occurring too frequently
 ```
+
 这两个现象很不一样。
 `checkpoint starting: time` 表示时间触发到达。
 `checkpoint starting: wal` 表示 WAL 消耗触发到达。
@@ -83,11 +60,13 @@ checkpoints are occurring too frequently
 复制槽、`wal_keep_size`、归档、restartpoint、崩溃恢复中的 invalid page reference 都可能把保留窗口继续拉长。
 第三个现场是 crash restart 时间变长。
 实例被 kill 后启动，日志里能看到：
+
 ```text
 redo starts at ...
 redo in progress, elapsed time: ...
 redo done at ... system usage: ...
 ```
+
 这些日志来自 `xlogrecovery.c:1699-1701`、`xlogrecovery.c:1712-1714` 和 `xlogrecovery.c:1848-1851`。
 恢复时间主要取决于从 checkpoint redo LSN 到可用 WAL 末端之间有多少 WAL record 需要读取、校验和 replay。
 `max_wal_size` 和 `checkpoint_timeout` 变大，通常会拉长这个潜在距离。
@@ -97,12 +76,15 @@ redo done at ... system usage: ...
 原因不是 checkpoint record 本身大。
 真正的放大来自 checkpoint 推进 redo pointer 后，页面在新 checkpoint 周期里的首次 WAL 修改更容易带 full-page image。
 `xloginsert.c:678-695` 的核心判断是：
+
 ```c
 needs_backup = (page_lsn <= RedoRecPtr);
 ```
+
 这行判断把 checkpoint 周期和 WAL/FPI 量直接连起来。
----
-## 2. 一句话运行模型
+
+## 2. 核心矛盾与一句话运行模型
+
 本节的运行模型可以压缩成一句话：
 checkpoint 调优是在三个窗口之间调平衡：脏页写出窗口、WAL 保留窗口、FPI 重新开始窗口。
 脏页写出窗口由本轮 checkpoint 开始时有多少 dirty buffer 决定。
@@ -115,8 +97,9 @@ checkpoint 越稀疏，单轮 dirty set、WAL 保留和 crash recovery 距离通
 它只是 checkpointer 在 `BufferSync()` 每处理一个候选 buffer 后，用进度估算决定要不要睡 100ms。
 如果系统已经落后于计划，它不会继续 sleep。
 如果手动或 shutdown 请求带 `CHECKPOINT_FAST`，它也不会按 completion target 平滑。
----
+
 ## 3. 核心文件分工与阅读顺序
+
 第一站读 `guc_parameters.dat`。
 这里确认参数的真实名字、单位、上下文和默认值。
 `checkpoint_completion_target` 在 `guc_parameters.dat:411-418`。
@@ -151,8 +134,9 @@ checkpoint 越稀疏，单轮 dirty set、WAL 保留和 crash recovery 距离通
 这里解释 FPI 重新开始和 `RedoRecPtr` 更新之后的 WAL 放大。
 第十站读 `system_views.sql:1247-1293`。
 这里是 `pg_stat_checkpointer`、`pg_stat_io` 和 `pg_stat_wal` 的 SQL 视图定义。
----
+
 ## 4. 三个参数不是三个旋钮
+
 `max_wal_size`、`checkpoint_timeout` 和 `checkpoint_completion_target` 经常被误解为三个彼此独立的旋钮。
 源码里不是这样。
 `checkpoint_timeout` 决定 checkpointer 主循环中时间触发何时到达。
@@ -165,9 +149,11 @@ WAL 写路径在 segment 完成时进入 `xlog.c:2498-2525`。
 这个距离超过 `CheckPointSegments` 就认为需要 checkpoint。
 `CheckPointSegments` 不是直接等于 `max_wal_size / wal_segment_size`。
 它在 `xlog.c:2191-2218` 里这样计算：
+
 ```text
 CheckPointSegments = floor(max_wal_size_segments / (1.0 + checkpoint_completion_target))
 ```
+
 这个公式非常关键。
 源码注释给出的假设是：checkpoint 期间还会继续消耗 WAL，消耗量大约是 checkpoint 间隔 WAL 量乘以 `checkpoint_completion_target`。
 所以为了避免 checkpoint 完成时超过 `max_wal_size`，触发点要早于 `max_wal_size`。
@@ -182,8 +168,9 @@ CheckPointSegments = floor(max_wal_size_segments / (1.0 + checkpoint_completion_
 `checkpoint_timeout` 只是在 WAL 没有先触发时发挥主导作用。
 高 WAL 生成 workload 下，真正的周期常常由 `max_wal_size` 和 `checkpoint_completion_target` 推导出的 `CheckPointSegments` 决定。
 低 WAL 生成 workload 下，周期才更接近 `checkpoint_timeout`。
----
+
 ## 5. 从请求到开始：checkpointer 主循环
+
 checkpoint 请求可以来自多处。
 时间触发来自 checkpointer 自己。
 WAL 触发来自 WAL 写路径。
@@ -222,12 +209,14 @@ end-of-recovery checkpoint 例外。
 这就是等待语义的边界。
 `CHECKPOINT_WAIT` 等的是 checkpointer 认为本次 checkpoint 完成或失败。
 它不是等待“所有未来新 dirty 页都落盘”。
----
+
 ## 6. 在线 checkpoint 的安全顺序
+
 `CreateCheckPoint()` 的大框架在 `xlog.c:7361-7896`。
 第 21 节已经详细讲过 checkpoint lifecycle 和 redo pointer。
 这里只保留调参相关的顺序。
 在线 checkpoint 的顺序是：
+
 ```text
 SyncPreCheckpoint()
   -> 进入 critical section
@@ -251,6 +240,7 @@ SyncPreCheckpoint()
   -> PreallocXlogFiles()
   -> LogCheckpointEnd()
 ```
+
 这条顺序解释了两个 runtime 细节。
 第一，checkpoint 的写入动作可能持续很久。
 `CreateCheckPoint()` 注释在 `xlog.c:7378-7387` 直接说，在线 checkpoint 在 flush disk buffers 期间允许其他 WAL record 并发写入，函数可能在繁忙系统上运行很多分钟。
@@ -258,8 +248,9 @@ SyncPreCheckpoint()
 `xlog.c:7845-7864` 才调用 `KeepLogSeg()`、slot invalidation 检查和 `RemoveOldXlogFiles()`。
 所以 `pg_wal` 在 checkpoint 进行中继续增长是正常现象。
 如果 checkpoint 很慢，WAL 触发和 WAL 保留压力会同时变大。
----
+
 ## 7. 脏页集合如何确定
+
 checkpoint 并不是在整个过程中持续追踪所有新 dirty 页。
 `BufferSync()` 在 `bufmgr.c:3551-3826`。
 它开始时扫描所有 shared buffers。
@@ -282,13 +273,16 @@ checkpoint 正在运行时，业务继续写入。
 主循环在 `bufmgr.c:3740-3807`。
 每处理一个候选 buffer，就用 `SyncOneBuffer()` 尝试写出。
 然后调用：
+
 ```text
 CheckpointWriteDelay(flags, num_processed / num_to_scan)
 ```
+
 注意传入的是“处理进度”，不是“实际写出进度”。
 这是为了避免某些 buffer 已经被别人写掉时导致 tablespace 写入节奏失衡。
----
+
 ## 8. Buffer 写出和 WAL-before-data
+
 `SyncOneBuffer()` 在 `bufmgr.c:4124-4198`。
 它先检查 buffer 是否 still valid and dirty。
 如果 dirty，就 pin buffer，拿 share-exclusive content lock，然后调用 `FlushUnlockedBuffer()`。
@@ -307,8 +301,9 @@ checkpoint completion 前必须保证 fsync。
 这个注册进入 fsync request 机制。
 如果无法转发给 checkpointer，`md.c:1528-1555` 会在 backend 本地 fsync。
 这条 fallback 很少见，但一旦出现会直接把 fsync 延迟打到前台 backend。
----
+
 ## 9. 写入平滑不是固定 sleep
+
 `CheckpointWriteDelay()` 在 `checkpointer.c:787-859`。
 它在每个 checkpoint buffer write 之后被调用。
 正常情况下，如果不是 fast checkpoint、没有 shutdown、没有 pending fast request，并且 `IsCheckpointOnSchedule(progress)` 返回 true，checkpointer 会做几件事：
@@ -321,9 +316,11 @@ checkpoint completion 前必须保证 fsync。
 如果队列压力大，它即使不 sleep，也每 `WRITES_PER_ABSORB` 次写操作吸收一次 fsync requests，避免 queue 溢出。
 `IsCheckpointOnSchedule()` 在 `checkpointer.c:869-939`。
 它先做：
+
 ```text
 progress *= CheckPointCompletionTarget
 ```
+
 然后用两个维度比较。
 第一个维度是 WAL 进度。
 它取当前 WAL insert pointer 或 replay pointer，计算自 checkpoint start 以来消耗了多少 segment，再除以 `CheckPointSegments`。
@@ -342,8 +339,9 @@ progress *= CheckPointCompletionTarget
 - shutdown 或 end-of-recovery checkpoint 走特殊路径。
 这就是为什么仅调大 `checkpoint_completion_target`，不一定消除延迟尖刺。
 如果系统本来就落后，它只是减少 sleep 的机会。
----
+
 ## 10. Sync phase 为什么会尖刺
+
 checkpoint 写 dirty buffer 后，还要处理 fsync requests。
 `CheckPointGuts()` 在 `xlog.c:8048-8074`。
 它先做 SLRU checkpoint 和 `CheckPointBuffers()`。
@@ -367,8 +365,9 @@ sync phase 会遍历 pending fsync hash table。
 在 buffer 写出后，`ScheduleBufferTagForWriteback()` 和 `IssuePendingWritebacks()` 会尝试把 pending writeback 以更顺序的方式发给 OS。
 但源码也说这是 hint，`bufmgr.c:7741-7746` 明确说明它用于改善 OS I/O scheduling，尽量不报错。
 所以它不是 fsync 延迟的严格上界。
----
+
 ## 11. WAL 触发与 max_wal_size
+
 `max_wal_size` 最容易被误解。
 它不是“`pg_wal` 目录永远不能超过这个大小”。
 它首先参与 `CheckPointSegments` 计算。
@@ -392,20 +391,23 @@ checkpoint 结束时 `xlog.c:7849-7864` 从 `RedoRecPtr` 开始计算可删除�
 2. 是否 checkpoint 完成后仍有 slot 或 `wal_keep_size` 保留。
 3. 是否归档积压或 standby/restartpoint 使清理滞后。
 4. `max_wal_size` 是否本来就太小，导致频繁触发但清理追不上增长。
----
+
 ## 12. FPI/WAL 量如何受 checkpoint 影响
+
 FPI 与 checkpoint 的关系来自 redo pointer。
 在线 checkpoint 开始后，`CreateCheckPoint()` 插入 `XLOG_CHECKPOINT_REDO`。
 `XLogInsertRecord()` 对 `XLOG_CHECKPOINT_REDO` 走 special checkpoint class。
 `xlog.c:929-941` 持有所有 WAL insertion locks，保留 WAL 空间，然后把 `RedoRecPtr` 和 `Insert->RedoRecPtr` 更新为这条 record 的 start position。
 之后普通 WAL record 插入时，需要重新判断页面是否要带 FPI。
 `XLogInsert()` 在 `xloginsert.c:512-535` 中循环：
+
 ```text
 GetFullPageWriteInfo()
   -> XLogRecordAssemble()
   -> XLogInsertRecord()
   -> 如果 RedoRecPtr 变新导致 FPI 判断失效，返回 InvalidXLogRecPtr 重试
 ```
+
 `XLogRecordAssemble()` 在 `xloginsert.c:678-695` 中按 page LSN 判断。
 如果 `full_page_writes` 或 backup 要求生效，且 page LSN 小于等于 `RedoRecPtr`，就为该 block 生成 full-page image。
 这带来一个可观测规律：
@@ -428,8 +430,9 @@ GetFullPageWriteInfo()
 这些是实例级累计统计。
 它们不是单 query 统计。
 单 query 视角可以用 `EXPLAIN (ANALYZE, WAL)`，但它看不到后台 checkpoint 自身的完整因果。
----
+
 ## 13. 恢复时间如何受 checkpoint 影响
+
 crash recovery 从 checkpoint record 指向的 redo LSN 开始。
 `xlogrecovery.c:850-875` 会判断 checkpoint record 的 redo 是否有效，以及是否需要 recovery。
 如果 `checkPoint.redo < CheckPointLoc`，说明在线 checkpoint 的 redo pointer 早于 checkpoint completion record。
@@ -440,6 +443,7 @@ crash recovery 从 checkpoint record 指向的 redo LSN 开始。
 它持续 `ApplyWalRecord()`，直到读不到更多 WAL 或达到 recovery target。
 恢复日志在 `xlogrecovery.c:1699-1701` 打印 redo start，在 `xlogrecovery.c:1848-1851` 打印 redo done。
 所以 checkpoint 调参影响 recovery 的路径很直接：
+
 ```text
 更大的 checkpoint interval
   -> redo pointer 推进较少
@@ -447,6 +451,7 @@ crash recovery 从 checkpoint record 指向的 redo LSN 开始。
   -> 需要读取和 replay 的 WAL record 更多
   -> recovery time 可能更长
 ```
+
 但这仍然不是严格线性。
 recovery 时间还取决于 WAL record 类型、FPI 比例、数据文件缓存状态、storage read bandwidth、CPU 校验成本、prefetch、是否 archive recovery、是否有 timeline/backup label，以及是否需要等待恢复目标。
 FPI 对 recovery 也不是单向坏事。
@@ -454,10 +459,12 @@ FPI 增加 WAL 字节数。
 但 replay 某些页面时可以直接 restore image，避免依赖 torn 或旧 page 状态。
 真正调参时要同时看 recovery SLO、steady-state P99 和 WAL 存储预算。
 不能只用日常延迟指标做决定。
----
+
 ## 14. 成本模型
+
 先给一个近似模型。
 设：
+
 ```text
 D = checkpoint 开始时需要写出的 dirty bytes
 T = 实际 checkpoint interval
@@ -466,27 +473,36 @@ W = checkpoint 周期内 WAL generated bytes
 M = max_wal_size bytes
 S = wal_segment_size bytes
 ```
+
 如果时间触发主导：
+
 ```text
 T ≈ checkpoint_timeout
 ```
+
 如果 WAL 触发主导：
+
 ```text
 触发距离 ≈ floor((M / S) / (1 + C)) * S
 T ≈ 触发距离 / WAL 生成速率
 ```
+
 write phase 的目标平均写速率可以粗略看成：
+
 ```text
 D / (T * C)
 ```
+
 这只是近似。
 源码实际使用 `num_processed / num_to_scan` 作为 progress，并同时比较时间进度和 WAL 进度。
 如果 `D` 很大，`T` 很短，或者 storage 吞吐不足，checkpointer 会落后并停止 sleep。
 于是你看到的就是突刺，而不是平滑。
 FPI 放大可以粗略看成：
+
 ```text
 每个 checkpoint 周期内，被 WAL 修改过的不同 page 数量 * page image size
 ```
+
 checkpoint 更频繁会增加周期数。
 周期内 page 热度越分散，FPI 放大越明显。
 热点 page 反复更新时，周期内通常只有首次修改带 FPI，后续修改不带。
@@ -494,16 +510,19 @@ checkpoint 更频繁会增加周期数。
 全表随机更新、索引多、page 工作集大、checkpoint 频繁，是 FPI 放大明显的组合。
 少量热点 page、高局部性更新，FPI 增量可能相对可控。
 WAL 保留成本可以粗略看成：
+
 ```text
 max(redo 到 current WAL 的距离,
     slot restart_lsn 到 current WAL 的距离,
     wal_keep_size,
     archiving/recovery 需要的保留)
 ```
+
 旧 segment 的物理删除还要等 checkpoint 完成后的 cleanup 路径。
 所以 `pg_wal` 峰值可能大于任何一个单独参数的直觉。
----
+
 ## 15. 参数调优的源码级解释
+
 调大 `max_wal_size` 的主要效果：
 - 增大 WAL 触发 checkpoint 的距离。
 - 降低 WAL-triggered checkpoint 频率。
@@ -546,8 +565,9 @@ max(redo 到 current WAL 的距离,
 - dirty set 是否来自 shared_buffers 太大、bgwriter 不足、批量写入或 autovacuum。
 - sync phase 是否才是主要尖刺。
 - FPI/WAL 量是否因 checkpoint 更频繁而上升。
----
+
 ## 16. 观测入口：先看日志
+
 最直接入口是打开 `log_checkpoints`。
 本基线默认值是 `true`，定义在 `guc_parameters.dat:1648-1652`。
 checkpoint start log 来自 `xlog.c:7167-7183`。
@@ -580,8 +600,9 @@ checkpoint complete log 来自 `xlog.c:7188-7287`。
 `CHECKPOINT (mode=spread)` 才能显式请求 spread。
 这个细节在 `checkpointer.c:1005-1049`。
 如果运维脚本定期执行默认 `CHECKPOINT`，它可能绕过你对 completion target 的预期。
----
+
 ## 17. 观测入口：pg_stat_checkpointer
+
 `pg_stat_checkpointer` 定义在 `system_views.sql:1247-1259`。
 字段包括：
 - `num_timed`
@@ -603,12 +624,15 @@ checkpoint complete log 来自 `xlog.c:7188-7287`。
 `pg_stat_checkpointer` 是实例级累计。
 它不是最近一次 checkpoint。
 要看一个实验窗口，先 reset：
+
 ```sql
 SELECT pg_stat_reset_shared('checkpointer');
 ```
+
 然后跑 workload。
 再取差值。
 常用查询：
+
 ```sql
 SELECT
   num_timed,
@@ -621,6 +645,7 @@ SELECT
   stats_reset
 FROM pg_stat_checkpointer;
 ```
+
 解释时要谨慎。
 `num_requested` 包括 WAL 触发、手动请求、shutdown 路径等外部请求。
 它不是“业务手动执行 CHECKPOINT 的次数”。
@@ -628,8 +653,9 @@ FROM pg_stat_checkpointer;
 它不包括 bgwriter 或 backend replacement 写出的所有数据页。
 `write_time` 和 `sync_time` 是累计毫秒。
 要做平均，至少要除以 `num_done` 的增量，并结合 checkpoint log 验证每次分布。
----
+
 ## 18. 观测入口：pg_stat_wal
+
 `pg_stat_wal` 定义在 `system_views.sql:1285-1293`。
 本节重点看：
 - `wal_bytes`
@@ -637,11 +663,14 @@ FROM pg_stat_checkpointer;
 - `wal_fpi_bytes`
 - `wal_buffers_full`
 实验窗口同样先 reset：
+
 ```sql
 SELECT pg_stat_reset_shared('wal');
 ```
+
 然后跑 workload。
 查询：
+
 ```sql
 SELECT
   wal_records,
@@ -651,23 +680,28 @@ SELECT
   wal_buffers_full
 FROM pg_stat_wal;
 ```
+
 如果调小 `max_wal_size` 或 `checkpoint_timeout` 后，`wal_fpi` 和 `wal_fpi_bytes` 明显上升，说明 FPI 周期重启成本变高。
 但不能只用 `wal_fpi` 判断 checkpoint 是否“坏”。
 FPI 是 crash safety 的一部分。
 问题在于是否为了过短的 checkpoint 周期付出了不必要的 WAL 放大。
 还要结合 `wal_bytes` 和业务吞吐。
 例如：
+
 ```text
 wal_fpi_bytes / wal_bytes
 ```
+
 可以近似看 FPI 在 WAL 中的字节占比。
 但这个比例也受 `wal_compression` 和 workload page locality 影响。
----
+
 ## 19. 观测入口：pg_stat_io、wait event 和系统层
+
 `pg_stat_io` 定义在 `system_views.sql:1261-1283`。
 checkpoint 写 dirty page 时，`FlushBuffer()` 会调用 `pgstat_count_io_op_time()`，对象是 relation，context 通常是 normal。
 relation fsync 由 `mdsyncfiletag()` 计入 `IOOP_FSYNC`。
 典型查询：
+
 ```sql
 SELECT
   backend_type,
@@ -684,6 +718,7 @@ FROM pg_stat_io
 WHERE backend_type IN ('checkpointer', 'background writer', 'client backend')
 ORDER BY backend_type, object, context;
 ```
+
 `pg_stat_io` 能帮助区分 checkpointer、bgwriter 和 client backend 的 I/O。
 它仍然是累计统计。
 对于尖刺，还要看时间序列。
@@ -711,8 +746,9 @@ ORDER BY backend_type, object, context;
 - filesystem mount option。
 checkpoint 调优不能修复底层 fsync 持续抖动。
 它只能改变 PostgreSQL 把压力送到存储层的节奏和批次。
----
+
 ## 20. 常见误区
+
 误区一：把 `max_wal_size` 当硬上限。
 源码里它参与 `CheckPointSegments` 和 WAL 清理策略。
 checkpoint 进行中、slot 保留、`wal_keep_size`、归档和 restartpoint 都可能让 `pg_wal` 超过它。
@@ -736,8 +772,9 @@ checkpoint 变频繁后，page 首次修改更频繁带 FPI，是源码预期。
 误区七：用手动 `CHECKPOINT` 做平滑 checkpoint 实验，却忘了默认 fast。
 本基线 SQL `CHECKPOINT` 默认 `fast = true`。
 要实验 spread 行为，应使用 `CHECKPOINT (mode=spread)`。
----
+
 ## 21. 诊断流程
+
 第一步，确认 checkpoint 是 time 触发还是 WAL 触发。
 看 checkpoint start log。
 如果没有日志，先打开 `log_checkpoints`，或在实验环境打开。
@@ -759,8 +796,9 @@ checkpoint 变频繁后，page 首次修改更频繁带 FPI，是源码预期。
 第七步，评估 recovery SLO。
 如果打算增大 `max_wal_size` 或 `checkpoint_timeout`，必须接受 crash recovery 可能 replay 更多 WAL。
 用实验环境 kill/restart 验证，而不是只凭公式。
----
+
 ## 22. 源码 walkthrough：WAL 触发一次 checkpoint
+
 下面走一条最常见的 WAL-triggered 主链路。
 业务 backend 生成 WAL。
 WAL writer 或 backend 刷 WAL segment。
@@ -770,9 +808,11 @@ WAL writer 或 backend 刷 WAL segment。
 它先用本地 `RedoRecPtr` 快速判断。
 如果看起来需要 checkpoint，就调用 `GetRedoRecPtr()` 刷新本地 copy，再判断一次。
 仍然需要，就调用：
+
 ```text
 RequestCheckpoint(CHECKPOINT_CAUSE_XLOG)
 ```
+
 `RequestCheckpoint()` 把 flags OR 到 `ckpt_flags`。
 它唤醒 checkpointer，但不等待，除非调用者带 `CHECKPOINT_WAIT`。
 checkpointer 主循环醒来。
@@ -796,17 +836,20 @@ checkpointer 主循环醒来。
 这条链路也有两个放大位置：
 - redo pointer 推进导致后续 FPI 周期重启。
 - checkpoint 完成前 WAL 继续生成，导致保留和触发压力增加。
----
+
 ## 23. 源码 walkthrough：time-triggered checkpoint
+
 time-triggered checkpoint 不经过 WAL segment 完成时的请求路径。
 checkpointer 主循环自己计算时间。
 `checkpointer.c:410-418`：
+
 ```text
 elapsed_secs = now - last_checkpoint_time
 if elapsed_secs >= CheckPointTimeout:
     do_checkpoint = true
     flags |= CHECKPOINT_CAUSE_TIME
 ```
+
 如果同时有外部 request，flags 会合并。
 如果没有外部 request，统计上增加 `num_timed`。
 checkpoint 完成后，`checkpointer.c:523-533` 把 `last_checkpoint_time` 更新为 checkpoint start time，而不是 end time。
@@ -822,8 +865,9 @@ checkpoint 完成后，`checkpointer.c:523-533` 把 `last_checkpoint_time` 更�
 - 提高存储写入和 fsync 能力。
 - 减少不必要的手动 fast checkpoint。
 - 分析 bgwriter、backend writes 和 bulk workload。
----
+
 ## 24. 生命周期、ownership 与 cleanup
+
 checkpoint 请求状态属于 shared memory。
 `CheckpointerShmemStruct` 由 checkpointer shmem init 创建。
 backend 只通过 `RequestCheckpoint()` 设置 flags 和等待 condition variable。
@@ -842,8 +886,9 @@ checkpoint 失败时，checkpointer 的异常恢复在 `checkpointer.c:285-345`�
 但失败前已经发生的一些 WAL 或 control file 更新不一定能“事务式回滚”。
 `xlog.c:7552-7558` 注释说明，如果 checkpoint 未完成但 `RedoRecPtr` 已经推进，后果是后续 `XLogInsert` 可能写一些本来不必要的 FPI。
 这是安全但更贵的 fallback。
----
+
 ## 25. 正确性机制层次
+
 checkpoint 调优不能破坏 crash safety。
 这里有多层机制共同约束。
 第一层是 WAL-before-data。
@@ -870,8 +915,9 @@ checkpoint 可以推进 redo pointer，但不能随意删除 slot 仍需要的 W
 它们不能互相替代。
 调参只能改变节奏、窗口和成本。
 不能绕过这些正确性边界。
----
+
 ## 26. 异常路径与 fallback
+
 第一个异常路径是 checkpoint 写入或 fsync 失败。
 `CreateCheckPoint()` 在写 dirty buffer 前退出 critical section。
 `xlog.c:7655-7663` 注释说明，I/O 可能失败，checkpoint 可以失败，但没有理由强制系统 panic。
@@ -897,11 +943,13 @@ shutdown checkpoint 带 `CHECKPOINT_FAST`。
 并且 shutdown 时不允许并发 WAL 插入。
 `xlog.c:7770-7776` 如果发现 shutdown checkpoint 期间仍有并发 WAL activity，会 PANIC。
 这不是调参问题，而是 correctness 断言。
----
+
 ## 27. 课堂实验一：观察 WAL 触发和 time 触发
+
 目标：确认 `checkpoint_timeout` 和 `max_wal_size` 谁主导 checkpoint 周期。
 环境要求：只在实验实例做，不要在生产直接执行。
 准备：
+
 ```sql
 ALTER SYSTEM SET log_checkpoints = on;
 ALTER SYSTEM SET checkpoint_timeout = '5min';
@@ -909,28 +957,37 @@ ALTER SYSTEM SET checkpoint_completion_target = 0.9;
 ALTER SYSTEM SET max_wal_size = '128MB';
 SELECT pg_reload_conf();
 ```
+
 重置统计：
+
 ```sql
 SELECT pg_stat_reset_shared('checkpointer');
 SELECT pg_stat_reset_shared('wal');
 ```
+
 运行写入 workload，例如 `pgbench`：
+
 ```bash
 pgbench -i -s 50 postgres
 pgbench -c 16 -j 4 -T 300 -N postgres
 ```
+
 观察：
+
 ```sql
 SELECT * FROM pg_stat_checkpointer;
 SELECT wal_records, wal_fpi, wal_bytes, wal_fpi_bytes FROM pg_stat_wal;
 ```
+
 再把 `max_wal_size` 增大：
+
 ```sql
 ALTER SYSTEM SET max_wal_size = '2GB';
 SELECT pg_reload_conf();
 SELECT pg_stat_reset_shared('checkpointer');
 SELECT pg_stat_reset_shared('wal');
 ```
+
 重复同样 workload。
 预期观察：
 - 小 `max_wal_size` 更容易看到 `checkpoint starting: wal`。
@@ -941,10 +998,12 @@ SELECT pg_stat_reset_shared('wal');
 - `assign_max_wal_size()` 触发 `CalculateCheckpointSegments()`。
 - `XLogCheckpointNeeded()` 用 `RedoRecPtr` 到新 segment 的距离判断。
 - `CheckpointerMain()` 把 WAL request 合并成 checkpoint。
----
+
 ## 28. 课堂实验二：观察 FPI 周期重启
+
 目标：看到 checkpoint 后 page 首次修改带来的 FPI 增加。
 准备一张足够大的表：
+
 ```sql
 DROP TABLE IF EXISTS ckpt_fpi_demo;
 CREATE TABLE ckpt_fpi_demo (id int PRIMARY KEY, payload text);
@@ -953,28 +1012,37 @@ SELECT g, repeat('x', 200)
 FROM generate_series(1, 500000) AS g;
 VACUUM ckpt_fpi_demo;
 ```
+
 重置 WAL 统计并强制一次 checkpoint：
+
 ```sql
 SELECT pg_stat_reset_shared('wal');
 CHECKPOINT;
 ```
+
 执行一次分散更新：
+
 ```sql
 UPDATE ckpt_fpi_demo
 SET payload = repeat('a', 200)
 WHERE id % 10 = 0;
 ```
+
 查询 WAL：
+
 ```sql
 SELECT wal_records, wal_fpi, wal_bytes, wal_fpi_bytes
 FROM pg_stat_wal;
 ```
+
 不做 checkpoint，再执行一次更新同一批 page：
+
 ```sql
 UPDATE ckpt_fpi_demo
 SET payload = repeat('b', 200)
 WHERE id % 10 = 0;
 ```
+
 再次查询 WAL。
 预期观察：
 - checkpoint 后第一次分散更新更容易产生 FPI。
@@ -986,10 +1054,12 @@ WHERE id % 10 = 0;
 - checkpoint 推进 `RedoRecPtr`。
 - `xloginsert.c:692-695` 用 page LSN 和 `RedoRecPtr` 判断 FPI。
 - `xlog.c:1118-1121` 累计 `wal_fpi` 和 `wal_fpi_bytes`。
----
+
 ## 29. 课堂实验三：观察 write phase 和 sync phase
+
 目标：区分写 dirty buffer 慢和 fsync 慢。
 配置：
+
 ```sql
 ALTER SYSTEM SET log_checkpoints = on;
 ALTER SYSTEM SET track_io_timing = on;
@@ -997,27 +1067,36 @@ ALTER SYSTEM SET checkpoint_timeout = '2min';
 ALTER SYSTEM SET checkpoint_completion_target = 0.9;
 SELECT pg_reload_conf();
 ```
+
 重置：
+
 ```sql
 SELECT pg_stat_reset_shared('checkpointer');
 ```
+
 跑写入 workload。
 在 workload 期间每 5 秒采样：
+
 ```sql
 SELECT now(), *
 FROM pg_stat_checkpointer;
 ```
+
 同时采样 I/O：
+
 ```sql
 SELECT now(), backend_type, object, context,
        writes, write_time, fsyncs, fsync_time
 FROM pg_stat_io
 WHERE backend_type IN ('checkpointer', 'client backend', 'background writer');
 ```
+
 观察 checkpoint log：
+
 ```text
 write=... s, sync=... s, total=... s; sync files=...; longest=... s
 ```
+
 判断：
 - `write` 高，`wrote buffers` 高：dirty set 和 write pacing 是重点。
 - `sync` 高，`longest` 高：fsync latency 是重点。
@@ -1027,33 +1106,40 @@ write=... s, sync=... s, total=... s; sync files=...; longest=... s
 - `CheckpointWriteDelay()` 只调节 write phase 的 sleep。
 - `ProcessSyncRequests()` 负责 sync phase。
 - `mdsyncfiletag()` 执行 relation fsync。
----
+
 ## 30. 课堂实验四：恢复时间窗口
+
 目标：验证更大 checkpoint 间隔对 crash recovery 距离的影响。
 只在可丢弃实验环境执行。
 准备两组配置。
 配置 A：
+
 ```sql
 ALTER SYSTEM SET checkpoint_timeout = '1min';
 ALTER SYSTEM SET max_wal_size = '128MB';
 ALTER SYSTEM SET checkpoint_completion_target = 0.9;
 SELECT pg_reload_conf();
 ```
+
 配置 B：
+
 ```sql
 ALTER SYSTEM SET checkpoint_timeout = '15min';
 ALTER SYSTEM SET max_wal_size = '4GB';
 ALTER SYSTEM SET checkpoint_completion_target = 0.9;
 SELECT pg_reload_conf();
 ```
+
 每组都执行相同写入 workload。
 在 workload 中途用外部方式 kill postmaster 或主进程，模拟 crash。
 重启实例，记录日志里的：
+
 ```text
 redo starts at ...
 redo in progress ...
 redo done at ... system usage: ...
 ```
+
 比较：
 - redo start LSN 到 redo done LSN 的距离。
 - redo elapsed time。
@@ -1063,8 +1149,9 @@ redo done at ... system usage: ...
 配置 B 往往减少 checkpoint 频率和 FPI 周期重启，但 crash recovery 可能 replay 更多 WAL。
 这个实验用来训练权衡。
 它不是证明某个配置永远更好。
----
+
 ## 31. 源码练习
+
 练习一：跟 `CheckPointSegments`。
 在 `xlog.c:2191` 给 `CalculateCheckpointSegments()` 加临时 DEBUG 日志。
 打印 `max_wal_size_mb`、`CheckPointCompletionTarget`、`wal_segment_size` 和 `CheckPointSegments`。
@@ -1083,8 +1170,9 @@ redo done at ... system usage: ...
 观察 checkpoint sync phase 前如何吸收请求，以及每个 filetag 如何进入 fsync handler。
 重点不是背函数。
 重点是确认 runtime 指标背后的状态边界。
----
+
 ## 32. 讨论题
+
 1. 为什么 `checkpoint_completion_target` 越大，`CheckPointSegments` 反而越小？
 2. 如果日志里 checkpoint 频繁显示 `wal`，但 `checkpoint_timeout` 很大，下一步应该看哪些参数和指标？
 3. 为什么 `max_wal_size` 不能保证 `pg_wal` 目录永远低于该值？
@@ -1093,8 +1181,9 @@ redo done at ... system usage: ...
 6. checkpoint log 中 `write=1s, sync=20s` 时，调大 `checkpoint_completion_target` 为什么可能帮助有限？
 7. 手动执行默认 `CHECKPOINT` 为什么可能制造与自动 checkpoint 不同的延迟尖刺？
 8. 如果增大 `max_wal_size` 后 P99 好了，但 crash recovery 变慢，这是不是 PostgreSQL 行为异常？
----
+
 ## 33. 本节小结
+
 checkpoint 调优的核心不是找到一个“更大”或“更小”的参数。
 核心是识别当前系统的主导窗口。
 如果 WAL 触发主导，`max_wal_size`、`checkpoint_completion_target` 和 WAL 生成速率决定 checkpoint 周期。

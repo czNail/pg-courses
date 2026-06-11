@@ -1,9 +1,11 @@
 # PostgreSQL HOT update 与 index 维护边界
+
 ## 课程定位
-本节主题：HOT update 与 index 维护边界。
+
 上一节已经把 heap page、line pointer、tuple header 和 `t_ctid` 的基本语义拆开。
 本节继续沿着 heap access method 往前走。
 前置知识：已经理解 MVCC tuple version、heap page line pointer、buffer content lock、WAL-before-data、visibility map 和普通 btree index scan 的基本行为。
+
 本节唯一主问题：
 什么时候 `UPDATE` 可以不为新 tuple version 新增普通索引 entry？
 本节围绕的核心矛盾：
@@ -27,39 +29,11 @@ index scan 从 root TID 进入 heap page，再沿 `t_ctid` 和 HOT flags 找到�
 - HOT update 的 WAL 记录、pruning WAL 记录和 page LSN 分别保护什么。
 - abort、broken chain、CREATE INDEX、CREATE INDEX CONCURRENTLY 会在哪些边界上限制 HOT。
 - 哪些现象能用 SQL 和 `pageinspect` 直接看到，哪些只能用断点或源码推断。
-## 源码基线
-源码仓库：
-```text
-/home/nail/postgres-lab
-```
-基线：
-```text
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
-```
-行号来自：
-```text
-nl -ba <source-file>
-```
-本节重点阅读：
-```text
-src/backend/access/heap/heapam.c
-src/backend/access/heap/README.HOT
-src/backend/access/heap/pruneheap.c
-src/backend/access/index/indexam.c
-src/backend/catalog/index.c
-src/include/access/htup_details.h
-```
-为讲清 index scan 回 heap 的路径，本节还会辅助引用：
-```text
-src/backend/access/heap/heapam_indexscan.c
-src/include/access/tableam.h
-src/backend/executor/nodeModifyTable.c
-src/backend/executor/execIndexing.c
-src/backend/utils/cache/relcache.c
-```
-辅助文件不是本节主角，只用于把 `heap_update()` 返回的边界一路接到 executor 和 index AM。
-## 1. 先给结论
+
+源码基线：本课使用当前实际源码路径 `/home/highgo/postgres`，branch `master`，commit `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`；核心源码分工见第 3 节。
+
+## 1. 本节在总主线中的位置
+
 一个普通 heap `UPDATE` 能不新增普通索引 entry，需要同时满足三个条件。
 第一，新 tuple version 必须放在旧 version 所在的同一个 heap page。
 第二，所有 HOT-blocking indexes 引用的列，在旧 tuple 和新 tuple 之间没有变化。
@@ -77,11 +51,13 @@ HOT update 实际写 page 时发生三件关键事。
 这些动作在 `heapam.c:4029-4060`。
 如果是 HOT，`heap_update()` 最后不会要求 executor 为所有索引插入新 entry。
 `heapam.c:4159-4167` 返回：
+
 ```text
 TU_None          不需要更新任何索引
 TU_Summarizing   只更新 summarizing indexes
 TU_All           更新所有索引
 ```
+
 `TU_None` 才是最狭义的“不新增 index entry”。
 `TU_Summarizing` 是当前 master 的重要细化：
 HOT chain 仍然成立，普通 TID-bearing index 不新增 entry，但 BRIN 这类 summarizing index 可能还要更新 summary。
@@ -98,7 +74,9 @@ summarizing index 不直接持有单个 tuple 的 TID，所以不阻断 HOT chai
 没有 indexed columns 变化，可以 HOT，不更新索引。
 只变化 summarizing indexed columns，可以 HOT，但更新 summarizing indexes。
 这就是本节的核心边界。
-## 2. HOT 不是“索引懒更新”
+
+## 2. 核心矛盾与一句话运行模型
+
 HOT 不是把索引更新延后到 VACUUM。
 HOT 是在可达性模型上改变了 index entry 的含义。
 普通 update 中，新 tuple version 有自己的索引 entry。
@@ -115,7 +93,7 @@ HOT update 中，新 tuple version 没有自己的普通索引 entry。
 index scan 找到 root TID 后，可能还要在 heap page 内追 HOT chain。
 它换来的是一个全局收益：
 重复更新非索引列时，普通索引不增长，索引 WAL 和后续 index vacuum 成本也减少。
-这里的 tension 不是“写索引慢，所以少写”这么简单。
+这里的矛盾不是“写索引慢，所以少写”这么简单。
 真正的问题是：
 如果省略新索引 entry，系统必须提供另一条严格正确的查找路径。
 这条路径不能依赖重新计算 index expression。
@@ -123,10 +101,13 @@ index scan 找到 root TID 后，可能还要在 heap page 内追 HOT chain。
 不能跨 page 让 index scan 多做不受控 heap fetch。
 不能让 VACUUM 在清理旧 tuple 后丢失 index entry 指向 live version 的能力。
 HOT 的答案是 page-local update chain 加稳定 root line pointer。
+
 ## 3. 核心文件分工与阅读顺序
+
 建议先读 `README.HOT`。
 它不是用户文档，而是实现不变量说明。
 尤其要读这些段落：
+
 ```text
 README.HOT:15-32    为什么 page-at-a-time vacuum 不能重算索引 key
 README.HOT:53-130   单个 index entry 覆盖一个 HOT chain
@@ -137,14 +118,17 @@ README.HOT:199-274  pruning / defragmentation 时机
 README.HOT:301-414  CREATE INDEX / CREATE INDEX CONCURRENTLY 边界
 README.HOT:448-520  glossary
 ```
+
 再读 `htup_details.h`。
 这里定义 tuple header flags 的稳定语义。
 `htup_details.h:291-296` 定义：
+
 ```text
 HEAP_KEYS_UPDATED
 HEAP_HOT_UPDATED
 HEAP_ONLY_TUPLE
 ```
+
 `htup_details.h:519-560` 定义 HOT/heap-only 的 accessor。
 这里最容易忽略的是：
 `HeapTupleHeaderIsHotUpdated()` 不只是检查 bit。
@@ -153,6 +137,7 @@ HEAP_ONLY_TUPLE
 第三读 `heapam.c` 的 `heap_update()`。
 它是本节的主入口。
 核心行段：
+
 ```text
 heapam.c:3286-3297   取 HOT-blocking、summarized、key、identity attr bitmap
 heapam.c:3382-3384   计算 modified_attrs
@@ -164,6 +149,7 @@ heapam.c:4159-4167   返回 TU_None / TU_Summarizing / TU_All
 heapam.c:4360-4438   比较 old/new tuple 的实际列值
 heapam.c:8775-8988   log_heap_update()
 ```
+
 第四读 `relcache.c` 的 `RelationGetIndexAttrBitmap()`。
 它回答“indexed columns”到底怎么得来。
 `relcache.c:5280-5287` 描述各类 bitmap。
@@ -184,6 +170,7 @@ heapam.c:8775-8988   log_heap_update()
 最后读 `pruneheap.c`。
 它回答旧 root tuple 死亡后，为什么 root line pointer 还必须存在。
 核心行段：
+
 ```text
 pruneheap.c:242-360    opportunistic pruning 入口和 cleanup lock
 pruneheap.c:542-645    一次性分类 root items 和 heap-only items
@@ -194,7 +181,9 @@ pruneheap.c:2091-2167  LP_REDIRECT / LP_DEAD 的断言边界
 pruneheap.c:2228-2268  page_verify_redirects()
 pruneheap.c:2273-2391  heap_get_root_tuples()
 ```
+
 ## 4. 关键状态与不变量
+
 HOT 的核心状态不在一个单独结构体里。
 它分散在四层：
 heap tuple header flags。
@@ -237,26 +226,32 @@ heap-only tuple 的 line pointer 不应该变成 `LP_DEAD`。
 第四层是 `TU_UpdateIndexes`。
 这是 heap AM 返回给上层 executor 的维护边界。
 `tableam.h:132-141` 定义：
+
 ```text
 TU_None          no indexed columns updated, TID addressing unchanged
 TU_All           non-summarizing indexed column changed, or TID changed
 TU_Summarizing   only summarized columns changed, TID unchanged
 ```
+
 注意这里的 “TID unchanged” 不是说新 tuple 的 physical TID 没变。
 UPDATE 总是生成新 tuple version。
 它指的是普通索引 entry 用来定位逻辑行的 root TID 不需要改变。
 HOT chain 让 index entry 的 TID 继续是 root TID。
 新 tuple version 的 `t_self` 当然是新的 offset。
 这个差异是理解 HOT 的关键。
+
 ## 5. HOT eligibility 的源码判断
+
 `heap_update()` 开始时先准备 attr bitmap。
 `heapam.c:3286-3292` 取四组 bitmap：
+
 ```text
 hot_attrs  = INDEX_ATTR_BITMAP_HOT_BLOCKING
 sum_attrs  = INDEX_ATTR_BITMAP_SUMMARIZED
 key_attrs  = INDEX_ATTR_BITMAP_KEY
 id_attrs   = INDEX_ATTR_BITMAP_IDENTITY_KEY
 ```
+
 `hot_attrs` 服务 HOT eligibility。
 `sum_attrs` 服务 summarizing index 维护。
 `key_attrs` 服务 tuple lock mode 和外键并发。
@@ -270,10 +265,12 @@ id_attrs   = INDEX_ATTR_BITMAP_IDENTITY_KEY
 表达式索引更保守。
 `relcache.c:5475-5479` 对 index expressions 和 index predicate 调 `pull_varattnos()`。
 这意味着：
+
 ```sql
 CREATE INDEX ON t ((lower(name)));
 CREATE INDEX ON t (id) WHERE active;
 ```
+
 `name` 和 `active` 都可能阻断 HOT。
 即使 `active` 不存储在索引 tuple 中，只出现在 partial index predicate 中，也必须视为 indexed column。
 原因在 `README.HOT:18-32`。
@@ -310,6 +307,7 @@ SQL 层认为“逻辑相等”的更新，不一定 HOT-safe。
 如果最终 old/new datum 二进制一致，它不会进入 `modified_attrs`。
 HOT eligibility 的实际判断在 `heapam.c:3972-3992`。
 伪流程是：
+
 ```text
 if newbuf == buffer:
     if modified_attrs does not overlap hot_attrs:
@@ -319,6 +317,7 @@ if newbuf == buffer:
 else:
     PageSetFull(old_page)
 ```
+
 这段代码同时说明两个边界。
 只有 same page 才“可能 HOT”。
 没有 HOT-blocking attr 变化才“允许 HOT”。
@@ -332,8 +331,11 @@ else:
 这就是 HOT-safe 和 actual HOT update 的区别。
 HOT-safe 描述列变化边界。
 actual HOT update 还要求物理落点在同一页。
+
 ## 6. 主流程源码 walkthrough
+
 从 executor 看，UPDATE 的主线可以压缩成：
+
 ```text
 ExecUpdateAct()
   -> table_tuple_update()
@@ -344,6 +346,7 @@ ExecUpdateAct()
      -> 如果 updateIndexes != TU_None:
           ExecInsertIndexTuples()
 ```
+
 `heapam_handler.c:223-240` 把 table AM API 接到 `heap_update()`。
 `heapam_handler.c:243-262` 对 `heap_update()` 返回的 `update_indexes` 做断言。
 如果新 tuple 不是 heap-only，必须是 `TU_All`。
@@ -367,11 +370,13 @@ ExecUpdateAct()
 接下来 `heap_update()` 为新 tuple 选择落点。
 这部分代码分散在 `heapam.c:3663-3945`，本节不逐行展开。
 对 HOT 来说，只需要抓住最终变量：
+
 ```text
 buffer  = old tuple page
 newbuf  = new tuple page
 heaptup = 实际要写入 page 的 tuple
 ```
+
 `heapam.c:3972` 之后，`newbuf == buffer` 才能进入 HOT 判断。
 如果 `newbuf != buffer`，`heapam.c:3995-3998` 对 old page 设置 full hint。
 这会让后续访问更积极尝试 pruning/defragmentation。
@@ -386,17 +391,21 @@ heaptup = 实际要写入 page 的 tuple
 如果事务 abort，后续 pruning 会 no-op 或清理 aborted tuple。
 `heapam.c:4029-4044` 根据 `use_hot_update` 设置或清理 HOT flags。
 HOT 时：
+
 ```text
 old tuple: HeapTupleSetHotUpdated()
 new tuple: HeapTupleSetHeapOnly()
 caller copy: HeapTupleSetHeapOnly()
 ```
+
 非 HOT 时：
+
 ```text
 old tuple: HeapTupleClearHotUpdated()
 new tuple: HeapTupleClearHeapOnly()
 caller copy: HeapTupleClearHeapOnly()
 ```
+
 这里清理 flags 也很重要。
 tuple 可能来自上层私有副本或重用路径。
 非 HOT 更新必须显式保证新旧 tuple 不带 HOT 语义。
@@ -416,9 +425,11 @@ UPDATE 产生了新版本和旧版本的可见性变化。
 `heapam.c:4082-4107` 写 WAL。
 `log_heap_update()` 根据新 tuple 是否 heap-only 选择 WAL info。
 `heapam.c:8799-8802`：
+
 ```text
 HeapTupleIsHeapOnly(newtup) ? XLOG_HEAP_HOT_UPDATE : XLOG_HEAP_UPDATE
 ```
+
 如果 old/new 在同一 page，并且不需要 logical tuple data，也不需要 full-page image，`heapam.c:8824-8854` 会记录新旧 tuple payload 的 common prefix/suffix 以减少 WAL。
 这不是 HOT correctness 的核心。
 但它解释了为什么 same-page update 在 WAL 上还有额外优化空间。
@@ -430,6 +441,7 @@ HeapTupleIsHeapOnly(newtup) ? XLOG_HEAP_HOT_UPDATE : XLOG_HEAP_UPDATE
 这个调用会把 HOT update 和 new page update 计入 pgstat。
 最后 `heapam.c:4159-4167` 返回 index maintenance decision。
 伪代码是：
+
 ```text
 if use_hot_update:
     if summarized_update:
@@ -439,6 +451,7 @@ if use_hot_update:
 else:
     update_indexes = TU_All
 ```
+
 上层 `ExecUpdateEpilogue()` 只看这个结果。
 `nodeModifyTable.c:2608-2617` 如果 `TU_None`，不调用 `ExecInsertIndexTuples()`。
 如果 `TU_Summarizing`，设置 `EIIT_ONLY_SUMMARIZING`。
@@ -449,7 +462,9 @@ else:
 heap AM 判断“是否需要新增索引 entry”。
 executor 负责对需要维护的索引形成 index datum。
 index AM 负责具体插入、唯一性检查和 WAL。
+
 ## 7. index scan 如何找到新版本
+
 HOT 的正确性最终要在 index scan 中兑现。
 普通 index scan 的第一步不懂 HOT。
 `indexam.c:598-615` 调具体 index AM 的 `amgettuple()`。
@@ -458,6 +473,7 @@ index AM 找到满足 scan key 的 index entry，把 TID 放到 `scan->xs_heapti
 它可能指向一个普通 tuple。
 也可能指向一个已经被 pruning 成 `LP_REDIRECT` 的 root line pointer。
 `indexam.c:657-664` 随后调用：
+
 ```text
 table_index_fetch_tuple(scan->xs_heapfetch,
                         &scan->xs_heaptid,
@@ -466,6 +482,7 @@ table_index_fetch_tuple(scan->xs_heapfetch,
                         &scan->xs_heap_continue,
                         &all_dead)
 ```
+
 `tableam.h:1280-1302` 对这个 API 的注释非常关键。
 它说 `tid` 在返回 true 时可能被修改。
 原因是一个 index entry 可能通过 heap AM 的 HOT 支持到达多个 row versions。
@@ -497,9 +514,11 @@ chain start 不应该是 heap-only tuple。
 第三条边界在 `heapam_indexscan.c:160-166`。
 当前 tuple 的 xmin 必须等于上一跳 tuple 的 update xid。
 也就是：
+
 ```text
 prev_xmax == current_xmin
 ```
+
 这个检查防止链路被 pruning、abort 或 line pointer reuse 后误连到无关 tuple。
 只靠 buffer pin 不够。
 `README.HOT:179-181` 特别指出，早期 HOT 代码曾假设 page pin 能防住这类问题。
@@ -526,7 +545,9 @@ heap-only tuple 本身也在 page 上。
 它会被当作普通 tuple version 做 visibility check。
 如果它对 snapshot 可见，seq scan 能直接看到。
 因此 HOT 的额外追链成本主要落在 index scan。
+
 ## 8. root line pointer 与 pruning 边界
+
 HOT 能省 index entry，代价是 root line pointer 必须长期承担 index 可达性。
 当 root tuple bytes 已经对所有事务 dead 时，不能直接把 root line pointer 变成 `LP_UNUSED`。
 因为索引 entry 还指向这个 offset number。
@@ -587,7 +608,9 @@ pruning 的实际 page 变化在 `heap_page_prune_execute()`。
 前者创建 chain。
 后者缩短 chain、redirect root、释放 heap-only line pointers。
 两者都修改 heap page，都需要 WAL 保证 crash recovery。
+
 ## 9. CREATE INDEX 为什么是 HOT 边界
+
 HOT 的一个复杂边界来自新增索引。
 已有 HOT chain 对旧索引是安全的。
 因为旧索引引用的列在 chain 内没有变化。
@@ -621,7 +644,9 @@ HOT-safety 要考虑 not indisready/not indisvalid 的索引。
 这里的可迁移规律是：
 索引是否可用于 read、是否 ready for inserts、是否 live、是否参与 HOT-safety，是四个不同问题。
 不要把 `indisvalid` 当成“这个索引对所有维护路径都不存在”。
+
 ## 10. 生命周期 / ownership / cleanup
+
 HOT chain 的创建者是执行 UPDATE 的 backend。
 它在 `heap_update()` 中持有 old page 和 new page 的 buffer pin。
 修改 page 时持有 exclusive buffer content lock。
@@ -658,7 +683,9 @@ Resource cleanup 是常规 buffer/lock cleanup。
 `heapam.c:4169-4177` 释放 old replica identity tuple 和 bitmapsets。
 如果中途返回非 `TM_Ok`，`heapam.c:3639-3660` 也会释放 buffer、tuple lock、bitmapsets，并设置 `update_indexes = TU_None`。
 失败 update 不应该让 executor 插入 index entries。
+
 ## 11. 正确性机制层次
+
 HOT 正确性不是一个 flag 保证的。
 它至少依赖八层机制。
 第一层是 MVCC visibility。
@@ -697,7 +724,9 @@ WAL 保证 crash recovery 后 page 状态和 LSN 顺序一致。
 `RelationGetIndexAttrBitmap()` 的结果决定 HOT-blocking attrs。
 `indisready`、`indisvalid`、`indislive`、`indcheckxmin` 决定新索引在维护和查询上的不同边界。
 这是 HOT 和 catalog/index build 的跨模块连接。
+
 ## 12. 错误路径 / fallback
+
 第一类 fallback：same page 空间不足。
 即使列变化 HOT-safe，只要新 tuple 不能放在 old page，`newbuf != buffer`。
 `heapam.c:3972-3998` 不会设置 `use_hot_update`。
@@ -732,7 +761,9 @@ HOT-safety 不能建立在过期的 index set 上。
 standby 不写 pruning WAL。
 主库之后可能产生清理 WAL。
 这意味着 HOT chain 的物理缩短不是每个 reader 都能主动推进。
+
 ## 13. 成本、资源与跨模块传播
+
 HOT 减少的成本主要在索引侧。
 它减少普通索引 entry 数量。
 减少 index page split 和 index WAL。
@@ -761,6 +792,7 @@ fillfactor 太高、row 变宽、page 上 dead tuple 不能及时 prune，都会
 `heapam.c:8866-8875` 在需要 logical tuple data 时记录新 tuple 和 old key/old tuple。
 这和 HOT 是否省普通 index entry 是相邻但独立的成本层。
 跨模块传播可以按路径记：
+
 ```text
 schema/index definition
   -> relcache attr bitmap
@@ -770,19 +802,24 @@ schema/index definition
   -> heap index fetch chain following
   -> pruning/VACUUM cleanup
 ```
+
 如果诊断 HOT 比例下降，不要只看 heap。
 schema 上新增 expression index、partial index predicate、INCLUDE column、BRIN、fillfactor、long transaction、autovacuum 延迟、checkpoint/full page writes 都可能改变现象。
+
 ## 14. 观测与诊断入口
+
 本节锚定一个 runtime truth：
 更新非 HOT-blocking 列且新 tuple 留在同页时，`UPDATE` 可以增加 heap tuple version，但不为普通索引新增 entry。
 这个 truth 可以从三类现象验证。
 第一类是统计视图。
 `pg_stat_user_tables` 有：
+
 ```text
 n_tup_upd
 n_tup_hot_upd
 n_tup_newpage_upd
 ```
+
 `n_tup_hot_upd` 是 HOT update 计数。
 `n_tup_newpage_upd` 是 update 新版本落到新 page 的计数。
 这些是 relation-level 累计统计。
@@ -793,6 +830,7 @@ n_tup_newpage_upd
 WAL 数字还受 full-page writes、checkpoint 距离、tuple width、logical WAL 需求影响。
 第三类是 `pageinspect`。
 `heap_page_items(get_raw_page(...))` 能看到：
+
 ```text
 lp
 lp_flags
@@ -804,12 +842,14 @@ t_ctid
 t_infomask
 t_infomask2
 ```
+
 `heap_tuple_infomask_flags()` 能把 `HEAP_HOT_UPDATED` 和 `HEAP_ONLY_TUPLE` 解码成文本 flags。
 它能直接看到 HOT chain 的 page-level 痕迹。
 但它是 raw page 观察。
 不要把 raw flag 当作完整 visibility 语义。
 第四类是断点。
 适合设断点的位置：
+
 ```text
 heap_update
 HeapDetermineColumnsInfo
@@ -819,6 +859,7 @@ heap_prune_chain
 ExecInsertIndexTuples
 index_insert
 ```
+
 断点能看到 `use_hot_update`、`summarized_update`、`modified_attrs`、`hot_attrs`、`sum_attrs`。
 这些状态 SQL 层很难直接看到。
 第五类是索引尺寸和 bloat。
@@ -830,10 +871,13 @@ index_insert
 HOT 本身没有专门 wait event。
 如果看到 buffer content lock 或 tuple lock 等待，需要回到 update 并发路径分析。
 不能把等待直接解释为 HOT 问题。
+
 ## 15. 课堂实验一：HOT 与 cold 的最小对照
+
 目标：
 观察同样是 UPDATE，非索引列 same-page 更新会产生 HOT，索引列更新会退化为 cold。
 准备：
+
 ```sql
 CREATE EXTENSION IF NOT EXISTS pageinspect;
 
@@ -851,7 +895,9 @@ FROM generate_series(1, 2000) AS g;
 VACUUM hot_demo;
 SELECT pg_stat_reset_single_table_counters('hot_demo'::regclass);
 ```
+
 先更新非索引列：
+
 ```sql
 UPDATE hot_demo
 SET v = v + 1
@@ -863,12 +909,14 @@ SELECT n_tup_upd, n_tup_hot_upd, n_tup_newpage_upd
 FROM pg_stat_user_tables
 WHERE relname = 'hot_demo';
 ```
+
 预期：
 `n_tup_upd` 增加。
 `n_tup_hot_upd` 应该大量增加。
 如果环境、page 空间和 tuple width 不同，可能不是 500 条全 HOT。
 这正是 same-page 是 actual HOT 条件的体现。
 再创建一个会阻断 HOT 的索引：
+
 ```sql
 CREATE INDEX hot_demo_v_idx ON hot_demo(v);
 SELECT pg_stat_reset_single_table_counters('hot_demo'::regclass);
@@ -883,22 +931,27 @@ SELECT n_tup_upd, n_tup_hot_upd, n_tup_newpage_upd
 FROM pg_stat_user_tables
 WHERE relname = 'hot_demo';
 ```
+
 预期：
 这次 `v` 是 btree index column。
 `modified_attrs` 与 `hot_attrs` 有交集。
 `heap_update()` 返回 `TU_All`。
 `n_tup_hot_upd` 应显著下降或为 0。
 对照源码：
+
 ```text
 relcache.c:5437-5479   v 被收进 hotblockingattrs
 heapam.c:3382-3384    modified_attrs 包含 v
 heapam.c:3979         bms_overlap(modified_attrs, hot_attrs) 为 true
 heapam.c:4167         update_indexes = TU_All
 ```
+
 ## 16. 课堂实验二：用 pageinspect 看 HOT flags
+
 目标：
 看到 `HEAP_HOT_UPDATED`、`HEAP_ONLY_TUPLE` 和 `t_ctid` 的链路。
 重新准备一个小表：
+
 ```sql
 DROP TABLE IF EXISTS hot_page_demo;
 CREATE TABLE hot_page_demo (
@@ -916,11 +969,15 @@ VACUUM hot_page_demo;
 UPDATE hot_page_demo SET v = v + 1 WHERE id = 1;
 UPDATE hot_page_demo SET v = v + 1 WHERE id = 1;
 ```
+
 找目标行所在 block：
+
 ```sql
 SELECT ctid, * FROM hot_page_demo WHERE id = 1;
 ```
+
 如果 `ctid` 是 `(0,5)`，观察 block 0：
+
 ```sql
 SELECT h.lp,
        h.lp_flags,
@@ -934,30 +991,37 @@ LEFT JOIN LATERAL heap_tuple_infomask_flags(h.t_infomask, h.t_infomask2) AS f
 ON h.t_infomask IS NOT NULL
 ORDER BY h.lp;
 ```
+
 你应该寻找这些模式：
 旧 tuple 的 `raw_flags` 中有 `HEAP_HOT_UPDATED`。
 新 tuple 或中间 tuple 的 `raw_flags` 中有 `HEAP_ONLY_TUPLE`。
 旧 tuple 的 `t_ctid` 指向下一跳。
 最新可见 version 的 `t_ctid` 通常指向自己。
 然后执行：
+
 ```sql
 VACUUM hot_page_demo;
 ```
+
 再次观察 page。
 可能看到 root line pointer 从 `LP_NORMAL` 变成 redirect。
 也可能因为 snapshot horizon、page 状态、版本和 autovacuum 时机不同，没有立刻看到 redirect。
 这个实验的重点不是强行制造某个固定 `lp_flags` 数字。
 重点是把可见 flags 回到源码：
+
 ```text
 heapam.c:4029-4036          设置 HOT flags
 heapam_indexscan.c:127-139  index scan 能跟随 root redirect
 pruneheap.c:1452-1468       root redirect / LP_DEAD 的 pruning 规则
 ```
+
 ## 17. 课堂实验三：same page 边界
+
 目标：
 证明“indexed columns 不变”还不够。
 如果新 tuple 不能放在 same page，仍然要 cold update。
 准备一个更容易撑满 page 的表：
+
 ```sql
 DROP TABLE IF EXISTS hot_space_demo;
 CREATE TABLE hot_space_demo (
@@ -973,7 +1037,9 @@ FROM generate_series(1, 200) AS g;
 VACUUM hot_space_demo;
 SELECT pg_stat_reset_single_table_counters('hot_space_demo'::regclass);
 ```
+
 更新非索引列，但让 tuple 变宽：
+
 ```sql
 UPDATE hot_space_demo
 SET payload = payload || repeat('y', 200)
@@ -985,6 +1051,7 @@ SELECT n_tup_upd, n_tup_hot_upd, n_tup_newpage_upd
 FROM pg_stat_user_tables
 WHERE relname = 'hot_space_demo';
 ```
+
 预期：
 `payload` 没有普通索引。
 列变化本身 HOT-safe。
@@ -992,18 +1059,23 @@ WHERE relname = 'hot_space_demo';
 `n_tup_newpage_upd` 会增加。
 `n_tup_hot_upd` 不会等于全部 update 数。
 对照源码：
+
 ```text
 heapam.c:3972  只有 newbuf == buffer 才检查 HOT
 heapam.c:3995  newbuf != buffer 时 PageSetFull(page)
 heapam.c:4167  非 HOT 返回 TU_All
 ```
+
 如果你的实验仍然出现很多 HOT，说明 page 空间仍足够，或者 TOAST 行为改变了 tuple size。
 把 payload 调大或降低行数重新试。
 这是 workload-dependent 现象。
+
 ## 18. 课堂实验四：summarizing index 例外
+
 目标：
 观察 BRIN 这类 summarizing index 不阻断 HOT chain，但会触发 summarizing index 维护。
 准备：
+
 ```sql
 DROP TABLE IF EXISTS hot_brin_demo;
 CREATE TABLE hot_brin_demo (
@@ -1020,7 +1092,9 @@ CREATE INDEX hot_brin_demo_v_brin ON hot_brin_demo USING brin(v);
 VACUUM hot_brin_demo;
 SELECT pg_stat_reset_single_table_counters('hot_brin_demo'::regclass);
 ```
+
 更新 BRIN summarizing column：
+
 ```sql
 UPDATE hot_brin_demo
 SET v = v + 1
@@ -1032,6 +1106,7 @@ SELECT n_tup_upd, n_tup_hot_upd, n_tup_newpage_upd
 FROM pg_stat_user_tables
 WHERE relname = 'hot_brin_demo';
 ```
+
 预期：
 在 page 空间足够时，`n_tup_hot_upd` 仍会增加。
 这说明 BRIN 的 `v` 没有进入 HOT-blocking attrs。
@@ -1039,13 +1114,16 @@ WHERE relname = 'hot_brin_demo';
 这个状态 SQL 统计不能直接显示。
 要确认它，适合在 `heap_update()` 返回前或 `ExecInsertIndexTuples()` 设置 flags 处打断点。
 对照源码：
+
 ```text
 relcache.c:5427-5435  amsummarizing -> summarizedattrs
 heapam.c:3990-3991   modified_attrs overlaps sum_attrs
 heapam.c:4161-4164   update_indexes = TU_Summarizing
 execIndexing.c:373-377 跳过非 summarizing indexes
 ```
+
 然后把 BRIN 改成 btree：
+
 ```sql
 DROP INDEX hot_brin_demo_v_brin;
 CREATE INDEX hot_brin_demo_v_btree ON hot_brin_demo(v);
@@ -1061,10 +1139,14 @@ SELECT n_tup_upd, n_tup_hot_upd, n_tup_newpage_upd
 FROM pg_stat_user_tables
 WHERE relname = 'hot_brin_demo';
 ```
+
 这次 `v` 进入 HOT-blocking attrs。
 HOT 比例应显著下降。
+
 ## 19. gdb / 断点练习
+
 如果你在本地 debug build 上跑实验，可以设置这些断点：
+
 ```gdb
 break heap_update
 break HeapDetermineColumnsInfo
@@ -1074,16 +1156,21 @@ break heap_prune_chain
 break ExecInsertIndexTuples
 break index_insert
 ```
+
 重点观察四组状态：
+
 ```text
 heap_update: use_hot_update, summarized_update, *update_indexes, newbuf == buffer
 HeapDetermineColumnsInfo: modified_attrs, hot_attrs, sum_attrs
 log_heap_update: HeapTupleIsHeapOnly(newtup), info
 heap_hot_search_buffer: offnum, at_chain_start, prev_xmax, current xmin, HOT flag
 ```
+
 练习目标不是背变量。
 而是画出 `index root TID -> root/redirect -> heap-only successor -> visible tuple` 这条链。
+
 ## 20. 常见误区
+
 误区一：
 “只要 UPDATE 不改索引 key，就是 HOT。”
 不够。
@@ -1120,7 +1207,9 @@ chain validity 要靠 content lock、line pointer state 和 XMIN/XMAX matching�
 “`n_tup_hot_upd / n_tup_upd` 就是 schema 是否合理的完整答案。”
 不够。
 这个比例受 fillfactor、tuple width、page free space、long transaction、pruning 成功率、autovacuum、checkpoint 和 workload 分布影响。
+
 ## 21. 讨论题
+
 1. 为什么 HOT 要求 same page？
 如果允许跨 page HOT chain，index scan、pruning 和 VACUUM 的哪些边界会改变？
 2. 为什么 expression index 和 partial index predicate 中引用的列也要阻断 HOT？
@@ -1135,7 +1224,9 @@ BRIN minmax summary 漏更新会造成哪类错误？
 旧 snapshot 使用新索引会如何看到 broken HOT chain？
 7. HOT ratio 下降时，你会按什么顺序排查 schema、page space、long transaction 和 pruning？
 8. `HeapDetermineColumnsInfo()` 为什么用二进制 equality，而不是 opclass equality？
+
 ## 22. 本节小结
+
 本节只回答一个问题：
 什么时候 UPDATE 可以不为新 tuple version 新增普通索引 entry。
 答案是：
@@ -1143,6 +1234,7 @@ BRIN minmax summary 漏更新会造成哪类错误？
 所有 HOT-blocking indexes 引用的列必须没有二进制变化。
 如果只影响 summarizing indexes，可以保持 HOT chain，但仍要更新 summaries。
 HOT 的核心链路是：
+
 ```text
 heap_update()
   -> RelationGetIndexAttrBitmap()
@@ -1153,7 +1245,9 @@ heap_update()
   -> old.t_ctid = new.t_self
   -> return TU_None / TU_Summarizing / TU_All
 ```
+
 index scan 的补偿链路是：
+
 ```text
 index_getnext_tid()
   -> root TID
@@ -1162,7 +1256,9 @@ index_getnext_tid()
   -> root redirect / HOT flags / t_ctid / XMIN-XMAX matching
   -> visible tuple for snapshot
 ```
+
 pruning 的补偿链路是：
+
 ```text
 root tuple dead
   -> root line pointer cannot be reused
@@ -1171,8 +1267,10 @@ root tuple dead
   -> whole chain dead makes root LP_DEAD
   -> regular VACUUM later removes index entries
 ```
+
 核心状态不是某个字段。
 它是：
+
 ```text
 root line pointer
 + HEAP_HOT_UPDATED / HEAP_ONLY_TUPLE
@@ -1182,6 +1280,7 @@ root line pointer
 + snapshot visibility
 + WAL / pruning rules
 ```
+
 ownership 上，heap AM 创建 chain 并返回 index maintenance decision。
 executor 根据 `TU_UpdateIndexes` 决定是否调用索引插入。
 index AM 不需要知道 heap 为什么省略普通 entry。

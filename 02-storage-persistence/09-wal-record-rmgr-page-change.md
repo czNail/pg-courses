@@ -2,65 +2,62 @@
 
 ## 课程定位
 
-本节主题：PostgreSQL 如何把一次 page 修改描述成一条 WAL record。
-前置知识：已理解 shared buffer 中的 page 修改、WAL-before-data 的目标，以及 crash recovery 需要按 WAL 重建数据页。
-本节唯一主问题：一次 page 修改怎样被编码成既能由通用 WAL 层保存、又能由 rmgr 在 redo 侧精确解释的 record？
-本节核心矛盾：WAL record 格式必须足够通用，才能承载 heap、btree 等不同模块；但 redo 又必须足够具体，才能恢复每个 page 的真实状态。
-本节主流程：access method 登记 buffer、main data 和 block data -> `XLogRecordAssemble()` 决定 FPI 与 record 布局 -> `XLogInsert()` 返回 end LSN -> recovery 侧按 rmgr 解码并 redo。
-错误路径 / 异常路径主要发生在 record 构造协议错误、block reference 不一致、FPI 与 delta 边界错误，以及 recovery decode 发现 CRC、长度或 rmgr 信息不合法时。
-观测与诊断入口是 `pg_waldump` 的 rmgr/info/block references、WAL record LSN、checkpoint 后 FPI 变化，以及对 `XLogRecordAssemble()` 和 rmgr redo 入口的断点。
-这里的“描述”不是把页面前后两个版本做通用 byte diff。
-它更像一份给 crash recovery 的可执行说明。
-这份说明由通用 WAL record 容器承载，再交给具体 resource manager，也就是 rmgr，解释和重放。
-本节只做一件事：读懂 WAL record 从构造到 redo 的最小闭环。
-读完本节，你应该能回答：
+前置知识：已理解 shared buffer 中的 page 修改、dirty/page LSN 的关系、WAL-before-data 的目标，以及 crash recovery 需要按 WAL 重建数据页。
 
-- `XLogBeginInsert()` 到 `XLogInsert()` 中间到底登记了什么。
-- `XLogRegisterBuffer()` 和 `XLogRegisterData()` 的语义边界是什么。
-- block reference、block data、main data 在 record 中怎样分工。
-- record header 里的 `xl_rmid` 和 `xl_info` 为什么足以把 record 分派给正确 redo 逻辑。
-- page 修改为什么要被写成 WAL record，而不是只写“把某页某偏移改成某字节”。
-- buffer delta 和 full-page image，也就是 FPI，什么时候互相替代，什么时候必须同时存在。
-- redo 例程为什么必须处理“页面已经部分落盘”与“页面从 FPI 恢复”的两种状态。
-- heap insert/update 和 btree insert/split 如何使用同一个 WAL record 框架表达完全不同的页面修改。
+本节唯一主问题：
 
-## 源码基线
+```text
+一次 page 修改怎样被编码成既能由通用 WAL 层保存、又能由 rmgr 在 redo 侧精确解释的 record？
+```
 
-源码仓库：`/home/nail/postgres-lab`
-基线：`master` = `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`
-本节重点阅读：
+核心矛盾：WAL record 格式必须足够通用，才能承载 heap、btree 等不同模块；但 redo 又必须足够具体，才能恢复每个 page 的真实状态。
 
-- `src/backend/access/transam/xloginsert.c`
-- `src/backend/access/transam/xlogreader.c`
-- `src/backend/access/transam/rmgr.c`
-- `src/backend/access/transam/xlog.c`
-- `src/backend/access/transam/xlogrecovery.c`
-- `src/backend/access/transam/xlogutils.c`
-- `src/include/access/xlogrecord.h`
-- `src/include/access/xlog_internal.h`
-- `src/include/access/xlogreader.h`
-- `src/include/access/xloginsert.h`
-- `src/include/access/xlogutils.h`
-- `src/include/access/rmgr.h`
-- `src/include/access/rmgrlist.h`
-- `src/include/access/heapam_xlog.h`
-- `src/include/access/nbtxlog.h`
-- `src/backend/access/heap/heapam.c`
-- `src/backend/access/heap/heapam_xlog.c`
-- `src/backend/access/nbtree/nbtinsert.c`
-- `src/backend/access/nbtree/nbtxlog.c`
-注意一个版本差异：
-这个基线里没有 `src/backend/access/transam/xlogrecord.c`。
-record 格式定义在 `xlogrecord.h`。
-record 读取和 decode 逻辑在 `xlogreader.c`。
-所以本节在讲“读取侧 record 解析”时，实际对应的是 `xlogreader.c`。
-辅助核对：
+一句话运行模型：
 
-- `src/backend/access/transam/README`
+```text
+access method 先登记 buffer、main data 和 block data；XLogRecordAssemble() 决定 FPI 与 record 布局；XLogInsert() 把通用 record 插入 WAL 并返回 end LSN；recovery 侧再按 xl_rmid / xl_info 交给对应 rmgr redo。
+```
 
----
+学完后应能判断：`XLogRegisterBuffer()`、`XLogRegisterData()`、`XLogRegisterBufData()` 分别登记什么；block reference、main data、per-block data 如何分工；FPI 什么时候替代 delta，什么时候不能省略 rmgr payload。
 
-## 1. 先给结论
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。
+
+## 1. 本节在总主线中的位置
+
+前面几节已经说明 dirty page 写出前必须有 WAL 保护，但还没有解释“WAL 里到底写什么”。本节进入 WAL 子系统，先看一条 page 修改如何被装进通用 WAL record 容器。
+
+这里的重点不是某个 rmgr 的全部 redo 逻辑，而是通用 record 容器与 rmgr-specific 语义如何分工。后续 WAL insertion、flush、segment、FPI 和 redo contract 都会沿着这条边界继续展开。
+
+## 2. 核心矛盾与一句话运行模型
+
+WAL record 不是页面前后两个版本的通用 byte diff，也不是 SQL 逻辑变更。它是一份给 crash recovery 的可执行说明：通用 WAL 层负责可靠保存和解码 record，具体 rmgr 负责解释 payload 并把页面改到正确状态。
+
+最短模型如下：
+
+```text
+XLogBeginInsert()
+  -> XLogRegisterBuffer()
+  -> XLogRegisterData()
+  -> XLogRegisterBufData()
+  -> XLogRecordAssemble()
+  -> XLogInsert()
+  -> rmgr redo decodes the record during recovery
+```
+
+## 3. 核心文件分工与阅读顺序
+
+| 阅读顺序 | 文件 | 本节读什么 |
+| --- | --- | --- |
+| 1 | `src/backend/access/transam/xloginsert.c` | insert-side record 构造、registered buffers/data、FPI 判定、`XLogRecordAssemble()`。 |
+| 2 | `src/include/access/xlogrecord.h`、`src/include/access/xlog_internal.h` | `XLogRecord`、block reference、record header 和物理格式。 |
+| 3 | `src/include/access/xloginsert.h` | `XLogRegister*()` API 的调用 contract。 |
+| 4 | `src/backend/access/transam/xlogreader.c`、`src/include/access/xlogreader.h` | recovery/read-side record decode。 |
+| 5 | `src/backend/access/transam/rmgr.c`、`src/include/access/rmgr.h`、`src/include/access/rmgrlist.h` | `xl_rmid` 如何映射到 rmgr table。 |
+| 6 | `src/backend/access/heap/heapam.c`、`src/backend/access/heap/heapam_xlog.c` | heap insert/update record 的生成和 redo 示例。 |
+| 7 | `src/backend/access/nbtree/nbtinsert.c`、`src/backend/access/nbtree/nbtxlog.c` | btree insert/split 如何使用同一 record 框架表达结构变化。 |
+| 8 | `src/backend/access/transam/xlog.c`、`src/backend/access/transam/xlogrecovery.c`、`src/backend/access/transam/xlogutils.c` | 插入、恢复分派和 redo buffer helper 的衔接位置。 |
+
+## 4. 主流程入口：一条 WAL record 怎样产生
 
 一次持久化 page 修改通常会生成一条 WAL record。
 这条 record 至少要回答三个问题。
@@ -92,9 +89,7 @@ FPI 是某个 block 的整页镜像，主要用来抵御 torn page。
 它也不是通用二进制 patch。
 它是一个通用物理容器，加上 rmgr 自己定义的 redo 语义。
 
----
-
-## 2. 从调用序列看一条 record 怎样产生
+## 5. 从调用序列看一条 record 怎样产生
 
 WAL 插入路径的入口在 `xloginsert.c`。
 文件开头的注释已经给出基本过程。
@@ -103,6 +98,7 @@ WAL 插入路径的入口在 `xloginsert.c`。
 这些登记的数据先放在 backend-private 的工作区。
 最后 `XLogInsert()` 把工作区组装成 `XLogRecData` 链并插入 WAL。
 常见形态如下：
+
 ```c
 XLogBeginInsert();
 XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
@@ -111,6 +107,7 @@ XLogRegisterBufData(0, payload, payload_len);
 recptr = XLogInsert(RM_SOME_ID, XLOG_SOME_ACTION);
 PageSetLSN(page, recptr);
 ```
+
 这段伪代码里有两条边界很重要。
 
 `XLogRegisterData()` 登记的是 main data。
@@ -127,9 +124,7 @@ redo 侧通过 `XLogRecGetBlockData(record, block_id, &len)` 读取。
 调用者通常把它写回所有被修改页面的 page LSN。
 这就是后续写脏页时判断“对应 WAL 是否已经 flush”的依据。
 
----
-
-## 3. `XLogBeginInsert()`：开启一次构造
+## 6. `XLogBeginInsert()`：开启一次构造
 
 `XLogBeginInsert()` 做的事很少，但它建立了构造 record 的状态边界。
 它断言当前没有已经登记的 block 和 main data。
@@ -146,9 +141,7 @@ redo 侧通过 `XLogRecGetBlockData(record, block_id, &len)` 读取。
 它只是开始收集 record 的描述材料。
 真正保留 WAL 空间发生在后面的 `XLogInsertRecord()`。
 
----
-
-## 4. `XLogRegisterBuffer()`：给 page 修改命名
+## 7. `XLogRegisterBuffer()`：给 page 修改命名
 
 `XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)` 登记一页。
 源码注释直接说：每个被 WAL-logged operation 修改的 page 都必须调用它。
@@ -172,9 +165,7 @@ redo 侧通过 `XLogRecGetBlockData(record, block_id, &len)` 读取。
 在很多实际代码里，修改和 WAL 生成处于 critical section。
 失败时宁可 PANIC，也不能留下“page 已改但 WAL 没有完整生成”的中间状态。
 
----
-
-## 5. block id 是 rmgr 内部约定
+## 8. block id 是 rmgr 内部约定
 
 `block_id` 是 record 内的编号。
 它不是 block number。
@@ -194,9 +185,7 @@ btree split 约定 block 0 是 original/left page，block 1 是 new right page�
 这些含义不写在通用 WAL 层。
 它们属于 rmgr 的 record contract。
 
----
-
-## 6. `XLogRegisterData()`：main data
+## 9. `XLogRegisterData()`：main data
 
 `XLogRegisterData(const void *data, uint32 len)` 把数据追加到 main data 链。
 源码注释说，这些数据会在 replay 时通过 `XLogRecGetData()` 取得。
@@ -220,9 +209,7 @@ main data 在 record 的 fragment 顺序里按约定放在最后。
 
 `DecodeXLogRecord()` 看到 main data header 后会停止解析 fragment header，转而开始复制 payload。
 
----
-
-## 7. `XLogRegisterBufData()`：page delta 的主要载体
+## 10. `XLogRegisterBufData()`：page delta 的主要载体
 
 `XLogRegisterBufData(uint8 block_id, const void *data, uint32 len)` 把数据追加到某个 block reference 上。
 这个 block id 必须已经通过 `XLogRegisterBuffer()` 或 `XLogRegisterBlock()` 登记。
@@ -242,9 +229,7 @@ redo 侧知道这些 bytes 的格式，是因为 `xl_rmid/xl_info` 选择了对�
 通用 WAL 层只负责保存、decode、对齐和交付。
 它不理解这些 bytes 的业务含义。
 
----
-
-## 8. `XLogInsert()`：组装并插入
+## 11. `XLogInsert()`：组装并插入
 
 `XLogInsert(RmgrId rmid, uint8 info)` 是构造路径的结束点。
 它要求之前已经调用 `XLogBeginInsert()`。
@@ -266,9 +251,7 @@ redo 侧知道这些 bytes 的格式，是因为 `xl_rmid/xl_info` 选择了对�
 成功后 `XLogInsert()` reset 构造工作区，并返回 record end LSN。
 这条 end LSN 通常用于被修改 page 的 `PageSetLSN()`。
 
----
-
-## 9. record 总体布局
+## 12. record 总体布局
 
 `xlogrecord.h` 给出 WAL record 的通用布局。
 顺序是：
@@ -310,9 +293,7 @@ redo 侧知道这些 bytes 的格式，是因为 `xl_rmid/xl_info` 选择了对�
 `XLogInsertRecord()` 真正保留 WAL 位置后才知道前一条 record 的位置。
 它填好 `xl_prev` 后，再把 fixed header 纳入 CRC，最终写入 `xl_crc`。
 
----
-
-## 10. block reference 的物理格式
+## 13. block reference 的物理格式
 
 每个 block reference 以 `XLogRecordBlockHeader` 开始。
 它包含：
@@ -346,9 +327,7 @@ image header 包含：
 然后一定跟 `BlockNumber`。
 所以一个 block reference 既描述“去哪找页”，也描述“这条 record 有没有这个页的 image 和 data”。
 
----
-
-## 11. main data 的物理格式
+## 14. main data 的物理格式
 
 main data 没有 block tag。
 它只需要一个特殊 fragment id 和长度。
@@ -370,9 +349,7 @@ main data header 出现后，decode 按约定认为 header 部分结束。
 最后的 payload 才是 main data。
 这就是为什么 `XLogRecordAssemble()` 要先把所有 block header 写完，最后写 main data header。
 
----
-
-## 12. `XLogRecordAssemble()` 做了什么
+## 15. `XLogRecordAssemble()` 做了什么
 
 `XLogRecordAssemble()` 是本节最值得慢读的函数。
 它把之前登记的 buffer、main data、block data 变成最终 `XLogRecData` 链。
@@ -388,9 +365,7 @@ main data header 出现后，decode 按约定认为 header 部分结束。
 真正的 WAL byte position 还没有分配。
 所以它返回的是“可插入的 rdata 链”，不是已经落入 WAL buffer 的 record。
 
----
-
-## 13. FPI 决策：最核心的边界
+## 16. FPI 决策：最核心的边界
 
 FPI 决策在 `XLogRecordAssemble()` 的 block 循环中完成。
 优先级大致如下。
@@ -411,9 +386,7 @@ redo 从 checkpoint redo pointer 开始重放，可能没有一份完整页面�
 `XLogInsertRecord()` 拿 insertion lock 后会复查 `RedoRecPtr` 和 full-page-write 状态。
 如果 checkpoint 刚好推进导致某个 delta-only page 现在需要 FPI，它会让上层重试。
 
----
-
-## 14. FPI 不是“更详细的 delta”
+## 17. FPI 不是“更详细的 delta”
 
 FPI 和 block data 的角色不同。
 FPI 是页面镜像。
@@ -433,9 +406,8 @@ heap insert 在 logical logging 需要新 tuple 时就可能这么做。
 redo 时只有设置 `BKPIMAGE_APPLY` 的 image 才会被当成页面恢复来源。
 校验用 image 则用于比较 redo 后页面是否符合预期。
 
----
+## 18. standard page、hole 和 compression
 
-## 15. standard page、hole 和 compression
 PostgreSQL page 常有一段 unused hole。
 标准 page layout 中，`pd_lower` 和 `pd_upper` 之间是空洞。
 如果调用者给 block reference 传 `REGBUF_STANDARD`，FPI 生成时可以跳过这段 hole。
@@ -452,9 +424,7 @@ PostgreSQL page 常有一段 unused hole。
 也可能被 WAL compression 压缩。
 redo 侧 `RestoreBlockImage()` 会按 image header 解压、补零 hole，再恢复出完整 `BLCKSZ` page。
 
----
-
-## 16. `REGBUF_WILL_INIT` 的含义
+## 19. `REGBUF_WILL_INIT` 的含义
 
 `REGBUF_WILL_INIT` 表示 redo 会重新初始化这个 page。
 它隐含 `REGBUF_NO_IMAGE`。
@@ -472,9 +442,7 @@ btree split 的 new right page 也使用这个模式。
 因为 redo 会把页面从头构造出来。
 从 correctness 看，重新初始化页面能像 FPI 一样避开 torn page 依赖。
 
----
-
-## 17. rmgr 是 record 语义的入口
+## 20. rmgr 是 record 语义的入口
 
 `RmgrId` 在 `rmgr.h` 里是 `uint8`。
 内置 rmgr 的数值由 `rmgrlist.h` 的顺序决定。
@@ -503,9 +471,7 @@ record header 中的 `xl_rmid` 是表下标。
 recovery 过程中，`xlogrecovery.c` 调用 `GetRmgr(record->xl_rmid).rm_redo(xlogreader)`。
 之后就进入具体 rmgr 的 redo 逻辑。
 
----
-
-## 18. `xl_info` 是 rmgr 内部 opcode
+## 21. `xl_info` 是 rmgr 内部 opcode
 
 `xlogrecord.h` 把 `xl_info` 分成两部分。
 低 4 位由 WAL 通用层使用。
@@ -518,9 +484,11 @@ recovery 过程中，`xlogrecovery.c` 调用 `GetRmgr(record->xl_rmid).rm_redo(x
 `XLogInsert()` 会检查调用者没有乱设置保留 bit。
 redo 侧通常会先清掉通用低位。
 heap redo 中：
+
 ```c
 info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 ```
+
 然后用 `info & XLOG_HEAP_OPMASK` 分支。
 btree redo 中也做类似处理，然后直接 switch 具体 btree opcode。
 所以一条 record 的语义由两个维度确定。
@@ -535,9 +503,7 @@ btree redo 中也做类似处理，然后直接 switch 具体 btree opcode。
 同样的 `info` bit pattern 在不同 rmgr 下可以有不同含义。
 通用 WAL 层不尝试解释它。
 
----
-
-## 19. record decode：从字节流回到结构
+## 22. record decode：从字节流回到结构
 
 这个基线里，decode 逻辑在 `xlogreader.c`。
 
@@ -558,9 +524,7 @@ decode 会检查 block id 递增。
 它不知道某个 heap tuple payload 的内部字段是否符合 heap 语义。
 那是 rmgr redo 的责任。
 
----
-
-## 20. redo contract 初步
+## 23. redo contract 初步
 
 redo 例程的基本契约是：给定一条已经通过 CRC 和通用格式检查的 WAL record，把 data directory 推进到至少包含这条 record 效果的状态。
 它必须能处理 page 已经包含该修改的情况。
@@ -580,9 +544,7 @@ redo 例程只有在 `BLK_NEEDS_REDO` 时才真正套用 rmgr-specific delta。
 这让 redo 幂等。
 重复看到同一条 record 时，page LSN 会挡住重复应用。
 
----
-
-## 21. FPI 与 redo 的关系
+## 24. FPI 与 redo 的关系
 
 FPI 参与 redo 时，有一个常被忽略的细节。
 
@@ -599,9 +561,8 @@ WAL record 已经通过 CRC 检查，可信度更高。
 这就是 image header 里 `BKPIMAGE_APPLY` 单独存在的原因。
 不是所有 WAL record 中的 page image 都是 redo 恢复来源。
 
----
+## 25. 为什么 page 修改被描述成 WAL record
 
-## 22. 为什么 page 修改被描述成 WAL record
 page 修改发生在 shared buffers 中。
 最终持久化发生在 data file 中。
 崩溃可能发生在任意时刻。
@@ -617,9 +578,7 @@ rmgr 再用 block references 找 page，用 main/block data 或 FPI 修复 page�
 WAL record 是 durable order。
 data page 是可延迟、可重复构造的物理状态。
 
----
-
-## 23. record 是 atomic action，不一定是 SQL 语句
+## 26. record 是 atomic action，不一定是 SQL 语句
 
 一条 WAL record 通常对应一个 storage-level atomic action。
 它不一定对应一条 SQL。
@@ -638,9 +597,7 @@ btree 的 incomplete split flag 就服务这个目的。
 它是 btree rmgr 和 btree 并发算法共同设计的结果。
 通用 WAL record 只是承载这些状态转移。
 
----
-
-## 24. heap insert：生成侧
+## 27. heap insert：生成侧
 
 heap insert 的生成侧在 `heapam.c`。
 普通 insert 在需要 WAL 时会准备 `xl_heap_insert`。
@@ -649,6 +606,7 @@ heap insert 的生成侧在 `heapam.c`。
 同时 buffer flags 会加 `REGBUF_WILL_INIT`。
 这表示 redo 可以重新初始化整个 page。
 之后调用：
+
 ```c
 XLogBeginInsert();
 XLogRegisterData(&xlrec, SizeOfHeapInsert);
@@ -658,6 +616,7 @@ XLogRegisterBufData(0, tuple_bytes, tuple_len);
 recptr = XLogInsert(RM_HEAP_ID, info);
 PageSetLSN(page, recptr);
 ```
+
 `xl_heap_header` 只保存 tuple header 中必须记录的少数字段。
 完整 `HeapTupleHeaderData` 不直接原样进 WAL。
 redo 会根据 record 中的 xid、offset、header fields 和 tuple payload 重建。
@@ -666,9 +625,7 @@ redo 会根据 record 中的 xid、offset、header fields 和 tuple payload 重�
 这样即使该 block 被 FPI 覆盖，tuple data 仍保留在 WAL record 中。
 logical decoding 需要从 WAL record 读到新 tuple。
 
----
-
-## 25. heap insert：redo 侧
+## 28. heap insert：redo 侧
 
 heap insert 的 redo 侧在 `heapam_xlog.c` 的 `heap_xlog_insert()`。
 它先通过 `XLogRecGetData(record)` 取得 `xl_heap_insert`。
@@ -690,9 +647,7 @@ redo 读取 block data 后：
 生成侧把“足以重建 tuple”的信息分散到 main data、block tag、block data、record xid 中。
 redo 侧按同样 contract 拼回来。
 
----
-
-## 26. heap update：同一个 record 里的多个页面
+## 29. heap update：同一个 record 里的多个页面
 
 heap update 更能体现 block reference 的价值。
 update 可能在同一页生成新版本。
@@ -711,9 +666,7 @@ redo 时从 old tuple 复制回来。
 它依赖旧 tuple 在同一页，并且 redo 能先看到旧 tuple。
 如果 old page 和 new page 不同，或者 logical decoding 需要完整 tuple，或者新页可能有 FPI，这种优化就不适用。
 
----
-
-## 27. heap update：redo 侧
+## 30. heap update：redo 侧
 
 `heap_xlog_update()` 先解析 main data。
 它通过 block 0 得到 new block。
@@ -734,15 +687,15 @@ record 不保存“更新后整页”。
 也不保存“SQL 层的 UPDATE 语句”。
 它保存 redo 这次 heap page 状态转移需要的最小物理信息。
 
----
+## 31. btree insert：同一容器，不同 rmgr
 
-## 28. btree insert：同一容器，不同 rmgr
 btree insert 的生成侧在 `nbtinsert.c`。
 简单 leaf insert 准备 `xl_btree_insert`。
 main data 只需要新 item 的 offset number。
 目标 index page 登记为 block 0。
 新 index tuple 作为 block 0 data。
 调用：
+
 ```c
 XLogBeginInsert();
 XLogRegisterData(&xlrec, SizeOfBtreeInsert);
@@ -750,6 +703,7 @@ XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
 XLogRegisterBufData(0, itup, IndexTupleSize(itup));
 recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_INSERT_LEAF);
 ```
+
 如果是 internal page insert，record 还可能登记 child page 为 block 1。
 因为 internal insert 可能完成 child level 的 incomplete split。
 如果还要更新 metapage，则登记 metapage 为 block 2，并用 `REGBUF_WILL_INIT | REGBUF_STANDARD`。
@@ -759,9 +713,7 @@ heap block 0 是 heap page。
 btree block 0 是 index page。
 block data 的解析也完全由 btree redo 决定。
 
----
-
-## 29. btree insert：redo 侧
+## 32. btree insert：redo 侧
 
 `btree_redo()` 读取 `xl_info`，进入 `btree_xlog_insert()`。
 如果不是 leaf insert，它会先清 child page 的 incomplete split flag。
@@ -776,9 +728,7 @@ redo 用 `_bt_swap_posting()` 重做 posting list split。
 通用 WAL 层不知道 `postingoff` 是什么。
 只有 btree redo 知道如何解释这些 bytes。
 
----
-
-## 30. btree split：多 block reference 的代表
+## 33. btree split：多 block reference 的代表
 
 btree split 是本节最适合反复阅读的例子。
 生成侧在 `nbtinsert.c` 中准备 `xl_btree_split`。
@@ -800,9 +750,7 @@ right page 的 block data 中保存右页 tuples，redo 会用 `_bt_restore_page
 这样通常比让 WAL 层认为新右页需要整页 FPI 更省。
 这是一种 rmgr-level 的 WAL 体积优化。
 
----
-
-## 31. btree split：redo 侧
+## 34. btree split：redo 侧
 
 `btree_xlog_split()` 先取 block 0 和 block 1 的 block number。
 如果 block 2 不存在，说明没有右兄弟。
@@ -820,9 +768,7 @@ redo 初始化 btree page opaque fields。
 这些 buffer 最后一起 release，避免 hot standby 读者观察到不一致状态。
 这就是一个 record 同时描述多个 page 修改的例子。
 
----
-
-## 32. record header 和 rmgr 示例对应关系
+## 35. record header 和 rmgr 示例对应关系
 
 以 heap insert 为例。
 
@@ -847,9 +793,7 @@ block 2 和 block 3 视情况存在。
 差异都藏在 rmgr id、info opcode、main data struct 和 block id 约定中。
 这正是 WAL record 设计的扩展点。
 
----
-
-## 33. `XLogInsertRecord()` 和 WAL 字节位置
+## 36. `XLogInsertRecord()` 和 WAL 字节位置
 
 `XLogInsert()` 组装完 record 后，会调用 `XLogInsertRecord()`。
 这个函数位于 `xlog.c`。
@@ -866,9 +810,7 @@ block 2 和 block 3 视情况存在。
 前者构造 record 内容。
 后者把内容放进 WAL 字节流，并补上只有插入时才知道的链式位置和最终 CRC。
 
----
-
-## 34. buffer delta 与 FPI 的边界总结
+## 37. buffer delta 与 FPI 的边界总结
 
 block data 是 delta。
 FPI 是 image。
@@ -891,9 +833,7 @@ redo 例程也不能在 FPI 已经恢复页面的路径上继续无条件读取 
 常见模式是先调用 `XLogReadBufferForRedo()`。
 只有返回 `BLK_NEEDS_REDO` 时，才读取 block data 并应用 delta。
 
----
-
-## 35. page LSN 的两个方向
+## 38. page LSN 的两个方向
 
 正常执行时，`XLogInsert()` 返回 record end LSN。
 调用者把它写入被修改 page。
@@ -911,9 +851,7 @@ FPI 会稍微改变流程。
 如果 restored page 是 all-zero new page，不能随便写 LSN，因为会破坏新页语义。
 源码里也有对 `PageIsNew()` 的特殊处理。
 
----
-
-## 36. 成本、资源与常见误区：不要混淆三种“数据”
+## 39. 成本、资源与常见误区：不要混淆三种“数据”
 
 读 WAL 代码时，最容易混淆三种数据。
 从成本和资源角度看，这三种数据也决定了 WAL record 的大小、FPI 是否压过 delta、redo 是否还需要读取原 page。
@@ -937,9 +875,8 @@ btree split 中，page content 包括 left page、right page、sibling page。
 block data 是 high key、right page tuples 等。
 main data 是 split metadata。
 
----
+## 40. 源码跟读练习一：从 insert API 读到 assemble
 
-## 37. 源码跟读练习一：从 insert API 读到 assemble
 打开 `src/backend/access/transam/xloginsert.c`。
 先读文件头注释。
 确认构造 record 的四步：begin、register、assemble、insert。
@@ -969,9 +906,7 @@ main data 是 split metadata。
 - reset 时哪些状态会清理？
 - 为什么不需要释放登记 data 指针指向的内存？
 
----
-
-## 38. 源码跟读练习二：buffer 和 data 登记
+## 41. 源码跟读练习二：buffer 和 data 登记
 
 继续读 `XLogRegisterBuffer()`。
 重点看注释中的一句：必须为每个被 WAL-logged operation 修改的 page 调用。
@@ -999,9 +934,8 @@ main data 是 split metadata。
 把每个 flag 写成一句话。
 尤其要区分 `NO_IMAGE`、`WILL_INIT`、`KEEP_DATA`。
 
----
+## 42. 源码跟读练习三：record 格式和 decode
 
-## 39. 源码跟读练习三：record 格式和 decode
 打开 `src/include/access/xlogrecord.h`。
 先画出 record layout。
 不要跳过开头注释。
@@ -1032,9 +966,7 @@ main data 是 split metadata。
 - 它如何检查 block id 顺序？
 - 它为什么把 block data 和 main data 复制到 aligned buffer？
 
----
-
-## 40. 源码跟读练习四：rmgr 分派
+## 43. 源码跟读练习四：rmgr 分派
 
 打开 `src/include/access/rmgr.h`。
 确认 `RmgrId` 是 `uint8`。
@@ -1063,9 +995,7 @@ main data 是 split metadata。
 找到 `GetRmgr(record->xl_rmid).rm_redo(xlogreader)`。
 把“record header 到 rmgr redo”的调用链写下来。
 
----
-
-## 41. 源码跟读练习五：heap record 示例
+## 44. 源码跟读练习五：heap record 示例
 
 打开 `heapam.c` 中普通 insert 的 WAL 生成片段。
 问题：
@@ -1091,9 +1021,7 @@ main data 是 split metadata。
 - prefix/suffix 优化为什么只适合某些 same-page update？
 - redo 为什么要先处理 old tuple，再处理 new tuple？
 
----
-
-## 42. 源码跟读练习六：btree record 示例
+## 45. 源码跟读练习六：btree record 示例
 
 打开 `nbtinsert.c` 的 btree insert WAL 生成片段。
 问题：
@@ -1118,30 +1046,37 @@ main data 是 split metadata。
 - right page data 为什么保存 tuples，而不是依赖旧 page？
 - redo 为什么要把 left page 复制到 temp page 后按顺序重建？
 
----
+## 46. 实验一：用 `pg_waldump` 看 rmgr 和 info
 
-## 43. 实验一：用 `pg_waldump` 看 rmgr 和 info
 这个实验观察 record header 层面的 rmgr 分派。
 准备一个独立测试实例。
 确保能找到 `pg_waldump`。
 记录当前 WAL 位置：
+
 ```sql
 SELECT pg_current_wal_lsn();
 ```
+
 执行一组很小的写入：
+
 ```sql
 CREATE TABLE wal_lesson_heap(id int primary key, payload text);
 INSERT INTO wal_lesson_heap VALUES (1, 'alpha');
 UPDATE wal_lesson_heap SET payload = 'alpha-2' WHERE id = 1;
 ```
+
 再次记录 WAL 位置：
+
 ```sql
 SELECT pg_current_wal_lsn();
 ```
+
 对这段 LSN 范围运行：
+
 ```bash
 pg_waldump -p "$PGDATA/pg_wal" -s START_LSN -e END_LSN
 ```
+
 观察输出中的 rmgr。
 你应该能看到 Heap、Btree、Transaction 等 rmgr 记录。
 重点不是记住每一行。
@@ -1150,23 +1085,28 @@ pg_waldump -p "$PGDATA/pg_wal" -s START_LSN -e END_LSN
 这些名字来自各 rmgr 的 identify/desc 逻辑。
 它们对应 record header 里的 `xl_info`。
 
----
+## 47. 实验二：观察 checkpoint 后的 FPI
 
-## 44. 实验二：观察 checkpoint 后的 FPI
 这个实验观察 FPI 边界。
 确保 `full_page_writes` 是 on。
+
 ```sql
 SHOW full_page_writes;
 ```
+
 执行 checkpoint。
+
 ```sql
 CHECKPOINT;
 SELECT pg_current_wal_lsn();
 ```
+
 然后修改一个普通表页面。
+
 ```sql
 INSERT INTO wal_lesson_heap VALUES (2, repeat('x', 100));
 ```
+
 记录结束 LSN，用 `pg_waldump` 查看这段 WAL。
 重点找带有 `FPW` 或 block image 信息的记录。
 现象可能因页面状态、tuple 大小、是否新页、索引维护等而不同。
@@ -1178,22 +1118,25 @@ INSERT INTO wal_lesson_heap VALUES (2, repeat('x', 100));
 - 如果 record 使用 `WILL_INIT`，为什么可以不带 FPI？
 - 如果 block 带 FPI，为什么同一 block 的 block data 可能消失？
 
----
+## 48. 实验三：对比 heap 和 btree 的 block data
 
-## 45. 实验三：对比 heap 和 btree 的 block data
 这个实验不是直接解码 block data bytes。
 而是通过源码和 WAL dump 输出建立 mental model。
 准备表和索引：
+
 ```sql
 DROP TABLE IF EXISTS wal_lesson_heap;
 CREATE TABLE wal_lesson_heap(id int primary key, payload text);
 ```
+
 插入多行：
+
 ```sql
 INSERT INTO wal_lesson_heap
 SELECT g, md5(g::text)
 FROM generate_series(1, 1000) AS g;
 ```
+
 查看 WAL。
 你会看到 heap insert/multi-insert 相关记录，也会看到 btree insert 相关记录。
 然后回到源码：
@@ -1205,9 +1148,7 @@ FROM generate_series(1, 1000) AS g;
 相同 API，不同语义。
 这就是 rmgr contract 的核心。
 
----
-
-## 46. 讨论题
+## 49. 讨论题
 
 1. 为什么 WAL record 选择“通用容器 + rmgr payload”，而不是为 heap、btree、GIN 各自定义完全独立的日志格式？
 2. `XLogRegisterBuffer()` 只登记 page 身份和指针，为什么不能在调用点立刻决定最终 record 一定带 FPI 或 block data？
@@ -1218,9 +1159,7 @@ FROM generate_series(1, 1000) AS g;
 7. `pg_waldump` 能看到 rmgr、info 和 block image，但为什么不能直接证明某个 block data payload 的业务语义？
 8. 本节的可迁移规律是什么：什么时候应该把“格式 framing”和“模块语义”拆成两层 contract？
 
----
-
-## 47. 本节小结
+## 50. 本节小结
 
 WAL record 是 PostgreSQL 描述持久化 page 修改的基本单位。
 它由通用 record 格式和 rmgr-specific payload 共同组成。
@@ -1265,9 +1204,7 @@ heap 和 btree 使用同一套 WAL record API。
 但它们的 block id、payload 和 redo 行为完全不同。
 这就是 rmgr 的意义。
 
----
-
-## 48. 下一步衔接
+## 51. 下一步衔接
 
 下一节可以继续深入 WAL insertion。
 本节把 record 当成逻辑结构读完。

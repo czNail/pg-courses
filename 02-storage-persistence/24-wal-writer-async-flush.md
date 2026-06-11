@@ -2,8 +2,6 @@
 
 ## 课程定位
 
-本节主题：WAL writer 怎样周期性写出和 flush WAL，以及异步提交怎样把本地 WAL flush 等待从前台 commit 路径移到后台。
-
 前置知识：已理解 WAL record 插入、record end LSN、WAL buffer、`XLogFlush()`、WAL-before-data、commit record 和 `synchronous_commit`。
 
 本节唯一主问题：
@@ -11,23 +9,6 @@
 
 本节核心矛盾：
 前台 commit 希望避免每次都执行 write/fsync；但系统不能让 WAL、`pg_xact`、hint bit、同步复制和客户端承诺之间的顺序失去边界。
-
-本节主流程：
-`RecordTransactionCommit()` 的 async 分支记录 `asyncXactLSN`。
-`XLogSetAsyncXactLSN()` 更新共享状态并可能唤醒 walwriter。
-`WalWriterMain()` 周期性调用 `XLogBackgroundFlush()`。
-`XLogBackgroundFlush()` 按完整 WAL page、async commit LSN、`wal_writer_delay` 和 `wal_writer_flush_after` 推进 `LogwrtResult.Write/Flush`。
-
-本节必须区分四个事实：
-WAL record 插入 WAL buffer，不等于 WAL 已经写到文件。
-WAL 已经 write，不等于 WAL 已经 fsync。
-async commit 返回客户端，不等于 commit record 已经 durable。
-walwriter 后台 flush，不等于同步提交可以跳过 `XLogFlush(commit_lsn)`。
-
-本节不泛泛介绍 WAL。
-不重新讲 WAL record 格式。
-不展开 checkpoint、archive、segment recycle 全流程。
-这些内容只在解释 walwriter 边界时出现。
 
 读完本节，你应该能回答：
 - walwriter 每轮主循环推进什么状态。
@@ -41,20 +22,9 @@ walwriter 后台 flush，不等于同步提交可以跳过 `XLogFlush(commit_lsn
 - WAL write/fsync 失败、walwriter ERROR、postmaster death 时系统如何收尾。
 - 如何从 SQL、wait event、`pg_stat_io`、`pg_stat_wal` 和断点观察这条链。
 
-## 源码基线
+源码基线：本课使用当前实际源码路径 `/home/highgo/postgres`，branch `master`，commit `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`；核心源码分工见第 3 节。
 
-源码仓库：`/home/nail/postgres-lab`
-基线：`master` = `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`
-
-本节重点阅读：`src/backend/postmaster/walwriter.c`、`src/backend/access/transam/xlog.c`、`src/backend/access/transam/xlogwait.c`、`src/backend/access/transam/xloginsert.c`、`src/include/access/xlog.h`、`src/include/access/xlog_internal.h`。
-
-辅助核对：`xact.c`、`transam.c`、`clog.c`、`slru.c`、`heapam_visibility.c`、`syncrep.c`、`xact.h`、`slru.h`、`syncrep.h`、`walwriter.h`、`guc_parameters.dat`、`wait_event_names.txt`。
-
-行号来自 `nl -ba <source-file>`。
-
----
-
-## 1. 先给结论
+## 1. 本节在总主线中的位置
 
 walwriter 是 WAL 后台写出进程。
 它不是普通提交正确性的唯一执行者。
@@ -140,9 +110,17 @@ walwriter 可以提前把 WAL flush frontier 推过某个 commit LSN。
 如果它没做到，同步提交 backend 必须自己 flush 或等待别的 backend flush。
 walwriter 不能把 `synchronous_commit = on` 改造成“等后台以后再说”。
 
----
+## 2. 核心矛盾与一句话运行模型
 
-## 2. 核心文件分工与阅读顺序
+一句话运行模型：
+
+```text
+async commit 只保证 commit record 已插入 WAL buffer；XLogSetAsyncXactLSN 把需要后台 flush 的 LSN 发布给 walwriter，WalWriterMain 周期性调用 XLogBackgroundFlush 推进 write/flush frontier，而同步提交仍由前台 XLogFlush(commit_lsn) 固定 durability。
+```
+
+核心矛盾是：前台事务希望降低 commit latency，系统又必须让 WAL inserted、written、flushed、pg_xact 标记、同步复制等待和客户端承诺之间保持可解释顺序。
+
+## 3. 核心文件分工与阅读顺序
 
 先读 `src/backend/postmaster/walwriter.c`。
 它回答 walwriter 何时启动、如何处理信号、如何从 ERROR 恢复、何时 hibernate、每轮调用什么。
@@ -168,11 +146,9 @@ walwriter 不能把 `synchronous_commit = on` 改造成“等后台以后再说�
 不要从 `XLogWrite()` 的系统调用细节开始。
 本节首先要知道谁对哪个 LSN 作出承诺。
 
----
+## 4. 关键状态与边界
 
-## 3. 关键状态与边界
-
-### 3.1 `XactLastRecEnd`
+### 4.1 `XactLastRecEnd`
 
 `XactLastRecEnd` 是 backend-local 变量。
 定义在 `xlog.c:260-262`。
@@ -188,7 +164,7 @@ XactLastRecEnd = EndPos
 它不是 durable LSN。
 它必须和 `LogwrtResult.Flush` 比较才有持久化意义。
 
-### 3.2 `LogwrtResult.Write` 与 `LogwrtResult.Flush`
+### 4.2 `LogwrtResult.Write` 与 `LogwrtResult.Flush`
 
 `XLogwrtResult` 在 `xlog.c:332-336`。
 `Write` 是 WAL 已写出的位置。
@@ -200,7 +176,7 @@ XactLastRecEnd = EndPos
 `XLogWrite()` 发布结果时先写 write，再写屏障，再写 flush。
 这个顺序保证读者不会看到 flush 超过 write 的组合。
 
-### 3.3 `XLogCtl->LogwrtRqst`
+### 4.3 `XLogCtl->LogwrtRqst`
 
 `LogwrtRqst` 是共享 request。
 字段是 `Write` 和 `Flush`。
@@ -211,7 +187,7 @@ WAL record 跨 page boundary 时，`XLogInsertRecord()` 会推进 `LogwrtRqst.Wr
 前台 `XLogFlush()` 也会读取它，顺手写出更多 WAL。
 这使后台写出、前台 flush 和 group commit 能共享同一个 request frontier。
 
-### 3.4 `XLogCtl->asyncXactLSN`
+### 4.4 `XLogCtl->asyncXactLSN`
 
 `asyncXactLSN` 保存最新 async commit 或 async abort LSN。
 它受 `info_lck` 保护。
@@ -221,7 +197,7 @@ WAL record 跨 page boundary 时，`XLogInsertRecord()` 会推进 `LogwrtRqst.Wr
 它只保存最大 LSN。
 因为 WAL 是顺序日志，flush 到最大 async LSN 自然覆盖更早 async commit record。
 
-### 3.5 `XLogCtl->WalWriterSleeping`
+### 4.5 `XLogCtl->WalWriterSleeping`
 
 `WalWriterSleeping` 表示 walwriter 可能处于低功耗 hibernation。
 它受 `info_lck` 保护。
@@ -232,7 +208,7 @@ async commit 看到它时会设置 walwriter 的 latch。
 也不保证唤醒后立即 fsync。
 它只解决“不要让 async commit 等 hibernation 长睡眠自然结束”的问题。
 
-### 3.6 `ProcGlobal->walwriterProc`
+### 4.6 `ProcGlobal->walwriterProc`
 
 walwriter 在 `WalWriterMain()` 中发布自己的 `MyProcNumber`。
 `XLogSetAsyncXactLSN()` 如果决定唤醒，就用这个 proc number 找到 `procLatch` 并 `SetLatch()`。
@@ -241,7 +217,7 @@ walwriter 在 `WalWriterMain()` 中发布自己的 `MyProcNumber`。
 这不破坏 correctness。
 普通 backend 仍然可以自己 flush WAL。
 
-### 3.7 `WALWriteLock`
+### 4.7 `WALWriteLock`
 
 `WALWriteLock` 是 WAL buffer 写到 WAL file 的互斥边界。
 walwriter 和普通 backend 都要拿它执行 `XLogWrite()`。
@@ -250,7 +226,7 @@ walwriter 和普通 backend 都要拿它执行 `XLogWrite()`。
 这把锁不是事务语义锁。
 同步提交是否能返回，取决于目标 commit LSN 是否已经被 `LogwrtResult.Flush` 覆盖。
 
-### 3.8 `WaitLSNState`
+### 4.8 `WaitLSNState`
 
 `xlogwait.c` 维护等待某类 LSN 到达的共享状态。
 主库 flush wait 类型是 `WAIT_LSN_TYPE_PRIMARY_FLUSH`。
@@ -260,9 +236,7 @@ walwriter 或 backend flush 后调用 `WaitLSNWakeup()`。
 普通 commit path 自己 flush 或等 `WALWriteLock`。
 但这个设施是当前基线中观测 primary flush LSN wait 的重要连接点。
 
----
-
-## 4. WalWriterMain 生命周期
+## 5. WalWriterMain 生命周期
 
 `WalWriterMain()` 从 `walwriter.c:89` 开始。
 它由 auxiliary process 框架启动。
@@ -317,9 +291,7 @@ ProcGlobal->walwriterProc = MyProcNumber
 如果 walwriter hibernate 后只等自然超时，async commit 到盘窗口可能被拉长。
 所以 backend 会在必要时 `SetLatch()`。
 
----
-
-## 5. WalWriterMain 主循环
+## 6. WalWriterMain 主循环
 
 主循环在 `walwriter.c:218-269`。
 每轮的关键顺序是：
@@ -358,9 +330,7 @@ walwriter 主循环不能因为统计 flush 变成新的瓶颈。
 它不是 WAL flush 慢的直接证据。
 诊断 WAL I/O 要看 `WAL_WRITE`、`WAL_SYNC` 和 `pg_stat_io`。
 
----
-
-## 6. XLogBackgroundFlush 的目标选择
+## 7. XLogBackgroundFlush 的目标选择
 
 `XLogBackgroundFlush()` 在 `xlog.c:3003`。
 它的注释说：
@@ -422,9 +392,7 @@ async commit target 不能这样，否则可能仍没写到 commit record。
 walwriter 会顺手关闭不再需要的 open WAL segment fd，然后返回 false。
 这避免后台进程持有旧 segment 文件句柄影响删除或回收。
 
----
-
-## 7. XLogBackgroundFlush 的 flush 决策
+## 8. XLogBackgroundFlush 的 flush 决策
 
 有 write target 后，函数决定本轮是否 flush。
 计算：
@@ -460,9 +428,7 @@ else:
 `XLogWrite()` 会写 WAL，但不会执行 `issue_xlog_fsync()`。
 这降低 fsync 频率，也让 async commit 的 durable 时间滞后于 commit 返回。
 
----
-
-## 8. XLogBackgroundFlush 的执行路径
+## 9. XLogBackgroundFlush 的执行路径
 
 执行写出前，walwriter 进入 critical section：
 
@@ -506,9 +472,7 @@ WaitLSNWakeup(WAIT_LSN_TYPE_PRIMARY_FLUSH, LogwrtResult.Flush)
 最后调用 `AdvanceXLInsertBuffer(InvalidXLogRecPtr, insertTLI, true)`。
 这会尝试初始化未来可用的 WAL buffers，把一部分工作从前台 insert path 移走。
 
----
-
-## 9. XLogWrite 的 I/O 边界
+## 10. XLogWrite 的 I/O 边界
 
 `XLogWrite()` 在 `xlog.c:2324`。
 调用者必须持有 `WALWriteLock`。
@@ -545,9 +509,7 @@ fsync 失败是 PANIC。
 再按 write-barrier-flush 顺序更新 atomic result。
 所有 backend、walwriter、SQL 函数和 LSN wait 都依赖这个发布顺序。
 
----
-
-## 10. async commit 从哪里进入
+## 11. async commit 从哪里进入
 
 async commit 的入口在 `RecordTransactionCommit()`。
 普通写事务先插入 commit record。
@@ -585,9 +547,7 @@ else
 它不跳过 `pg_xact` 状态更新。
 它不允许状态页或 hint bit 无边界地越过 commit WAL。
 
----
-
-## 11. XLogSetAsyncXactLSN
+## 12. XLogSetAsyncXactLSN
 
 `XLogSetAsyncXactLSN()` 在 `xlog.c:2630`。
 注释说它记录 asynchronous transaction commit/abort 的 LSN，并在有工作时 nudge walwriter。
@@ -632,9 +592,7 @@ if wakeup and walwriterProc valid:
 不等待 fsync。
 它只是把后台需要推进到哪里写进共享状态。
 
----
-
-## 12. async commit 与 pg_xact
+## 13. async commit 与 pg_xact
 
 异步提交最容易误解的点是：
 commit record 没有 flush，为什么可以标记 `pg_xact` committed？
@@ -680,9 +638,7 @@ hint bit 也有边界。
 原因是 hint bit 也可能把“这个 XID 已提交”的事实持久化到 heap page。
 如果 commit WAL 未 flush，就不能让 data page 先携带这个事实落盘。
 
----
-
-## 13. 前台 XLogFlush
+## 14. 前台 XLogFlush
 
 `XLogFlush(record)` 在 `xlog.c:2801`。
 它和 walwriter 的差别是：
@@ -738,9 +694,7 @@ XLogWrite(WriteRqst, insertTLI, false)
 源码注释说明，来自 `xact.c` commit critical section 的 ERROR 会被提升为 PANIC。
 来自坏 data page LSN 的调用不一定导致整个系统重启。
 
----
-
-## 14. synchronous_commit 边界
+## 15. synchronous_commit 边界
 
 `xact.h` 中的枚举是：
 
@@ -785,9 +739,7 @@ and synchronous_commit > SYNCHRONOUS_COMMIT_LOCAL_FLUSH
 源码会发 WARNING，取消等待并收尾。
 这说明 commit path 的客户端语义不能由后台 walwriter 来模糊处理。
 
----
-
-## 15. 正确性机制层次
+## 16. 正确性机制层次
 
 第一层是 WAL insertion。
 `XLogInsert()` 把 record 放入 WAL buffer 并返回 end LSN。
@@ -819,9 +771,7 @@ walsender 和 `SyncRepWaitForLSN()` 推进 remote write/flush/apply。
 walwriter 推进的是全局后台 flush frontier。
 同步 commit 要求当前调用路径证明自己的 commit LSN 已经被 durable frontier 覆盖。
 
----
-
-## 16. 错误路径与 fallback
+## 17. 错误路径与 fallback
 
 walwriter 顶层 ERROR：
 释放 LWLocks。
@@ -858,9 +808,7 @@ walwriter 意外退出：
 文件头说明 postmaster 会按 backend crash 处理。
 因为共享内存可能损坏，剩余 backend 会被 SIGQUIT，然后进入恢复。
 
----
-
-## 17. 成本、资源与传播
+## 18. 成本、资源与传播
 
 成本一：fsync 频率。
 `wal_writer_delay` 越小，async commit 到盘越快，但后台 fsync 可能更频繁。
@@ -890,11 +838,9 @@ walwriter 或 backend 推进 local flush。
 walsender 基于 local WAL 进度推进复制。
 checkpoint 基于 WAL-before-data 和 data file fsync 发布恢复起点。
 
----
+## 19. 观测与诊断入口
 
-## 18. 观测与诊断入口
-
-### 18.1 insert/write/flush 差距
+### 19.1 insert/write/flush 差距
 
 主库上执行：
 
@@ -916,7 +862,7 @@ SELECT
 它不能证明某个具体事务是不是 async commit。
 它能展示 WAL insert 与 flush 是否存在 backlog。
 
-### 18.2 `pg_stat_wal`
+### 19.2 `pg_stat_wal`
 
 当前基线的 `pg_stat_wal` 列是：
 
@@ -936,7 +882,7 @@ stats_reset
 当前基线里 WAL write/fsync 次数和时间不在 `pg_stat_wal`。
 不要按旧版本经验写不存在的列。
 
-### 18.3 `pg_stat_io`
+### 19.3 `pg_stat_io`
 
 看 WAL I/O：
 
@@ -956,7 +902,7 @@ ORDER BY backend_type, context;
 时间列依赖 `track_wal_io_timing`。
 如果关闭，主要看计数和 bytes。
 
-### 18.4 wait event
+### 19.4 wait event
 
 相关 wait event：
 
@@ -974,16 +920,14 @@ XACT_GROUP_UPDATE    等待 group leader 更新 pg_xact
 不要把它当成 WAL 卡住。
 要判断 commit latency，看业务 backend 是否在 `WAL_WRITE`、`WAL_SYNC`、`COMMIT_DELAY` 或 `SYNC_REP`。
 
-### 18.5 gdb 断点
+### 19.5 gdb 断点
 
 建议断点：`WalWriterMain`、`XLogBackgroundFlush`、`XLogSetAsyncXactLSN`、`XLogFlush`、`XLogWrite`、`issue_xlog_fsync`、`WaitLSNWakeup`。
 关键变量：`XLogCtl->LogwrtRqst.Write/Flush`、`XLogCtl->asyncXactLSN`、`XLogCtl->WalWriterSleeping`、`LogwrtResult.Write/Flush`、`WriteRqst.Write/Flush`、`flexible`。
 断点会改变调度和时间。
 它适合验证状态变化，不适合测量 async commit 真实延迟。
 
----
-
-## 19. 常见误区
+## 20. 常见误区
 
 误区一：
 `XLogInsert()` 返回就表示 WAL durable。
@@ -1020,9 +964,7 @@ flush location 要看 `pg_current_wal_flush_lsn()`。
 不是。
 主库先本地 `XLogFlush()`，再等备库 write。
 
----
-
-## 20. 课堂实验一：观察 async commit 的 flush gap
+## 21. 课堂实验一：观察 async commit 的 flush gap
 
 目标：
 观察 `synchronous_commit = off` 下 insert frontier 和 flush frontier 的短暂差距。
@@ -1040,9 +982,7 @@ flush location 要看 `pg_current_wal_flush_lsn()`。
 commit path 调用 `XLogSetAsyncXactLSN()`。
 后台 `XLogBackgroundFlush()` 后续把 `asyncXactLSN` 纳入 write target。
 
----
-
-## 21. 课堂实验二：区分 walwriter 与 backend WAL I/O
+## 22. 课堂实验二：区分 walwriter 与 backend WAL I/O
 
 目标：
 判断 WAL write/fsync 是后台 walwriter 做的，还是业务 backend 自己做的。
@@ -1065,9 +1005,7 @@ FROM generate_series(1, 100000);
 对比普通 backend 和 walwriter 的 WAL I/O。
 如果同步提交时普通 backend fsync 增多，说明前台 `XLogFlush()` 正在承担更多工作。
 
----
-
-## 22. 课堂实验三：断点跟读 async commit 唤醒
+## 23. 课堂实验三：断点跟读 async commit 唤醒
 
 目标：
 确认 async commit 不直接 flush，而是登记 LSN 并可能唤醒 walwriter。
@@ -1089,9 +1027,7 @@ async commit backend 不进入 `XLogWrite()`。
 walwriter 后续进入 `XLogBackgroundFlush()`。
 如果完整 page target 已经 flush，它会使用 `asyncXactLSN` 并设置 `flexible = false`。
 
----
-
-## 23. 讨论题
+## 24. 讨论题
 
 1. 为什么 walwriter 通常只写完整 WAL page，但 async commit 会让它写当前不完整 page？
 2. `asyncXactLSN` 为什么保存最大 LSN 就够了？
@@ -1106,9 +1042,7 @@ walwriter 后续进入 `XLogBackgroundFlush()`。
 11. 如果普通 backend 的 WAL fsync 很多，而 walwriter 很少，可能有哪些解释？
 12. `wal_writer_delay` 调小会改善哪些现象，又可能引入哪些代价？
 
----
-
-## 24. 本节小结
+## 25. 本节小结
 
 本节核心链路是：
 commit record 先通过 `XLogInsert()` 进入 WAL buffer。

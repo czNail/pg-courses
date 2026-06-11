@@ -1,61 +1,56 @@
 # PostgreSQL WAL insertion、WAL buffers 与 insert lock
 
-
 ## 课程定位
 
-本节主题：多个 backend 并发生成 WAL record 时，PostgreSQL 如何把 record 放进共享 WAL buffers，并在保留 LSN、拷贝字节、推进插入位置和减少锁竞争之间做折中。
-前置知识：已理解 WAL record 的构造格式、record end LSN 的含义，以及 WAL flush 和 data page 写出的基本区别。
-本节唯一主问题：一个已经组装好的 WAL record，怎样在并发 backend 中获得唯一 WAL 地址并安全进入共享 WAL buffers？
-本节核心矛盾：WAL byte stream 必须有全局顺序；但如果把 reserve、copy、buffer 复用和 flush 全部串行化，提交和写入吞吐会被单点锁限制。
-本节主流程：`XLogInsert()` 组装 record -> `XLogInsertRecord()` 取得 insertion lock -> reserve byte range -> copy 到 WAL buffers -> flush 侧等待 insertion 完成。
-生命周期 / ownership / cleanup：WAL insertion lock 只保护短期 reservation 和 insertion state，record bytes 进入 WAL buffers 后由 flush/write 路径推进，backend 不长期拥有 WAL buffer page。
-错误路径 / 异常路径包括 record assemble 重试、WAL buffer 复用前必须写出旧页、flush 侧等待未完成 insertion、WAL write/fsync 失败，以及错误持锁等待导致的死锁风险。
-观测与诊断入口是 `pg_stat_wal`、WALWrite/Sync wait event、`wal_buffers` 压力、`pg_waldump` 的 record 顺序，以及 `XLogInsertRecord()`/`XLogWrite()` 断点。
-这一节只看 WAL insertion 的“写入 shared WAL buffers”阶段。
-它不展开每个 rmgr 的 redo 语义。
-它不展开 commit record 的同步提交策略。
-它也不展开 WAL segment 回收、归档和 checkpoint 调优。
-这些主题在后续课程继续拆开。
-本节要回答的是更底层的问题：
-一个已经组装好的 WAL record，怎样变成 WAL 字节流中的一段连续内容。
-为什么 `XLogInsert()` 返回的是 record end pointer。
-为什么 `ReserveXLogInsertLocation()` 可以先把 insert position 往前推进，而 record 字节还没完全拷贝完。
-为什么 WAL insertion lock 不是一把全局大锁，而是一组固定数量的锁。
-为什么 WAL buffer page 被复用前可能要写出旧 WAL。
-为什么 flush WAL 前必须等待相关 insertion 完成。
-读完本节，你应该能回答：
-- `XLogInsert()` 与 `XLogInsertRecord()` 的职责边界在哪里。
-- `WALInsertLock` 保护的是“插入进行中状态”，而不是整个 WAL 字节流的唯一序列化点。
-- `insertpos_lck` 为什么只保护 `CurrBytePos` 和 `PrevBytePos`。
-- reserve LSN 时得到的 `StartPos`、`EndPos`、`xl_prev` 分别是什么意思。
-- `CurrBytePos` 为什么用“usable byte position”，而不是直接用 `XLogRecPtr`。
-- `CopyXLogRecordToWAL()` 如何处理 WAL page 边界。
-- WAL page header 的 short / long header 对 record 起止位置有什么影响。
-- `GetXLogBuffer()` 为什么在缺页时要更新 `insertingAt`。
-- `AdvanceXLInsertBuffer()` 为什么会触发旧 WAL buffer 写出。
-- `XLogFlush()` 为什么先调用 `WaitXLogInsertionsToFinish()`，再争抢 `WALWriteLock`。
-- flush request 与 WAL insertion 的关系是什么，关系又不是什么。
-- 哪些边界是普通 `ERROR`，哪些边界会进入 `PANIC` 或 critical section。
+前置知识：已理解 WAL record 的构造格式、record end LSN、`xl_prev`、WAL flush 和 data page 写出的区别。
 
-## 源码基线
+本节唯一主问题：
 
-源码仓库：`/home/nail/postgres-lab`
-基线：`master` = `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`
-本节重点阅读：
-- `src/backend/access/transam/xloginsert.c`
-- `src/backend/access/transam/xlog.c`
-- `src/include/access/xlog_internal.h`
-- `src/include/access/xlog.h`
-辅助核对：
-- `src/include/access/xlogdefs.h`
-- `src/include/access/xlogrecord.h`
-本节源码行号按上述基线记录。
-如果你本地 checkout 不是这个提交，行号可能会漂移。
+```text
+一个已经组装好的 WAL record，怎样在并发 backend 中获得唯一 WAL 地址并安全进入共享 WAL buffers？
+```
 
----
+核心矛盾：WAL byte stream 必须有全局顺序；但如果把 reserve、copy、buffer 复用和 flush 全部串行化，提交和写入吞吐会被单点锁限制。
 
+一句话运行模型：
 
-## 1. 先给结论
+```text
+XLogInsert() 在 backend-private 内存中 assemble record；XLogInsertRecord() 用很短的全局临界区 reserve WAL byte range；随后并发拷贝到 WAL buffers；flush 侧先等待相关 insertion 完成，再由 WALWriteLock 控制 write/fsync。
+```
+
+学完后应能判断：reserve LSN 与 copy bytes 为什么分离；`WALInsertLock` 保护什么；`CurrBytePos` 为什么是 usable byte position；flush 为什么要先等 insertion 完成。
+
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。
+
+## 1. 本节在总主线中的位置
+
+上一节看到 record 如何从访问方法的登记信息变成通用 WAL record。本节接着问：这条 record 如何进入共享 WAL byte stream，并获得唯一、连续、可恢复的地址。
+
+这仍然不是 commit durability 课程。普通 `XLogInsert()` 只保证 record 已进入 WAL buffers；是否 write/fsync 要看调用方是否随后走 `XLogFlush()` 或由其他后台路径推进。
+
+## 2. 核心矛盾与一句话运行模型
+
+WAL insertion 的设计把“全局顺序”压缩到最短的 reserve 临界区，把较重的 memcpy 和 buffer page 初始化放到更细的锁域里处理。这样保证 WAL byte stream 有全局地址顺序，同时避免所有 backend 因为拷贝 record bytes 而完全串行。
+
+可以把路径记成：
+
+```text
+register -> assemble -> reserve -> copy to WAL buffers -> optionally write/flush
+```
+
+其中只有 reserve 是全局串行点，copy 通常并行，write/flush 由另一个锁域控制。
+
+## 3. 核心文件分工与阅读顺序
+
+| 阅读顺序 | 文件 | 本节读什么 |
+| --- | --- | --- |
+| 1 | `src/backend/access/transam/xloginsert.c` | `XLogInsert()`、`XLogRecordAssemble()`、组装 record 的 private 工作区。 |
+| 2 | `src/backend/access/transam/xlog.c` | `XLogInsertRecord()`、`ReserveXLogInsertLocation()`、`CopyXLogRecordToWAL()`、`GetXLogBuffer()`、`AdvanceXLInsertBuffer()`、`XLogFlush()`。 |
+| 3 | `src/include/access/xlog_internal.h` | `XLogCtlInsert`、`WALInsertLock`、WAL page header、`XLogRecData`、usable byte position。 |
+| 4 | `src/include/access/xlog.h`、`src/include/access/xlogdefs.h` | `XLogRecPtr`、LSN 边界、公开 WAL 接口。 |
+| 5 | `src/include/access/xlogrecord.h` | fixed record header 与 record end pointer 的关系。 |
+
+## 4. 主流程入口：WAL insertion 的分段同步
 
 WAL insertion 的核心不是“拿一把锁，把 record 追加到文件”。
 PostgreSQL 把这个过程拆成几段不同粒度的同步：
@@ -83,17 +78,16 @@ flush 路径用它判断：我要写到某个 LSN，是否还需要等待某个�
 需要持久化时，调用方走 `XLogFlush(record_end_lsn)`。
 `XLogFlush()` 会先等待相关 insertion 完成，再持有 `WALWriteLock` 调用 `XLogWrite()`。
 所以你可以把这条路径记成：
+
 ```text
 register -> assemble -> reserve -> copy to WAL buffers -> optionally write/flush
 ```
+
 其中只有 reserve 是全局串行点。
 copy 通常并行。
 write/flush 由另一个锁域控制。
 
----
-
-
-## 2. 关键名词
+## 5. 关键名词
 
 `XLogRecPtr` 是 64 位 WAL 位置。
 定义在 `src/include/access/xlogdefs.h:17-29`。
@@ -158,18 +152,17 @@ WAL record 也可以跨 WAL segment，但 segment switch 这种特殊 record 有
 从 usable byte position 到真实 `XLogRecPtr` 的转换由 `XLogBytePosToRecPtr()` 和 `XLogBytePosToEndRecPtr()` 完成。
 这两个函数在 `src/backend/access/transam/xlog.c:1893-1976`。
 
----
-
-
-## 3. 从 `XLogInsert()` 进入
+## 6. 从 `XLogInsert()` 进入
 
 先读 `src/backend/access/transam/xloginsert.c:482-540`。
 `XLogInsert(RmgrId rmid, uint8 info)` 是多数 rmgr 调用的入口。
 它要求调用方之前已经调用 `XLogBeginInsert()`。
 如果没有，会报：
+
 ```text
 XLogBeginInsert was not called
 ```
+
 这是编程错误。
 `XLogInsert()` 还检查 `info` mask。
 调用方只能使用 rmgr bits、`XLR_SPECIAL_REL_UPDATE` 和 `XLR_CHECK_CONSISTENCY`。
@@ -194,10 +187,7 @@ bootstrap mode 有特殊分支。
 原因是 WAL-before-data 需要的是“写出这个数据页前，WAL 至少 flush 到这条 record 的末尾”。
 如果只写 record start pointer，无法证明整条 record 已持久化。
 
----
-
-
-## 4. `XLogRecordAssemble()` 与重试边界
+## 7. `XLogRecordAssemble()` 与重试边界
 
 `XLogRecordAssemble()` 位于 `src/backend/access/transam/xloginsert.c:607` 之后。
 本节不详细展开 WAL record 格式。
@@ -219,10 +209,7 @@ bootstrap mode 有特殊分支。
 `XLogInsert()` 负责“准备可插入 record”。
 `XLogInsertRecord()` 负责“在持有插入锁后确认 record 仍可插入，并执行插入”。
 
----
-
-
-## 5. `XLogInsertRecord()` 的两步模型
+## 8. `XLogInsertRecord()` 的两步模型
 
 核心注释在 `src/backend/access/transam/xlog.c:824-855`。
 PostgreSQL 把插入 shared WAL buffer cache 分成两步：
@@ -252,19 +239,18 @@ PostgreSQL 把插入 shared WAL buffer cache 分成两步：
 它只需要一个 insertion lock。
 这就是并发插入能扩展的关键。
 
----
-
-
-## 6. WAL insertion state
+## 9. WAL insertion state
 
 `XLogCtlInsert` 是 shared state 中与 insertion 直接相关的部分。
 定义在 `src/backend/access/transam/xlog.c:400-452`。
 它的第一段是最热的字段：
+
 ```text
 insertpos_lck
 CurrBytePos
 PrevBytePos
 ```
+
 `CurrBytePos` 是 reserve head。
 下一条 record 会从这里开始 reserve。
 `PrevBytePos` 是上一条 record 的起点。
@@ -276,12 +262,14 @@ PrevBytePos
 `RedoRecPtr` 和 `fullPageWrites` 虽然每次插入都读，但更新很少。
 如果放在同一 cache line，会增加不必要的 cache line 抖动。
 第二段是 full page write 相关状态：
+
 ```text
 RedoRecPtr
 fullPageWrites
 runningBackups
 lastBackupStart
 ```
+
 读取这些字段必须持有一个 insertion lock。
 修改这些字段必须持有所有 insertion locks。
 这正是 `XLogInsertRecord()` 拿锁后重新检查 full page write 状态的原因。
@@ -296,10 +284,7 @@ lastBackupStart
 但 flush 路径需要扫描所有 locks。
 所以数量不是越大越好。
 
----
-
-
-## 7. `WALInsertLock` 的真实职责
+## 10. `WALInsertLock` 的真实职责
 
 `WALInsertLock` 不是用来保护 `CurrBytePos` 的。
 `CurrBytePos` 由 `insertpos_lck` 保护。
@@ -328,10 +313,7 @@ flush 路径不能把某段 WAL 写出到磁盘，除非这段 WAL 对应的插�
 它用 `LWLockReleaseClearVar()` 把 `insertingAt` 清回 0。
 注释特别强调，清回 0 是为了让下一次 acquire 后 `LWLockWaitForVar()` 能正确阻塞。
 
----
-
-
-## 8. reserve LSN：最短的全局串行点
+## 11. reserve LSN：最短的全局串行点
 
 `ReserveXLogInsertLocation()` 位于 `src/backend/access/transam/xlog.c:1130-1193`。
 这段是性能关键路径。
@@ -341,6 +323,7 @@ flush 路径不能把某段 WAL 写出到磁盘，除非这段 WAL 对应的插�
 函数先把 `size` 做 `MAXALIGN()`。
 普通 record 的 size 必须大于 `SizeOfXLogRecord`。
 真正持有 spinlock 的代码非常少：
+
 ```text
 startbytepos = Insert->CurrBytePos
 endbytepos = startbytepos + size
@@ -348,13 +331,16 @@ prevbytepos = Insert->PrevBytePos
 Insert->CurrBytePos = endbytepos
 Insert->PrevBytePos = startbytepos
 ```
+
 然后立刻释放 `insertpos_lck`。
 之后再把 byte position 转成 `XLogRecPtr`：
+
 ```text
 StartPos = XLogBytePosToRecPtr(startbytepos)
 EndPos   = XLogBytePosToEndRecPtr(endbytepos)
 PrevPtr  = XLogBytePosToRecPtr(prevbytepos)
 ```
+
 注意这里的顺序。
 `CurrBytePos` 在 record 字节拷贝之前就推进了。
 所以 `CurrBytePos` 表示“已 reserve 到哪里”，不是“已完整插入到哪里”。
@@ -374,10 +360,7 @@ record 可以刚好结束在 page 末尾。
 而上一条 record 的 end pointer 可以表达为新 page 开头。
 源码在 `xlog.c:1932-1976` 专门区分这两种转换。
 
----
-
-
-## 9. usable byte position 与真实 LSN
+## 12. usable byte position 与真实 LSN
 
 `CurrBytePos` 不是 `XLogRecPtr`。
 它是 usable byte position。
@@ -404,10 +387,7 @@ flush 阶段可以用真实 LSN 与 page/segment 边界交互。
 跨 WAL page 时，真实 address 空间中有 page headers。
 `xl_tot_len` 只统计 record 自身。
 
----
-
-
-## 10. copy record 到 WAL buffers
+## 13. copy record 到 WAL buffers
 
 `CopyXLogRecordToWAL()` 位于 `src/backend/access/transam/xlog.c:1266-1400`。
 它接收：
@@ -448,10 +428,7 @@ copy 主循环遍历 `XLogRecData` 链。
 源码在 `xlog.c:1141-1142` 特别提醒：
 reserve 的空间计算必须和 copy 的逻辑一致。
 
----
-
-
-## 11. WAL buffer page 边界
+## 14. WAL buffer page 边界
 
 每个 WAL page 都有 page header。
 segment 第一页通常是 long header。
@@ -478,10 +455,7 @@ WAL page header 是 WAL byte stream 的物理结构。
 所以 record 跨 page 时，`CopyXLogRecordToWAL()` 会跳过 page header，再继续拷贝 record 剩余字节。
 reader 读取时根据 `XLP_FIRST_IS_CONTRECORD` 和 `xlp_rem_len` 重新拼出完整 record。
 
----
-
-
-## 12. `GetXLogBuffer()`：从 LSN 找共享内存页
+## 15. `GetXLogBuffer()`：从 LSN 找共享内存页
 
 `GetXLogBuffer()` 位于 `src/backend/access/transam/xlog.c:1656-1771`。
 它把一个 `XLogRecPtr` 映射到 shared WAL buffers 中的地址。
@@ -509,10 +483,7 @@ reader 读取时根据 `XLP_FIRST_IS_CONTRECORD` 和 `xlp_rem_len` 重新拼出�
 如果初始化后 `xlblocks[idx]` 仍不是 expected end pointer，就 `PANIC`。
 这是一条内部一致性边界。
 
----
-
-
-## 13. `AdvanceXLInsertBuffer()`：初始化和复用 WAL buffer
+## 16. `AdvanceXLInsertBuffer()`：初始化和复用 WAL buffer
 
 `AdvanceXLInsertBuffer()` 位于 `src/backend/access/transam/xlog.c:2026-2185`。
 它持有 `WALBufMappingLock`。
@@ -546,10 +517,7 @@ reader 读取时根据 `XLP_FIRST_IS_CONTRECORD` 和 `xlp_rem_len` 重新拼出�
 并推进 `InitializedUpTo`。
 这个顺序防止别人看到“看起来有效但实际只初始化了一半”的 WAL page。
 
----
-
-
-## 14. insert position 推进与 inserted position
+## 17. insert position 推进与 inserted position
 
 本节最容易混淆两个位置。
 一个是 reserve head。
@@ -578,10 +546,7 @@ WAL buffers 已经安全写到哪里。
 对调用方来说，最重要的是返回的 `EndPos`。
 数据页设置 page LSN 时通常用这个 end pointer。
 
----
-
-
-## 15. concurrency：锁拆分的完整图
+## 18. concurrency：锁拆分的完整图
 
 WAL insertion 路径至少有五个同步域。
 第一，backend-local construction 没有 shared lock。
@@ -614,10 +579,7 @@ WAL buffer page 初始化是按 page 串行。
 磁盘 write/fsync 是另一个串行资源。
 flush 等待用 insertion lock 的 `insertingAt` 精确缩小等待范围。
 
----
-
-
-## 16. 为什么 `insertingAt` 不是普通进度条
+## 19. 为什么 `insertingAt` 不是普通进度条
 
 `insertingAt` 的目标不是给监控显示百分比。
 它是 deadlock avoidance 和 flush correctness 的一部分。
@@ -645,10 +607,7 @@ flush 等待用 insertion lock 的 `insertingAt` 精确缩小等待范围。
 如果它不必要地等待另一个插入者，而另一个插入者也在等它，就可能死锁。
 `insertingAt` 让等待者只等真正覆盖目标范围的 insertion。
 
----
-
-
-## 17. flush request 与 insertion 的关系
+## 20. flush request 与 insertion 的关系
 
 普通 `XLogInsert()` 不负责 fsync。
 但 insertion 路径会更新 write request。
@@ -674,9 +633,11 @@ commit 或数据页写出需要的是 flush。
 如果共享 write request 更靠后，就把 `WriteRqstPtr` 提高。
 这让一个 flush 顺带写更多已经请求写出的 WAL。
 然后关键步骤是：
+
 ```text
 insertpos = WaitXLogInsertionsToFinish(WriteRqstPtr)
 ```
+
 只有确保目标范围内 insertion 完成，才能写 WAL buffers。
 之后才尝试拿 `WALWriteLock`。
 拿不到时，它先等待 lock 可用，再回头检查是否别人已经完成 flush。
@@ -687,17 +648,16 @@ insertpos = WaitXLogInsertionsToFinish(WriteRqstPtr)
 一般不能在持有 `WALWriteLock` 时调用可能等待的 `WaitXLogInsertionsToFinish()`。
 这里之所以安全，是因为第二次只允许把已经完成的位置往前推进。
 最后设置：
+
 ```text
 WriteRqst.Write = insertpos
 WriteRqst.Flush = insertpos
 ```
+
 然后调用 `XLogWrite()`。
 这会把 WAL buffers 写到文件，并在需要时 fsync。
 
----
-
-
-## 18. `XLogWrite()` 与 `LogwrtResult`
+## 21. `XLogWrite()` 与 `LogwrtResult`
 
 `XLogWrite()` 位于 `src/backend/access/transam/xlog.c:2320` 之后。
 它必须在持有 `WALWriteLock` 时调用。
@@ -730,10 +690,7 @@ WriteRqst.Flush = insertpos
 `logWriteResult` 说“文件 write 到哪里”。
 `logFlushResult` 说“fsync 到哪里”。
 
----
-
-
-## 19. WAL buffers 的大小与复用压力
+## 22. WAL buffers 的大小与复用压力
 
 `XLOGbuffers` 是 WAL buffers 的页数。
 本基线中自动选择逻辑在 `src/backend/access/transam/xlog.c:5012-5033`。
@@ -753,10 +710,7 @@ WAL buffers 太小会增加复用压力。
 统计上会表现为 `wal_buffers_full` 增加。
 但这属于性能问题，不是正确性漏洞。
 
----
-
-
-## 20. 错误边界
+## 23. 错误边界
 
 WAL insertion 路径处在很多 critical section 旁边。
 理解错误边界很重要。
@@ -791,10 +745,7 @@ WAL write/fsync 失败是持久化系统无法继续安全运行的边界。
 如果这里错误地持锁等待，就可能让插入者和写出者互相阻塞。
 这是锁顺序边界，不是错误处理代码。
 
----
-
-
-## 21. 一条普通 heap insert 的位置感
+## 24. 一条普通 heap insert 的位置感
 
 本节不展开 heap。
 但为了把 WAL insertion 放回上下文，可以记住典型调用顺序。
@@ -810,10 +761,7 @@ heap 修改 page。
 本节研究的是 `XLogInsert()` 里面 record 如何进入 WAL buffers。
 下一节会更系统地看 page LSN 与 data page write 的持久化顺序。
 
----
-
-
-## 22. 源码跟读路线
+## 25. 源码跟读路线
 
 第一步，读 `src/backend/access/transam/xloginsert.c:482-540`。
 确认 `XLogInsert()` 的入口检查、assemble 循环和返回值。
@@ -846,18 +794,17 @@ heap 修改 page。
 确认 `XLogFlush()` 为什么先等 insertion，再拿 `WALWriteLock`。
 重点看 group commit 和最终 unsatisfied flush 的错误边界。
 
----
-
-
-## 23. 跟读练习一：画出 reserve 与 copy
+## 26. 跟读练习一：画出 reserve 与 copy
 
 选择 `ReserveXLogInsertLocation()`。
 在纸上画三条 record：
+
 ```text
 R1 size = 100
 R2 size = 200
 R3 size = 300
 ```
+
 假设初始 `CurrBytePos = C0`，`PrevBytePos = P0`。
 依次写出每次 reserve 后：
 - `startbytepos`
@@ -878,10 +825,7 @@ Backend B 先 copy 完。
 顺序由 reserve 阶段写入的 address range 和 `xl_prev` 决定。
 但 flush R2 end 之前，仍然要等待 R1 涉及的早期 insertion 完成。
 
----
-
-
-## 24. 跟读练习二：追踪跨 page record
+## 27. 跟读练习二：追踪跨 page record
 
 选择 `CopyXLogRecordToWAL()`。
 假设 `CurrPos` 当前 page 只剩 40 bytes。
@@ -900,10 +844,7 @@ Backend B 先 copy 完。
 它会跳过 WAL page header。
 这就是 `written` 和 `CurrPos - StartPos` 不总是相等的原因。
 
----
-
-
-## 25. 跟读练习三：解释一个等待
+## 28. 跟读练习三：解释一个等待
 
 选择 `WaitXLogInsertionsToFinish(upto)`。
 假设系统有 8 个 insertion locks。
@@ -923,15 +864,14 @@ lock 5 正被 backend B 持有，`insertingAt = 0/5000`。
 `insertingAt = 0` 不是“插入在 LSN 0”。
 它表示“持锁但尚未公布可安全跳过的位置”。
 
----
+## 29. 实验一：只用源码验证锁拆分
 
+在 `/home/highgo/postgres` 中运行：
 
-## 26. 实验一：只用源码验证锁拆分
-
-在 `/home/nail/postgres-lab` 中运行：
 ```bash
 rg -n "WALInsertLockAcquire|ReserveXLogInsertLocation|CopyXLogRecordToWAL|WALBufMappingLock|WALWriteLock" src/backend/access/transam/xlog.c
 ```
+
 把输出按调用路径排序。
 你应该能看到：
 - `XLogInsertRecord()` 调用 `WALInsertLockAcquire()`。
@@ -949,17 +889,16 @@ PostgreSQL 为什么没有这么做。
 但它会让所有 backend 的 record copy 串行化。
 当前实现只让 reserve 串行，把 copy 和 write/flush 分离。
 
----
-
-
-## 27. 实验二：观察 WAL page header 边界
+## 30. 实验二：观察 WAL page header 边界
 
 这个实验不需要编译。
 在源码中打开：
+
 ```bash
 nl -ba src/include/access/xlog_internal.h | sed -n '32,84p'
 nl -ba src/backend/access/transam/xlog.c | sed -n '1893,1976p'
 ```
+
 对照写出：
 - short header 包含哪些字段。
 - long header 多了哪些字段。
@@ -973,15 +912,13 @@ record continuation page 的第一段不是一条新 record。
 它是上一条 record 的剩余字节。
 因此需要 `XLP_FIRST_IS_CONTRECORD` 和 `xlp_rem_len`。
 
----
-
-
-## 28. 实验三：构建后用 gdb 看一次插入
+## 31. 实验三：构建后用 gdb 看一次插入
 
 如果你已经在另一个 build 目录编译了 PostgreSQL，可以做这个实验。
 本课程文件不要求你在源码树里修改任何文件。
 启动一个临时实例。
 在一个 backend 上用 gdb 设置断点：
+
 ```gdb
 break XLogInsert
 break XLogInsertRecord
@@ -989,11 +926,14 @@ break ReserveXLogInsertLocation
 break CopyXLogRecordToWAL
 break XLogFlush
 ```
+
 执行一条简单写入：
+
 ```sql
 create table wal_insert_demo(id int primary key, v text);
 insert into wal_insert_demo values (1, 'a');
 ```
+
 观察：
 - `XLogInsert()` 可能被调用多次。
 - 不同 rmgr 会生成不同 record。
@@ -1001,6 +941,7 @@ insert into wal_insert_demo values (1, 'a');
 - `CopyXLogRecordToWAL()` 中的 `CurrPos` 可能和 `StartPos` 同页。
 - 提交时或数据页写出时才会进入需要 flush 的路径。
 如果断点太多，可以只保留：
+
 ```gdb
 break XLogInsertRecord
 break ReserveXLogInsertLocation
@@ -1009,6 +950,7 @@ commands
   continue
 end
 ```
+
 然后逐步减少噪音。
 这个实验的目标不是记住某条 SQL 产生几条 WAL。
 目标是确认：
@@ -1016,10 +958,7 @@ reserve 和 copy 是分开的。
 `XLogInsert()` 返回 end pointer。
 flush 是另一条路径。
 
----
-
-
-## 29. 讨论题
+## 32. 讨论题
 
 1. 为什么 WAL insertion 只把 reserve 做成全局短临界区，而不是让所有 backend 串行完成 reserve、copy 和 flush？
 2. `CurrBytePos` 已经推进时，为什么 flush 仍必须通过 insertion locks 确认目标范围内的 copy 已完成？
@@ -1030,10 +969,7 @@ flush 是另一条路径。
 7. `WALInsertLock`、`WALBufMappingLock` 和 `WALWriteLock` 分别保护哪一层状态？哪一个不能用来解释事务 durability？
 8. 本节的可迁移规律是什么：怎样把全局有序 byte stream 拆成短串行点和可并行 copy 阶段？
 
----
-
-
-## 30. 常见误区
+## 33. 常见误区
 
 误区一：
 `XLogInsert()` 会把 WAL fsync 到磁盘。
@@ -1067,10 +1003,7 @@ write request 只是请求。
 全局顺序由 reserve 出来的 address range 和 `xl_prev` 决定。
 多个 insertion locks 只是允许 copy 阶段并发。
 
----
-
-
-## 31. 本节小结
+## 34. 本节小结
 
 WAL insertion 是一个拆分过的并发协议。
 `XLogInsert()` 负责把 caller 登记的数据组装成 WAL record，并调用 `XLogInsertRecord()`。

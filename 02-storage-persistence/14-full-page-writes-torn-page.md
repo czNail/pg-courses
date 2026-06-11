@@ -2,57 +2,61 @@
 
 ## 课程定位
 
-本节主题：PostgreSQL 为什么需要 `full_page_writes`，WAL record 中的 full page image 如何生成和 replay，以及 hint bit 这种“逻辑上可丢”的修改为什么在 checksum 或 `wal_log_hints` 场景下仍然会碰到 WAL 边界。
-前置知识：已理解 WAL record block reference、page LSN、checkpoint redo pointer 和 `FlushBuffer()` 的 WAL-before-data gate。
-本节唯一主问题：为什么增量 redo 已经存在，PostgreSQL 仍要在某些 page 修改中写入 full-page image？
-本节核心矛盾：增量 WAL 可以控制体积；但 crash 时磁盘 page 可能是 torn state，增量 redo 不能假设它仍是合法旧 page。
-本节主流程：checkpoint 推进 RedoRecPtr -> page 第一次 WAL 修改触发 FPI 判定 -> `XLogRecordAssemble()` 写 block image -> recovery 侧优先 restore FPI -> hint bit 路径在 checksum/`wal_log_hints` 下复用同一物理安全边界。
-生命周期 / ownership / cleanup：FPI 由 WAL insertion 记录在 record block reference 中，buffer manager 只负责 dirty/page LSN/writeback，recovery 侧由 xlogreader 和 rmgr redo 使用 block image 恢复 page。
-错误路径 / 异常路径包括 torn page、checksum mismatch、hint bit 写入未受 WAL/FPI 保护、`full_page_writes` 切换窗口和 redo 侧错误跳过 block image。
-观测与诊断入口是 `pg_waldump` 中的 FPI 标记、checkpoint 后 WAL 体积变化、`wal_compression` 对 record size 的影响、checksum 错误日志和相关断点。
+前置知识：已理解 WAL record block reference、page LSN、checkpoint redo pointer、`FlushBuffer()` 的 WAL-before-data gate，以及 checksum 只是检测机制不是恢复机制。
 
-这一节只做一件事：把 page、WAL、checkpoint、checksum、hint bit 放在同一条调用链里读。
+本节唯一主问题：
 
-读完本节，你应该能回答：
+```text
+为什么增量 redo 已经存在，PostgreSQL 仍要在某些 page 修改中写入 full-page image？
+```
 
-- `full_page_writes` 的动机是什么。
-- torn page 为什么不是“WAL record 丢了”。
-- checkpoint 后某页第一次修改为什么特殊。
-- `XLogRegisterBuffer()` 的 flags 如何影响 FPI。
-- FPI 与 rmgr redo 是怎样分工的。
-- checksum 能检测什么，不能修复什么。
-- `wal_log_hints` 为什么影响 hint bit。
-- `MarkBufferDirtyHint()` 什么时候写 `XLOG_FPI_FOR_HINT`。
-- committed hint bit 为什么要检查 commit LSN。
-- FPI 带来的 WAL 体积和性能权衡在哪里。
+核心矛盾：增量 WAL 可以控制体积；但 crash 时磁盘 page 可能是 torn state，增量 redo 不能假设它仍是合法旧 page。
 
-## 源码基线
+一句话运行模型：
 
-源码仓库：`/home/nail/postgres-lab`
+```text
+checkpoint 推进 RedoRecPtr 后，page 第一次 WAL-logged 修改若发现 page_lsn <= RedoRecPtr，就在 XLogRecordAssemble() 中写入 full-page image；recovery 侧优先 restore 可信 FPI，再处理 rmgr redo 边界，hint bit 在 checksum/wal_log_hints 场景下复用同一物理安全边界。
+```
 
-基线：`master` = `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`
+学完后应能判断：FPI 为什么防 torn page；checkpoint 后第一次修改为什么特殊；`XLogRegisterBuffer()` flags 如何影响 FPI；hint bit 为什么可能写 `XLOG_FPI_FOR_HINT`；FPI 的 WAL 体积成本在哪里。
 
-本节重点阅读：
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。
 
-- `src/backend/access/transam/xloginsert.c`
-- `src/backend/access/transam/xlog.c`
-- `src/backend/storage/buffer/bufmgr.c`
-- `src/backend/access/heap/heapam_visibility.c`
-- `src/include/storage/bufpage.h`
-- `src/include/access/xlogrecord.h`
+## 1. 本节在总主线中的位置
 
-辅助核对：
+上一组 WAL 课程已经讲了 record、insertion、flush 和 segment。本节回到 page 层，解释为什么有了 page LSN 和增量 redo 之后，PostgreSQL 仍然需要在一些修改中把整页镜像写进 WAL。
 
-- `src/include/access/xloginsert.h`
-- `src/include/access/xlog.h`
-- `src/backend/access/transam/xlogutils.c`
-- `src/backend/access/transam/xlogreader.c`
-- `src/backend/storage/page/bufpage.c`
-- `src/backend/storage/page/README`
+这节是后续 redo contract 的关键前置：redo routine 不能总是假设磁盘 page 是合法旧版本。FPI 提供的是一个比数据文件当前内容更可信的页面基底。
 
----
+## 2. 核心矛盾与一句话运行模型
 
-## 1. 先给结论
+如果 crash 发生在 8KB page 写到一半时，磁盘上的 page 可能既不是旧版本也不是新版本。增量 redo 通常假设 page 至少结构合法；torn page 破坏了这个前提。
+
+因此本节模型是：
+
+```text
+checkpoint redo pointer 之后
+  -> page 第一次 WAL 修改
+  -> XLogRecordAssemble() 判断需要 FPI
+  -> WAL record 携带 block image
+  -> recovery 侧优先 restore FPI
+  -> 后续增量 redo 在可信基底上继续
+```
+
+## 3. 核心文件分工与阅读顺序
+
+| 阅读顺序 | 文件 | 本节读什么 |
+| --- | --- | --- |
+| 1 | `src/backend/access/transam/xloginsert.c` | `XLogRegisterBuffer()` flags、`XLogRecordAssemble()`、FPI 判定和 block image 生成。 |
+| 2 | `src/backend/access/transam/xlog.c` | `RedoRecPtr`、checkpoint 后 FPI 边界、`full_page_writes` 变化。 |
+| 3 | `src/backend/storage/buffer/bufmgr.c` | `MarkBufferDirtyHint()`、hint bit 与 FPI-for-hint。 |
+| 4 | `src/backend/access/heap/heapam_visibility.c` | committed hint bit 设置和 commit LSN 边界。 |
+| 5 | `src/include/storage/bufpage.h` | page header、`pd_lsn`、checksum、标准 page layout。 |
+| 6 | `src/include/access/xlogrecord.h` | WAL block image 的 record 表达。 |
+| 7 | `src/backend/access/transam/xlogutils.c`、`src/backend/access/transam/xlogreader.c` | recovery 侧如何读取并应用 FPI。 |
+| 8 | `src/backend/storage/page/bufpage.c`、`src/backend/storage/page/README` | checksum 与 page 物理格式辅助核对。 |
+
+## 4. 关键结论：FPI 与 torn page
 
 `full_page_writes` 的核心目标不是让每一次修改都更容易 redo。
 
@@ -110,9 +114,7 @@ FPI 不是“每次写整页”。
 
 FPI 是“每个 checkpoint 周期里，每个 page 的首次 WAL 修改提供可信页面基底”。
 
----
-
-## 2. page header、LSN 与 checksum
+## 5. page header、LSN 与 checksum
 
 `bufpage.h` 定义了 PostgreSQL 标准 page header。
 
@@ -165,9 +167,7 @@ checksum 自己不能修复 torn page。
 
 对普通数据页修改来说，这个足够内容通常来自 checkpoint 后第一次修改时的 FPI。
 
----
-
-## 3. checkpoint 后第一次修改
+## 6. checkpoint 后第一次修改
 
 checkpoint 让恢复可以从某个 redo point 开始，而不是从数据库创建时开始 replay。
 
@@ -205,9 +205,7 @@ shutdown checkpoint 的注释在 `xlog.c:7548-7558` 说得很直接：如果 che
 
 它是从当前 checkpoint redo point 以来第一次 WAL-logged 修改。
 
----
-
-## 4. `full_page_writes`、`doPageWrites` 与重试
+## 7. `full_page_writes`、`doPageWrites` 与重试
 
 用户看到的 GUC 是 `full_page_writes`。
 
@@ -249,9 +247,7 @@ WAL insert 路径实际使用 `doPageWrites`。
 
 它允许无锁阶段先做一次便宜判断，同时确保最终插入的 WAL record 符合最新 RedoRecPtr 和 full-page-writes 状态。
 
----
-
-## 5. `XLogRegisterBuffer()` 的职责
+## 8. `XLogRegisterBuffer()` 的职责
 
 WAL record 构造从 `XLogBeginInsert()` 开始。
 
@@ -289,9 +285,7 @@ hint bit 路径允许 share-exclusive lock。
 
 因为 hint bit 可以在读路径发生，且走 `MarkBufferDirtyHint()` 的特殊协议。
 
----
-
-## 6. `XLogRegisterBuffer` flags
+## 9. `XLogRegisterBuffer` flags
 
 flags 定义在 `src/include/access/xloginsert.h:31-41`。
 
@@ -348,9 +342,7 @@ redo 侧 `XLogReadBufferForRedoExtended()` 在 `xlogutils.c:362-371` 检查这�
 | `REGBUF_KEEP_DATA` | 有 FPI 时仍保留 block data |
 | `REGBUF_NO_CHANGE` | 注册 clean buffer 且不更新 LSN |
 
----
-
-## 7. `XLogRecordAssemble()` 的 FPI 判定
+## 10. `XLogRecordAssemble()` 的 FPI 判定
 
 `XLogRecordAssemble()` 在 `xloginsert.c:620-940`。
 
@@ -410,9 +402,7 @@ include_image = needs_backup || (info & XLR_CHECK_CONSISTENCY) != 0;
 
 这意味着有 block image 不等于 redo 一定应用它。
 
----
-
-## 8. WAL record 中的 block image
+## 11. WAL record 中的 block image
 
 `src/include/access/xlogrecord.h` 定义 WAL record 格式。
 
@@ -454,9 +444,7 @@ redo 只把带 apply 的 image 当作恢复基底。
 
 如果压缩后加额外 header 不划算，就存原始 image。
 
----
-
-## 9. FPI 与 redo 的关系
+## 12. FPI 与 redo 的关系
 
 redo 侧的通用入口是 `XLogReadBufferForRedo()`。
 
@@ -504,9 +492,7 @@ rmgr redo 提供 operation-level 的增量逻辑。
 
 两者不是重复劳动。
 
----
-
-## 10. `XLOG_FPI`、`XLOG_FPI_FOR_HINT` 与普通 record
+## 13. `XLOG_FPI`、`XLOG_FPI_FOR_HINT` 与普通 record
 
 FPI 可以作为普通 rmgr record 的 block image 出现。
 
@@ -540,9 +526,7 @@ FPI 可以作为普通 rmgr record 的 block image 出现。
 
 这说明：checksum 或 `wal_log_hints` 不会在 `full_page_writes=off` 时神奇提供 torn-page 修复能力。
 
----
-
-## 11. `full_page_writes` 动态变化
+## 14. `full_page_writes` 动态变化
 
 `full_page_writes` 可以通过 SIGHUP 改变。
 
@@ -578,9 +562,7 @@ recovery 中的 `lastFullPageWrites` 在 `xlog.c:219-224` 定义。
 
 它是 WAL 流中 recovery 端需要理解的状态。
 
----
-
-## 12. hint bit 的来源
+## 15. hint bit 的来源
 
 heap tuple 可见性判断集中在 `heapam_visibility.c`。
 
@@ -613,9 +595,7 @@ heap tuple 可见性判断集中在 `heapam_visibility.c`。
 
 这就是 hint bit 与普通数据修改的第一个差别。
 
----
-
-## 13. committed hint bit 的 WAL flush 边界
+## 16. committed hint bit 的 WAL flush 边界
 
 hint bit 逻辑上可重建，但 committed hint bit 不能破坏 WAL-before-data。
 
@@ -656,9 +636,7 @@ aborted/invalid hint bit 不需要这个 commit LSN 检查。
 
 因为 crash recovery 本来就会把 crash 时仍 in-progress 的事务视为 aborted。
 
----
-
-## 14. 设置 hint bits 的 buffer 锁协议
+## 17. 设置 hint bits 的 buffer 锁协议
 
 `SetHintBitsExt()` 有单个 tuple 模式和批量模式。
 
@@ -690,9 +668,7 @@ flush buffers 也需要 share-exclusive lock。
 
 这个边界也解释了为什么本基线不需要旧资料中的 `BM_JUST_DIRTIED` 来处理 hint dirty 与 flush race。
 
----
-
-## 15. `MarkBufferDirtyHint()` 的语义
+## 18. `MarkBufferDirtyHint()` 的语义
 
 `MarkBufferDirtyHint()` 在 `bufmgr.c:5815-5848`。
 
@@ -733,9 +709,7 @@ shared buffer 的实际逻辑在 `MarkSharedBufferDirtyHint()`。
 
 不需要每个 hint bit 都再写 WAL。
 
----
-
-## 16. hint bit 什么时候写 WAL
+## 19. hint bit 什么时候写 WAL
 
 `XLogHintBitIsNeeded()` 定义在 `src/include/access/xlog.h:115-123`。
 
@@ -807,9 +781,7 @@ XLogHintBitIsNeeded() && (lockstate & BM_PERMANENT)
 
 `xlog.c:9068-9072` 对此有明确注释。
 
----
-
-## 17. checksum、hint bit 与 torn page
+## 20. checksum、hint bit 与 torn page
 
 没有 checksum 时，hint bit 的 torn write 通常只是性能问题。
 
@@ -835,9 +807,7 @@ XLogHintBitIsNeeded() && (lockstate & BM_PERMANENT)
 
 尤其 checkpoint 后第一次大范围扫描旧 tuple 时，可能产生明显 `XLOG_FPI_FOR_HINT` 和 FPI bytes。
 
----
-
-## 18. 性能与体积权衡
+## 21. 性能与体积权衡
 
 FPI 的直接成本是 WAL 体积。
 
@@ -885,9 +855,7 @@ checksum 可以让损坏更早暴露，但没有 FPI 时不一定能修复。
 
 优化优先级通常应放在 checkpoint 参数、`wal_compression`、批量写入方式和 workload 形态上。
 
----
-
-## 19. 源码跟读练习
+## 22. 源码跟读练习
 
 练习一：FPI 判定链路。
 
@@ -924,9 +892,7 @@ redo 侧读 `xlogrecord.h:156-163`、`xlogreader.c:1765-1833`、`xlogreader.h:42
 
 结论：hint bit 的逻辑正确性依赖事务状态可重查，物理安全性仍受 page write、checksum、torn page 约束。
 
----
-
-## 20. 实验
+## 23. 实验
 
 实验一：观察 checkpoint 后 FPI。
 
@@ -978,7 +944,7 @@ SELECT wal_records, wal_fpi, wal_bytes FROM pg_stat_wal;
 
 这个实验受 tuple 是否已有 hint、autovacuum 是否先访问、page 是否已经 dirty 等因素影响，验证的是边界：SELECT 也可能因为 hint bit 产生 WAL。
 
-## 21. 讨论题
+## 24. 讨论题
 
 1. 如果普通增量 redo 已经能重放 heap update，为什么 torn page 仍然需要 FPI？
 2. `PageGetLSN(page) <= RedoRecPtr` 判断的是 page 内容、checkpoint 周期，还是 WAL flush 位置？
@@ -989,9 +955,7 @@ SELECT wal_records, wal_fpi, wal_bytes FROM pg_stat_wal;
 7. 用 `pg_stat_wal.wal_fpi` 和 `pg_waldump` 观察 FPI 时，哪些结论受 workload、page 分布和后台活动影响？
 8. 本节的可迁移规律是什么：什么时候增量日志必须补一个可信 base image？
 
----
-
-## 22. 常见误区与误解
+## 25. 常见误区与误解
 
 误解一：FPI 是每次 UPDATE 都写整页。
 
@@ -1035,9 +999,7 @@ hint bit 逻辑上可丢，但它仍然修改 page bytes。
 
 它影响 primary 上 hint bit dirty 的 WAL 行为。
 
----
-
-## 23. 本节小结
+## 26. 本节小结
 
 `full_page_writes` 是 PostgreSQL 针对 torn page 的默认保护。
 
@@ -1094,5 +1056,3 @@ checkpoint 参数会改变 FPI 频率和 recovery 窗口。
 `wal_log_hints` 和 checksums 会让 hint bit 路径产生额外 WAL。
 
 可靠性默认选择是保持 `full_page_writes=on`。
-
----

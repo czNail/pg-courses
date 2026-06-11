@@ -1,6 +1,7 @@
 # PostgreSQL Heap insert、FSM 与 page selection
+
 ## 课程定位
-本节主题：`heap_insert`、Free Space Map 和 heap page selection。
+
 上一节已经解释了 heap page layout、line pointer 和 tuple header。
 这一节把视角推进到“一个 tuple 如何真正落到某个 heap page 上”。
 前置知识：
@@ -30,38 +31,11 @@ PostgreSQL 因此把问题拆成两层：
 - `MarkBufferDirty` 和 `MarkBufferDirtyHint` 在本节语义上有什么差别。
 - abort 后插入 tuple 为什么不是立即物理删除。
 - 哪些现象能用 SQL、pageinspect、pg_freespacemap、pg_waldump、gdb 观察。
-## 源码基线
-源码仓库：
-```text
-/home/nail/postgres-lab
-```
-基线：
-```text
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
-```
-本节重点阅读：
-```text
-src/include/access/tableam.h
-src/backend/access/heap/heapam_handler.c
-src/backend/access/heap/heapam.c
-src/backend/access/heap/hio.c
-src/backend/storage/freespace/freespace.c
-src/backend/storage/freespace/fsmpage.c
-src/include/storage/freespace.h
-src/include/storage/fsm_internals.h
-src/backend/storage/buffer/bufmgr.c
-src/include/access/heapam_xlog.h
-src/backend/access/heap/heapam_xlog.c
-```
-行号来自：
-```text
-nl -ba <source-file>
-```
-本节主流程基于单 tuple insert。
-`heap_multi_insert` 会作为对照出现。
-它不是本节唯一主问题。
+
+源码基线：本课使用当前实际源码路径 `/home/highgo/postgres`，branch `master`，commit `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`；核心源码分工见第 3 节。
+
 ## 1. 本节在总主线中的位置
+
 前面几节已经建立了持久化主线：
 buffer 负责把 page 放进 shared buffers。
 WAL 负责 crash 后重放 page change。
@@ -82,19 +56,24 @@ FSM 记录 page 剩余空间，影响后续插入。
 新 tuple 的 `xmin`、`cmin` 和 `xmax` 会被设置。
 但本节关心的是：
 这些 tuple header 字段如何被放进 page，并如何在 WAL/abort/prune 边界中保持可恢复。
+
 ## 2. 核心矛盾与一句话运行模型
+
 唯一主问题可以压缩为一句话：
 如何把“低成本找到可能有空间的 page”和“在并发与 crash 下确认插入成功”拆开？
 一句话运行模型：
+
 ```text
 heap_insert 先准备 tuple header/toast，再让 RelationGetBufferForTuple 用 targetBlock、BulkInsertState、FSM、尾页和 relation extension 找候选 page；候选 page 必须被 pin 并持有 exclusive content lock 后重新计算真实 heap free space；确认可插入后进入 critical section，PageAddItem 写 tuple，清 VM all-visible，MarkBufferDirty，写 WAL，设置 page LSN，最后释放 buffer、VM pin、记录 cache invalidation 和 pgstat。
 ```
+
 关键不是 FSM 找到了哪个 page。
 关键是 PostgreSQL 从不把 FSM 当作事实。
 FSM 的返回值只意味着“值得试一下”。
 真正的事实是 locked heap page 上的 `PageGetHeapFreeSpace(page)`。
 如果这个事实否定了 FSM，前台 backend 会把真实 free space 写回 FSM，再继续找。
 这形成了本节的核心状态故事：
+
 ```text
 local tuple
   -> candidate block number
@@ -104,7 +83,9 @@ local tuple
   -> WAL record and page LSN
   -> FSM/VM/cache/stat side effects
 ```
+
 ## 3. 核心文件分工与阅读顺序
+
 建议按下面顺序读，而不是按文件名读。
 `src/include/access/tableam.h`
 定义 AM 层插入入口。
@@ -149,7 +130,9 @@ heap tuple insert 本身不能用 hint dirty。
 redo 侧的 `heap_xlog_insert()` 和 `heap_xlog_multi_insert()` 重放 tuple insert。
 它们在 page 低空间时调用 `XLogRecordPageWithFreeSpace()` 更新 FSM。
 这说明 FSM 可以从 heap page redo 结果再推导，并不是每次前台 insert 都必须 WAL-log FSM。
+
 ## 4. 关键数据结构与状态
+
 第一类状态是待插入 tuple。
 `heapam_tuple_insert()` 从 `TupleTableSlot` 取 `HeapTuple`。
 `heap_insert()` 之后，caller 会看到 `t_self` 被设置成真实 TID。
@@ -174,6 +157,7 @@ tuple bytes 是否放得下；
 如果 smgr invalidation 发生，这个 target block 可以被丢弃。
 第四类状态是 `BulkInsertStateData`。
 `src/include/access/hio.h` 中它包含：
+
 ```text
 strategy
 current_buf
@@ -181,6 +165,7 @@ next_free
 last_free
 already_extended_by
 ```
+
 `current_buf` 表示 bulk insert 持有的额外 pin。
 `next_free..last_free` 记录一次 bulk extension 后尚未用完的新 page 范围。
 这些 page 到真正使用时可能已经被别人用掉。
@@ -196,10 +181,12 @@ slot 只保存 1 byte category。
 这意味着 FSM 记录的是量化后的近似空间。
 第六类状态是单个 FSM page 内部小树。
 `FSMPageData` 有两个关键字段：
+
 ```text
 fp_next_slot
 fp_nodes[]
 ```
+
 `fp_nodes` 的 leaf 保存 heap block 的 free-space category。
 非叶节点保存子节点最大 category。
 所以搜索一个 FSM page 时，可以先看 root 是否满足需求。
@@ -221,17 +208,21 @@ heap page 被实际修改后，如果 relation 需要 WAL，`heap_insert()` 注�
 它还调用 `pgstat_count_heap_insert()`。
 这些不决定 tuple 是否已经在 page 中。
 它们是上层语义和诊断侧效应。
+
 ## 5. 主流程源码 walkthrough
+
 先从 AM 入口看。
 `table_tuple_insert()` 在 `tableam.h:1457-1463` 调用当前 table AM 的 `tuple_insert`。
 heap 的实现是 `heapam_tuple_insert()`。
 `heapam_handler.c:149-166` 的流程很短：
+
 ```text
 ExecFetchSlotHeapTuple()
   -> 设置 table oid
   -> heap_insert()
   -> 把 tuple->t_self 复制到 slot->tts_tid
 ```
+
 这里的关键状态是 `t_self`。
 heap page selection 没完成前，slot 没有最终 TID。
 index insert、RETURNING `ctid`、后续 executor 状态都依赖这个结果。
@@ -337,7 +328,9 @@ speculative insertion 即使后面 abort，也会被计入。
 这个统计口径和最终可见行数不同。
 `heapam.c:2188` 以后，如果 `heaptup != tup`，把 `t_self` 复制回原 tuple 并释放 toasted/private copy。
 这完成了单 tuple insert 的生命周期。
+
 ## 6. Page selection 的真实流程
+
 `RelationGetBufferForTuple()` 是本节最重要的函数。
 它的入口注释在 `hio.c:434-498`。
 第一句契约是：
@@ -353,10 +346,12 @@ speculative insertion 即使后面 abort，也会被计入。
 `hio.c:536-551` 计算 `targetFreeSpace`。
 它不是简单的 `len`。
 默认路径会考虑 fillfactor：
+
 ```text
 saveFreeSpace = RelationGetTargetPageFreeSpace(...)
 targetFreeSpace = len + saveFreeSpace
 ```
+
 但大 tuple 和 nearly-empty page 有特殊处理。
 如果 `len + saveFreeSpace` 超过 nearly-empty 阈值，目标变成 `Max(len, nearlyEmptyFreeSpace)`。
 这避免低 fillfactor 表插入大 tuple 时过度扩 relation。
@@ -427,7 +422,9 @@ VM pin 的判断在 lock 前读 page flag。
 新 page 不会马上录入 FSM。
 它先留给当前 backend 作为短期插入目标。
 这降低其他 backend 立刻抢同一页造成的 contention。
+
 ## 7. FSM 搜索、更新和近似性
+
 `GetPageWithFreeSpace()` 在 `freespace.c:136-142` 很简单。
 它把需要的 bytes 转成 category，然后调用 `fsm_search()`。
 转换在 `freespace.c:441-459`。
@@ -484,7 +481,9 @@ restart 超过 10000 次返回 `InvalidBlockNumber`。
 日志级别是 `DEBUG1`。
 这类修复服务的是 FSM 自身一致性。
 即使 FSM 不准，heap page insert 的正确性仍靠 locked page recheck。
+
 ## 8. Relation extension 与 bulk insert 状态
+
 当 cached target、FSM、尾页都不能提供候选，`RelationGetBufferForTuple()` 调 `RelationAddBlocks()`。
 `RelationAddBlocks()` 在 `hio.c:235-430`。
 它不是单纯扩 1 页。
@@ -526,7 +525,9 @@ restart 超过 10000 次返回 `InvalidBlockNumber`。
 注释给出真实原因：
 如果同一个 bulk state 被不同 partition 复用，旧 partition 的 `next_free` 会让新 partition 查错 page。
 这正是 ownership 和 relation identity 不能混淆的例子。
+
 ## 9. 生命周期 / ownership / cleanup
+
 待插入 tuple 的 owner 是当前 backend。
 `heap_prepare_insert()` 可能返回原 tuple，也可能返回 toaster 产生的 private copy。
 `heap_insert()` 在末尾判断 `heaptup != tup`。
@@ -560,7 +561,9 @@ cache invalidation 的生命周期不是 buffer 生命周期。
 事务结束时 invalidation 的投递/撤销按 cache invalidation 机制处理。
 本节只需要记住：
 catalog tuple insert 即使 abort，也要让 cache 侧能收尾。
+
 ## 10. 正确性机制层次
+
 第一层是 relation-level 语义锁。
 SQL INSERT 的调用者通常已经持有 relation 的合适 lock，例如 RowExclusiveLock。
 这保证 DDL/DML 语义边界。
@@ -603,7 +606,9 @@ FSM 不参与 tuple visibility。
 FSM 不保证 page 一定有空间。
 FSM 不需要和 heap insert WAL record 一一对应。
 FSM 错了最多导致 retry、额外 search、额外 extension 或低效空间利用。
+
 ## 11. 错误路径 / 异常路径 / fallback
+
 第一个错误路径是 tuple 过大。
 `RelationGetBufferForTuple()` 在任何 buffer 修改前检查 `len > MaxHeapTupleSize`。
 这会普通 `ereport(ERROR)`。
@@ -653,7 +658,9 @@ rewrite/unlogged additions 等场景会用这个选项。
 但不会写 heap WAL record，也不会设置来自 insert record 的 page LSN。
 这适用于 unlogged/temp 或特定 rewrite 场景。
 crash 后语义由 relation 类型决定，不是由 FSM 保证。
+
 ## 12. 成本、资源与跨模块传播
+
 CPU 成本的第一部分是 page selection。
 最佳情况只尝试 cached target block。
 成本接近一次 buffer lookup、一次 content lock、一次 `PageGetHeapFreeSpace()`。
@@ -693,6 +700,7 @@ walwriter 推进 WAL flush，影响 commit 和 page flush 等待。
 autovacuum/vacuum 会 prune/free space，并更新 FSM 与 VM。
 startup process 在 crash recovery 中重放 heap insert WAL，并可能更新 FSM。
 资源传播路径可以这样记：
+
 ```text
 tuple size -> page free space -> FSM search/retry -> relation extension
 tuple bytes -> WAL bytes -> walwriter/replication/checkpoint pressure
@@ -700,7 +708,9 @@ all-visible page insert -> VM clear -> index-only scan opportunity decrease
 many backends -> page/contention + extension lock wait -> bulk extension heuristic
 abort insert -> dead tuple -> pruning/vacuum -> FSM update
 ```
+
 ## 13. 观测与诊断入口
+
 本节锚定的 runtime truth 是：
 FSM 记录的 free space 可以和 heap page 的真实可用空间不一致；
 insert 路径必须通过 locked page recheck 把候选变成事实。
@@ -724,6 +734,7 @@ insert 路径必须通过 locked page recheck 把候选变成事实。
 - 一个 FSM hint update 是否已经持久化到磁盘。
 这些状态对诊断有帮助，但不能作为 SQL 层稳定语义。
 SQL 观察入口示例：
+
 ```sql
 CREATE EXTENSION IF NOT EXISTS pageinspect;
 CREATE EXTENSION IF NOT EXISTS pg_freespacemap;
@@ -750,29 +761,35 @@ LIMIT 20;
 SELECT lp, lp_flags, lp_len, t_xmin, t_ctid
 FROM heap_page_items(get_raw_page('heap_insert_fsm_lab', 0));
 ```
+
 用 `ctid` 看 block 分布。
 用 `pg_freespace` 看 FSM 记录。
 用 `heap_page_items` 看 page 内 line pointer 和 tuple header。
 不要期望三者每一刻完全一致。
 FSM 是近似和滞后的。
 WAL 观察入口：
+
 ```bash
 pg_waldump --rmgr=Heap --path="$PGDATA/pg_wal" <start-seg>
 ```
+
 关注 `INSERT`、`MULTI_INSERT`、`INIT_PAGE` 和 flags。
 如果使用 logical logging，注意 heap insert record 可能保留 tuple data。
 性能观察入口：
+
 ```sql
 EXPLAIN (ANALYZE, BUFFERS, WAL)
 INSERT INTO heap_insert_fsm_lab
 SELECT g, repeat('y', 100)
 FROM generate_series(1001, 2000) AS g;
 ```
+
 `BUFFERS` 能看到 shared hit/read/dirtied/written。
 `WAL` 能看到 record、FPI 和 bytes。
 它看不到 FSM retry 次数。
 如果怀疑 retry 或 extension contention，要用源码断点或临时计数器。
 建议 gdb 断点：
+
 ```text
 heap_insert
 RelationGetBufferForTuple
@@ -782,12 +799,15 @@ RelationPutHeapTuple
 XLogInsert
 PageSetLSN
 ```
+
 诊断时区分三类原因：
 workload 让 tuple 太大或 fillfactor 太低；
 concurrency 让很多 backend 抢同一 relation/page；
 kernel path 因 FSM stale、VM pin、extension lock 或 WAL flush 增加 latency。
 不要把所有 INSERT 慢都解释成 FSM 问题。
+
 ## 14. 常见误区
+
 误区一：
 FSM 决定 tuple 放在哪个 page。
 更准确地说：
@@ -825,11 +845,14 @@ abort 后 tuple 变成不可见/可清理状态。
 不能。
 `pg_stat_wal`、`pg_stat_io`、`EXPLAIN BUFFERS/WAL` 给的是聚合或 query 级现象。
 page selection 细节通常要用 `ctid`、pageinspect、pg_freespacemap、gdb 或源码计数器拼出来。
+
 ## 15. 课堂实验
+
 实验一：观察 `ctid`、heap page 和 FSM 记录的差异。
 目标：
 看到 insert 后行落在哪些 block，FSM 记录是什么，page 内 line pointer 是什么。
 步骤：
+
 ```sql
 CREATE EXTENSION IF NOT EXISTS pageinspect;
 CREATE EXTENSION IF NOT EXISTS pg_freespacemap;
@@ -862,6 +885,7 @@ LIMIT 20;
 SELECT lp, lp_flags, lp_len, t_xmin, t_ctid
 FROM heap_page_items(get_raw_page('heap_insert_fsm_lab', 0));
 ```
+
 解释要求：
 把 `ctid` block 分布和 `pg_freespace` 记录对上。
 再用 pageinspect 看 block 0 的 line pointer。
@@ -873,6 +897,7 @@ FROM heap_page_items(get_raw_page('heap_insert_fsm_lab', 0));
 目标：
 看到 abort/delete 后的空间不一定立刻变成 FSM 可搜索空间，VACUUM/prune 会推进记录。
 步骤：
+
 ```sql
 DROP TABLE IF EXISTS heap_insert_fsm_reuse;
 CREATE TABLE heap_insert_fsm_reuse (
@@ -899,6 +924,7 @@ FROM pg_freespace('heap_insert_fsm_reuse')
 ORDER BY blkno
 LIMIT 20;
 ```
+
 解释要求：
 DELETE 只改变 tuple visibility/header。
 空间能否进入 FSM，取决于 pruning/vacuum 对 page 的实际清理和记录。
@@ -909,6 +935,7 @@ DELETE 只改变 tuple visibility/header。
 目标：
 亲手确认候选页、locked page recheck、`PageAddItem`、`XLogInsert`、`PageSetLSN` 的时间顺序。
 建议断点：
+
 ```text
 b heap_insert
 b RelationGetBufferForTuple
@@ -917,7 +944,9 @@ b RelationPutHeapTuple
 b XLogInsert
 b PageSetLSN
 ```
+
 观察变量：
+
 ```text
 heaptup->t_len
 targetBlock
@@ -928,6 +957,7 @@ heaptup->t_self
 all_visible_cleared
 recptr
 ```
+
 解释要求：
 画出一次 insert 的状态线：
 candidate block 何时出现；
@@ -937,7 +967,9 @@ WAL record 何时产生；
 page LSN 何时设置。
 如果命中 `RecordAndGetPageWithFreeSpace()`，说明 FSM 候选页被真实 page recheck 否定。
 这正是本节核心现象。
+
 ## 16. 讨论题
+
 1. 为什么 PostgreSQL 不直接在每次 insert 时从 relation 尾页开始线性向前找 free space？
 2. 为什么 FSM 返回的 block number 不能直接作为插入成功的依据？
 3. `RelationGetBufferForTuple()` 为什么必须在 `START_CRIT_SECTION()` 之前完成所有可能 `ereport(ERROR)` 的工作？
@@ -946,7 +978,9 @@ page LSN 何时设置。
 6. 为什么 heap insert 清 VM bit 要提前 pin VM page，而不是持 heap buffer lock 时再读 VM page？
 7. `MarkBufferDirtyHint()` 可以用于 FSM，却不能替代 heap page insert 的 `MarkBufferDirty()`，边界在哪里？
 8. `pg_freespace`、`ctid`、`heap_page_items` 分别能看到什么，又分别看不到什么？
+
 ## 17. 本节小结
+
 本节唯一主问题是：
 `heap_insert` 如何在 FSM 可能过时、并发可能抢空间、WAL/VM 又要求严格顺序的条件下选 page 并插入 tuple。
 核心链路是：

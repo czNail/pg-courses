@@ -10,53 +10,40 @@
 当目标 block 不在 shared buffers 中时，PostgreSQL 如何在 pin/refcount、usage_count、dirty 状态和 access strategy ring 之间选择一个可以复用的 victim buffer？
 ```
 
-核心矛盾：
+核心矛盾：buffer pool 必须尽快给 miss 找到 slot；但它不能替换正在被 pin 的页，不能丢掉 dirty 页，不能让大顺序扫描冲掉整个 shared_buffers，也不能用一把大锁串行化所有 allocation。
+
+一句话运行模型：
 
 ```text
-buffer pool 必须尽快给 miss 找到 slot；
-但它不能替换正在被 pin 的页，不能丢掉 dirty 页，不能让大顺序扫描冲掉整个 shared_buffers，也不能用一把大锁串行化所有 allocation。
+PostgreSQL 用 backend-private ring 限制特殊访问模式污染，用全局 atomic clock hand 低成本扫描 BufferDesc，用 refcount 判断能否替换，用 usage_count 近似热度，用 dirty/writeback 路径守住 WAL-before-data 和 I/O 平滑边界。
 ```
 
-本节只讲 miss 后的 allocation / replacement。
+学完后应能判断：clock sweep 为什么不是精确 LRU；`refcount` 为什么是硬门槛；`usage_count` 为什么只是 second chance；ring 为什么不是独立缓存池；all buffers pinned 为什么会报错而不是无限等待。
 
-它不重新讲 mapping table 的完整 lookup 协议。
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。
 
-它不展开 WAL record 生成。
+## 1. 本节在总主线中的位置
 
-它不展开 page content lock 的完整 wait queue。
+上一节讲 mapping table 如何确保“一个 block 只有一个 slot”。本节接着问：如果 mapping table miss，哪个旧 slot 可以被拿来承载新 `BufferTag`。
 
-它只解释 victim 从“候选”到“可复用 slot”的状态推进。
+这一步位于 lookup 和真实 eviction 之间。它只决定 candidate 和初步 pin；dirty write、old tag invalidation、读 I/O 填充会在本节后半和后续课程继续收敛。
 
-版本边界也要先说明。
+## 2. 核心矛盾与一句话运行模型
 
-本课基于当前 master 基线。
+replacement 的难点不是“找一个最近没用的数组元素”，而是要在没有全局大锁的情况下同时尊重 refcount、usage_count、dirty、ring 和并发 race。源码因此把 candidate selection 和 eviction completion 分开。
 
-旧版本中的 content lock 实现、AIO 回调和部分统计入口可能不同。
-
-但 refcount 硬门槛、usage_count second chance、dirty victim 写出、old tag invalidation 这条 replacement 主线是稳定的。
-
-学完后应能判断：
-
-- 为什么 PostgreSQL 使用 clock sweep 而不是精确 LRU。
-- 为什么 `refcount` / pin 是 replacement 的硬门槛。
-- 为什么 `usage_count` 只是 second chance，不是 pin。
-- 为什么 dirty victim 的处理不在 `StrategyGetBuffer()` 中完成。
-- 为什么 bulkread / bulkwrite / vacuum 使用 backend-private ring。
-- 为什么 ring 不是独立缓存池。
-- 为什么 all buffers pinned 时选择 ERROR 而不是无限等待。
-- 为什么 victim 被选中后仍可能被放弃。
-
-源码基线：
+本节最重要的区分是：
 
 ```text
-/home/nail/postgres-lab
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
+candidate selection 不等于 eviction 完成；
+pin victim 不等于 old tag 已删除；
+dirty write 不等于 checkpoint/fsync；
+ring reuse 不等于独立缓存池。
 ```
 
-核心源码锚点：
+## 3. 核心文件分工与阅读顺序
 
-| 顺序 | 文件 | 本节读什么 |
+| 阅读顺序 | 文件 | 本节读什么 |
 | --- | --- | --- |
 | 1 | `src/include/storage/buf_internals.h` | `BufferDesc.state` bit layout、`BUF_STATE_GET_REFCOUNT()`、`BUF_STATE_GET_USAGECOUNT()`、`BM_MAX_USAGE_COUNT`、`BM_LOCKED`、`BM_DIRTY`、`BM_VALID`、`BM_TAG_VALID`。 |
 | 2 | `src/backend/storage/buffer/freelist.c` | `StrategyControl`、`ClockSweepTick()`、`StrategyGetBuffer()`、`GetBufferFromRing()`、`AddBufferToRing()`、`StrategyRejectBuffer()`。 |
@@ -64,7 +51,7 @@ commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
 | 4 | `src/include/storage/bufmgr.h` | `BufferAccessStrategyType`、`BAS_NORMAL`、`BAS_BULKREAD`、`BAS_BULKWRITE`、`BAS_VACUUM`。 |
 | 5 | `src/backend/storage/buffer/localbuf.c` | local buffer 的简化 victim selection，对照哪些复杂性来自 shared 并发。 |
 
-本节主链路：
+主链路：
 
 ```text
 PinBufferForBlock()
@@ -77,22 +64,7 @@ PinBufferForBlock()
   -> later read I/O sets BM_VALID
 ```
 
-一句话运行模型：
-
-```text
-PostgreSQL 用 backend-private ring 限制特殊访问模式污染，用全局 atomic clock hand 低成本扫描 BufferDesc，用 refcount 判断能否替换，用 usage_count 近似热度，用 dirty/writeback 路径守住 WAL-before-data 和 I/O 平滑边界。
-```
-
-本节最重要的区分是：
-
-```text
-candidate selection 不等于 eviction 完成；
-pin victim 不等于 old tag 已删除；
-dirty write 不等于 checkpoint/fsync；
-ring reuse 不等于独立缓存池。
-```
-
-## 1. 问题：miss 后为什么不能直接拿一个 slot
+## 4. 入口问题：miss 后为什么不能直接拿一个 slot
 
 lookup miss 只说明目标 `BufferTag` 当前不在 mapping table 中。
 
@@ -163,7 +135,7 @@ lookup miss
 
 它是 shared buffer replacement 在并发下的正常 retry。
 
-## 2. 状态：refcount、usage_count、clock hand、ring
+## 5. 状态：refcount、usage_count、clock hand、ring
 
 `BufferDesc.state` 是 replacement 的核心状态载体。
 
@@ -270,7 +242,7 @@ ring 中的 buffer 仍然是 shared buffers 的普通成员。
 
 它只是把该 backend 的候选复用范围限制在一个小环里。
 
-## 3. 主流程：从 lookup miss 到 new tag 安装
+## 6. 主流程：从 lookup miss 到 new tag 安装
 
 主流程从 `BufferAlloc()` 的第一次 lookup miss 之后开始。
 
@@ -493,7 +465,7 @@ new tag 安装回到上一节的 mapping table 协议；
 content lock 和 pin 的细边界进入下一节。
 ```
 
-## 4. 边界：哪些机制各管一段
+## 7. 边界：哪些机制各管一段
 
 第一条边界：refcount 不是 usage_count。
 
@@ -589,7 +561,7 @@ dirty local temp page 写出到 temp storage，不走 WAL 和 checkpoint 的同�
 
 因此诊断 replacement 时，需要把 SQL 指标和 gdb/perf/源码路径结合。
 
-## 5. 异常：压力下如何继续保持 correctness
+## 8. 异常：压力下如何继续保持 correctness
 
 异常路径一：所有 buffer 都 pinned。
 
@@ -697,7 +669,7 @@ bgwriter 可以提前写 dirty buffers，减少前台 miss 遇到 dirty victim �
 
 诊断上表现为 query latency 中夹杂 relation write / WAL flush / buffer content lock wait。
 
-## 6. 诊断与实验
+## 9. 诊断与实验
 
 本节可观测的 runtime truth 是：
 
@@ -845,7 +817,7 @@ new tag insert 是否 collision？
 
 这些问题共同解释的是“miss 到可复用 slot”的时间。
 
-## 7. 讨论题
+## 10. 讨论题
 
 1. 为什么 `StrategyGetBuffer()` 只负责 candidate selection，而不负责完整 eviction？
 2. `usage_count`、pin/refcount 和 access strategy ring 分别保护什么运行时目标？
@@ -853,7 +825,7 @@ new tag insert 是否 collision？
 4. bulk read 为什么宁可放弃某些 ring victim，也不把读路径拖进高成本 writeback？
 5. 哪些现象能通过 `pg_stat_io` 或 wait event 观察，哪些必须靠断点看 `BufferDesc.state`？
 
-## 8. 本节小结
+## 11. 本节小结
 
 本节核心链路是：
 

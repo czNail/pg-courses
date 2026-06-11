@@ -1,7 +1,7 @@
 # PostgreSQL fd.c、VFD cache 与文件描述符压力
 
 ## 课程定位
-本节主题：PostgreSQL backend 如何在 OS file descriptor 很少的现实下，仍然长期记住大量 relation segment、temporary file、配置文件、目录和短期 raw fd。
+
 上一组课程已经围绕 buffer、WAL 和 data page 的持久化边界展开。
 这一节进入更低一层的文件句柄管理。
 重点不是“fd.c 有哪些 API”。
@@ -24,8 +24,28 @@
 - `ResourceOwner`、EOXact、subtransaction abort、process exit 各自清理什么。
 - 遇到 `EMFILE`、`ENFILE`、close/fsync/write 失败、temp file limit 时，错误边界在哪里。
 
-## 源码基线
-源码仓库：`/home/nail/postgres-lab`
+源码基线：本课使用当前实际源码路径 `/home/highgo/postgres`，branch `master`，commit `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`；核心源码分工见第 3 节。
+
+## 1. 本节在总主线中的位置
+
+前几节已经到达 relation segment 文件和临时 spill 文件这一层。它们最终都要经过 OS fd，但 PostgreSQL backend 同时接触的文件远多于一个进程能长期持有的 fd 数量。本节把焦点放在 fd.c：它怎样让上层长期保存逻辑文件身份，同时只让一小部分文件真正占用 OS fd。
+
+## 2. 核心矛盾与一句话运行模型
+
+一句话运行模型：
+
+```text
+File 是 backend-local VFD 下标，VfdCache 保存路径、flags、cleanup 语义和可选 OS fd；每次 FileRead/FileWrite/FileSync 先经 FileAccess，如果 fd 已被 LRU 关闭就重新 open，fd 压力上来时 ReleaseLruFiles 关闭最冷的真实 fd。
+```
+
+核心矛盾是：PostgreSQL 需要大量长期可引用的文件句柄，操作系统只给有限真实 fd；VFD cache 把“文件身份仍然打开”和“当前是否持有 kernel fd”拆开。
+
+## 3. 核心文件分工与阅读顺序
+
+本节把源码基线、重点入口和辅助核对路径集中放在这里，避免课程定位之后再漂一个未编号大节。
+
+源码仓库：`/home/highgo/postgres`
+
 基线：`master` = `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`
 
 本节重点阅读：
@@ -77,9 +97,8 @@
 - `md.c:722-742` `mdclose()` 调用 `FileClose()`。
 - `md.c:1494-1507` `mdfd()` 暴露 raw fd 的危险边界。
 
----
+## 4. 运行模型：File 与 VFD 的两层句柄
 
-## 1. 先给结论
 `File` 不是 Unix fd。
 在本节源码基线里，`src/include/storage/fd.h:51` 把它定义成 `typedef int File`。
 但这个 `int` 的语义不是 kernel fd number。
@@ -116,9 +135,8 @@ LRU 负责选择牺牲者。
 这套设计不是为了抽象优雅。
 它是为了避免 backend 在 relation segment、sort/hash temp file、目录遍历、配置文件读取、pipe、动态库、extension、外部库调用共同存在时把进程 fd limit 打爆。
 
----
+## 5. 为什么不能长期持有所有 OS fd
 
-## 2. 为什么不能长期持有所有 OS fd
 先看一个直觉错误：
 如果 relation file、temporary file、config file 都只是文件，为什么不打开后一直拿着 fd？
 
@@ -168,9 +186,8 @@ VFD cache 的价值在这里：
 它不是为了减少 `open()` 次数。
 它是在 `open()` 成本和 fd limit 之间取一个工程上可控的折中。
 
----
+## 6. 核心状态：File、VfdCache、VFD
 
-## 3. 核心状态：File、VfdCache、VFD
 本节先只理解一个 backend 内的状态。
 `VfdCache` 是 backend-local static 变量。
 它不是 shared memory。
@@ -231,9 +248,8 @@ fd.c 试图维持
 因为 OS 全局 fd table、旁路代码、race 和内核错误仍可能让 `open()` 失败。
 但它是 backend 内 fd.c 能维护的主要边界。
 
----
+## 7. VFD LRU 的运行模型
 
-## 4. VFD LRU 的运行模型
 LRU ring 的注释在 `fd.c:297-327`。
 这个注释值得认真读。
 它说明只有当前真实打开的 VFD 在 ring 里。
@@ -305,9 +321,8 @@ nfile + numAllocatedDescs + numExternalFDs >= max_safe_fds
 LRU 的 correctness 不依赖“close 永远成功”。
 它依赖内部 VFD 状态不能在异常路径上半更新。
 
----
+## 8. 打开入口的语义边界
 
-## 5. 打开入口的语义边界
 `src/include/storage/fd.h:15-42` 是 API 使用规则的压缩版。
 它明确说这些不是 Unix routine 的简单改名。
 所有文件活动都应该使用它们。
@@ -401,9 +416,8 @@ BasicOpenFile      -> 最低层 raw fd，没有自动 cleanup，慎用
 所以 caller 不能拿着它做复杂操作。
 `md.c:1494-1507` 的 `mdfd()` 就是一个很窄的边界。
 
----
+## 9. fd limit 管理
 
-## 6. fd limit 管理
 fd.c 管理 fd limit 的第一步是 `set_max_safe_fds()`。
 它在普通 postmaster 启动后期运行，然后 fork 出来的 backend 继承结果。
 `fd.c:150-160` 说明了这个变量的生命周期。
@@ -463,9 +477,8 @@ fd limit 管理的思想是：
 fd.c 不是只管自己的 VFD。
 它要为几种 fd 消耗类型划出相互不完全挤占的空间。
 
----
+## 10. temporary file 的特殊语义
 
-## 7. temporary file 的特殊语义
 临时文件在 fd.c 里不是一类简单的 pathname。
 它叠加了三个语义：
 - 是否关闭时删除。
@@ -526,9 +539,8 @@ caller 不能把它算进自己的临时文件配额。
 清理失败通常只 LOG。
 原因是删除旧 temp 文件不应该阻止数据库启动。
 
----
+## 11. BufFile：在 VFD 之上减少 thrashing
 
-## 8. BufFile：在 VFD 之上减少 thrashing
 `buffile.c` 是理解 VFD 压力的好例子。
 文件开头注释说，BufFile 是在 fd.c 管理的 virtual Files 之上实现的简化 stdio。
 它只提供 buffered I/O，不提供 stdio 格式化。
@@ -582,9 +594,8 @@ ERROR 时即使 `BufFile` struct 只靠 memory context 消失，底层 `OpenTemp
 如果这些底层文件是 anonymous temp file，`FileClose()` 会删除它们。
 如果是 FileSet-backed file，是否删除不由 `FileClose()` 自动完成。
 
----
+## 12. FileSet：命名临时文件空间
 
-## 9. FileSet：命名临时文件空间
 `fileset.c` 的定位很窄：
 提供一个临时 namespace，让文件能按名字被发现。
 
@@ -636,9 +647,8 @@ FileSet-backed BufFile 的共享边界是只读。
 `BufFileExportFileSet()` flush buffer，然后标记 `readOnly = true`。
 其他 backend 才能安全打开。
 
----
+## 13. relation file 与 temporary file 的差异
 
-## 10. relation file 与 temporary file 的差异
 relation segment 和 temporary file 都可能通过 `PathNameOpenFile()` 得到 `File`。
 但它们的 lifecycle 不一样。
 不要因为底层 API 相同就把语义混在一起。
@@ -702,9 +712,8 @@ FileSet temp file:
 fd.c 只管理 file descriptor 与部分临时文件 cleanup。
 它不替 relation layer 决定 crash safety。
 
----
+## 14. resource cleanup 主链路
 
-## 11. resource cleanup 主链路
 fd.c 的 cleanup 要分四层看。
 
 第一层是显式 close。
@@ -757,9 +766,8 @@ process exit 时，它会清理所有临时文件，包括 interXact ones。
 `BufFile` struct 可以随 memory context 消失。
 但底层 fd 和磁盘文件必须通过 ResourceOwner、FileClose 或 FileSet ownership 关闭和删除。
 
----
+## 15. 正确性、错误边界与 fallback
 
-## 12. 正确性、错误边界与 fallback
 fd.c 最常见的资源错误是 `EMFILE` 和 `ENFILE`。
 `EMFILE` 通常表示当前进程 fd 达到限制。
 `ENFILE` 通常表示系统级打开文件表耗尽。
@@ -823,9 +831,8 @@ startup 清理遗留 temp files 失败也通常 LOG。
 原因是 Windows 上 unlink-but-not-yet-gone 的文件可能表现为 `EACCES`。
 这在 relation file 路径上影响 `mdopenfork()` 和 `_mdfd_getseg()` 对缺失文件的判断。
 
----
+## 16. 源码 walkthrough：一次 relation block read
 
-## 13. 源码 walkthrough：一次 relation block read
 这条 walkthrough 用 relation file 说明 VFD 如何隐藏 fd reopen。
 
 上层要读一个 relation block。
@@ -856,9 +863,8 @@ FileReadV(v->mdfd_vfd, iov, iovcnt, seekpos, WAIT_EVENT_DATA_FILE_READ)
 raw fd number 甚至可能被 OS 复用给另一个文件。
 这就是 `FileGetRawDesc()` 注释警告“不要做太多别的事”的原因。
 
----
+## 17. 源码 walkthrough：一次临时 BufFile 写入
 
-## 14. 源码 walkthrough：一次临时 BufFile 写入
 这条 walkthrough 用 executor 临时工作文件说明 temporary cleanup。
 
 某个 sort 或 hash 工作流创建 BufFile：
@@ -910,9 +916,8 @@ BufFileClose()
 这条链路的关键不是 BufFile 本身。
 关键是底层 `File` 的 ResourceOwner ownership 在创建时已经建立。
 
----
+## 18. 观测与诊断入口
 
-## 15. 观测与诊断入口
 fd.c 的内部状态不是普通 SQL view 能直接看到的。
 但可以从几个入口间接观察。
 
@@ -973,9 +978,8 @@ BufFile 使用 `WAIT_EVENT_BUFFILE_READ`、`WAIT_EVENT_BUFFILE_WRITE`。
 - `VfdCache[0].lruMoreRecently`
 - `VfdCache[0].lruLessRecently`
 
----
+## 19. 常见误区
 
-## 16. 常见误区
 误区一：`File` 就是 fd。
 不是。
 `File` 是 VFD index。
@@ -1018,16 +1022,16 @@ fd.c 的 `FileClose()` 只处理 fd/VFD 和特定 temp flags。
 它只影响 fd.c 可用上限。
 太高可能增加每个 backend 同时占用的 fd 数，给系统级 fd table 和多进程 workload 带来压力。
 
----
+## 20. 成本、资源与跨模块传播
 
-## 17. 成本、资源与跨模块传播
 VFD 的成本模型不是“打开文件一次有多贵”，而是 fd 预算如何在多类资源之间传播。`nfile` 表示 VFD 当前物理打开数，`numAllocatedDescs` 表示 `AllocateFile`/`OpenTransientFile`/directory 等短期资源，`numExternalFDs` 表示 fd.c 外部长期持有的裸 fd。三者一起逼近 `max_safe_fds` 时，VFD LRU 才有机会释放一部分真实 fd。
 
 成本随这些变量扩张：backend 数增加会把 per-process fd limit 压力复制多份；relation 数和 segment 数增加 logical `File` 数；sort/hash spill 增加 temporary `File` 和 `BufFile` segment；扩展或外部库如果绕过 `AcquireExternalFD()`，会让 fd.c 低估真实压力。VFD 能控制同时打开的 OS fd 数，但不能消除 reopen、LRU ring 操作、路径名保存和 `open()`/`close()` thrashing。
 
 跨模块边界也要分清：smgr/md 用 `PathNameOpenFile()` 把 relation segment 放进 VFD；executor spill 通过 `BufFile` 和 temporary `File` 使用 VFD；FileSet/SharedFileSet 只管理命名空间和 cleanup，不替代 fd LRU；ResourceOwner 兜底释放资源，但不能把 logical handle 自动变成 crash-safe relation storage。
 
-## 18. 课堂实验
+## 21. 课堂实验
+
 实验 1：画 VFD 三态图并用断点校验。
 
 ```gdb
@@ -1055,7 +1059,8 @@ break mdclose
 
 运行一个会 spill 的查询，再扫描或扩展一张 relation。比较 anonymous temp file close 时自动 unlink，和 relation file close 只释放 VFD、不删除磁盘文件的差异。
 
-## 19. 讨论题
+## 22. 讨论题
+
 1. 为什么 `File` 必须是 backend-local VFD index，而不能暴露 OS fd？
 2. `VfdCache[file].fileName != NULL` 和 `VfdCache[file].fd != VFD_CLOSED` 分别代表什么状态？
 3. VFD LRU 关闭一个 fd 后，哪些语义还保留，哪些资源已经释放？
@@ -1065,14 +1070,16 @@ break mdclose
 7. 如何判断 “too many open files” 是 VFD、allocated desc、external fd 还是系统级 `ENFILE`？
 8. 为什么缓存 `FileGetRawDesc()` 返回值是危险的？
 
-## 20. 诊断顺序与可迁移规律
+## 23. 诊断顺序与可迁移规律
+
 遇到 fd pressure，先看错误来源。如果日志出现 release/retry，说明 fd.c 已尝试释放 LRU VFD；如果仍失败，通常是可释放 VFD 不够、allocated desc/external fd 过多，或系统级 file table 耗尽。
 
 然后区分资源类型：relation segment 和 anonymous temp file 是 VFD；`AllocateFile()`/`OpenTransientFile()` 是 fd.c 登记的短期资源；外部库长期 fd 必须通过 `AcquireExternalFD()` 或 `ReserveExternalFD()` 让 fd.c 计入预算。最后再看 workload：大量 spill、过多 relation segment、多 backend 并发扫描和小 fd limit 都会放大 reopen 和 cleanup 成本。
 
 可迁移规律是：稳定 handle 不一定等于真实资源。`File` 代表 logical file identity，OS fd 是可回收物理资源。把二者拆开，可以让上层长期持有文件语义，同时让底层在资源压力下动态收缩；代价是所有访问必须经过抽象层，raw escape hatch 变危险，cleanup 和重新打开失败都必须被显式处理。
 
-## 21. 本节小结
+## 24. 本节小结
+
 本节核心链路是：`PathNameOpenFile()` 或 `OpenTemporaryFile()` 创建 backend-local `File`，`FileAccess()` 在每次读写/sync 前确保真实 fd 可用，VFD LRU 在 fd pressure 下关闭冷文件，`FileClose()` 才结束 logical handle 和 cleanup 语义。
 
 核心状态是 `VfdCache[file].fileName`、`VfdCache[file].fd`、LRU ring、`nfile`、`numAllocatedDescs`、`numExternalFDs` 和 `max_safe_fds`。MemoryContext 只能管 C 对象；ResourceOwner、EOXact、process exit 和 FileSet/SharedFileSet 才负责底层文件资源释放。

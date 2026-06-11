@@ -1,6 +1,7 @@
 # PostgreSQL B-tree VACUUM、cleanup 与 bloat 控制
 
 ## 课程定位
+
 前置知识：
 
 - 你已经知道 PostgreSQL heap tuple 有 MVCC 版本，索引 tuple 保存 heap TID。
@@ -23,7 +24,7 @@
 - 为什么 simple deletion、bottom-up deletion、deduplication 可以减缓 bloat，但不能替代 VACUUM 的全局回收链路。
 源码基线：
 
-- 本课基于 `/home/nail/postgres-lab`。
+- 本课基于 `/home/highgo/postgres`。
 - 本课确认的源码版本为 `master` 上的 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。
 - 下面的函数名和字段名都按这个基线书写。
 本节只围绕一个 runtime truth：
@@ -34,6 +35,7 @@
 这就是本节所有 lock、pin、cycle ID、WAL、FSM 延迟复用逻辑的共同根源。
 
 ## 1. 本节在总主线中的位置
+
 本目录讨论 storage 与 persistence。
 B-tree VACUUM 处在三个边界之间：
 
@@ -63,10 +65,12 @@ heap lazy VACUUM 收集 dead TID
   -> deleted page 延迟进入 FSM
   -> amvacuumcleanup 记录 cleanup 状态或触发 cleanup-only scan
 ```
+
 这个主线解释的是一个“空间何时真正可复用”的问题。
 这些相邻模块只在它们改变 reclaim 边界时进入本节。
 
 ## 2. 核心矛盾与一句话运行模型
+
 一句话运行模型：
 
 `lazy_scan_heap()` 找到 heap 上可移除的 TID，`btbulkdelete()` 在线性 index scan 中删除对应 index tuple，`btvacuumcleanup()` 决定是否还需要 cleanup-only scan，并把未能进入 FSM 的 deleted page 数写回 metapage，留给未来 VACUUM 判断。
@@ -80,7 +84,7 @@ heap lazy VACUUM 收集 dead TID
 - dead index tuple bloat：旧 heap version 对应的 index entry 还在 leaf page 上。
 - page fragmentation bloat：tuple 删除后 leaf page 变稀疏，但 PostgreSQL 不合并部分空 page。
 - non-recyclable deleted page bloat：page 已经从 tree unlink，但还没安全进入 FSM。
-本节的核心 tension 不是“VACUUM 快还是慢”。
+本节的核心矛盾 不是“VACUUM 快还是慢”。
 更准确地说，是：
 尽快让空间可复用，与允许并发 scan 在弱 interlock 下继续正确前进，不能同时完全满足。
 B-tree 选择的策略是分层推进：
@@ -104,6 +108,7 @@ B-tree 选择的策略是分层推进：
 - FSM 有页但后续插入没有复用到对应 key space。
 
 ## 3. 核心文件分工与阅读顺序
+
 本课必须先读状态，再读流程。
 推荐阅读顺序如下。
 
@@ -170,6 +175,7 @@ B-tree 选择的策略是分层推进：
 这就是为什么一次 VACUUM 可能多次扫描同一个 index。
 
 ### 4.2 `BTPageOpaqueData`
+
 每个 B-tree page 的 special space 中都有 `BTPageOpaqueData`。
 本节关心这些字段：
 
@@ -196,6 +202,7 @@ B-tree 选择的策略是分层推进：
 VACUUM 用它判断物理线性扫描是否可能漏掉被 split 移到低 block number 的 tuple。
 
 ### 4.3 `BTMetaPageData`
+
 metapage 的常规职责是记录 root、fast root、level 等 B-tree 全局入口。
 本节额外关心两个字段：
 
@@ -215,6 +222,7 @@ metapage 的常规职责是记录 root、fast root、level 等 B-tree 全局入�
 没有 dead TID 时，扫描整个 index 只为找少量可回收 deleted page 通常不划算。
 
 ### 4.4 `BTDeletedPageData`
+
 deleted page 的 page contents 中保存 `BTDeletedPageData.safexid`。
 
 `BTPageSetDeleted()` 会：
@@ -256,6 +264,7 @@ VACUUM 运行时通常不需要为了删除 B-tree page 而分配自己的 XID�
 那些 page 仍然已经安全地从 tree unlink，只是可能要等未来 VACUUM 才能进入 FSM。
 
 ### 4.6 `BTVacuumPostingData`
+
 posting list tuple 把多个相同 key 的 heap TID 合并在一个 index tuple 中。
 VACUUM 可能只删除其中一部分 TID。
 这时不能简单删除整个 index tuple。
@@ -278,6 +287,7 @@ deduplication 改变物理表示，VACUUM 必须能做粒度更细的删除。
 ## 5. 主流程源码 walkthrough
 
 ### 5.1 heap 先生产 TID 批次
+
 主流程从 `vacuumlazy.c` 开始。
 
 `lazy_scan_heap()` 做第一遍 heap scan。
@@ -298,6 +308,7 @@ lazy_scan_heap()
   -> lazy_cleanup_all_indexes()
      -> index AM amvacuumcleanup
 ```
+
 关键顺序是：
 先 index，后 heap `LP_UNUSED`。
 
@@ -312,6 +323,7 @@ B-tree 的 `btvacuumscan()` 每次都会完整扫描 index。
 这就是 `maintenance_work_mem` 或 `autovacuum_work_mem` 太小时，index vacuum 成本可能急剧放大的原因。
 
 ### 5.2 `btbulkdelete()` 建立 B-tree VACUUM cycle
+
 B-tree handler 在 `nbtree.c` 中把 `ambulkdelete` 指向 `btbulkdelete`。
 
 `btbulkdelete()` 的主体很短，但语义很重：
@@ -419,6 +431,7 @@ simple deletion 与 bottom-up deletion 发生在 insert path 中，必须通过 
 这就是 `_bt_delitems_vacuum()` 与 `_bt_delitems_delete()` 看起来很像，但不能合并成一个函数的原因。
 
 ### 5.7 空 leaf page 进入 two-stage page deletion
+
 当 leaf page 已经没有 data item，`btvacuumpage()` 调用 `_bt_pagedel()`。
 page deletion 只从空 leaf page 开始。
 B-tree 不合并部分空 page。
@@ -456,6 +469,7 @@ B-tree 不合并部分空 page。
 下一次 VACUUM 遇到 `BTP_HALF_DEAD` 会继续删除。
 
 ### 5.8 deleted page 进入 FSM
+
 page fully deleted 后仍不能立刻复用。
 deleted page 是 tombstone。
 它保留 sibling links，让旧 search 或 scan 能从旧物理链接中恢复。
@@ -498,12 +512,14 @@ scan 后 `btvacuumcleanup()` 计算：
 ```text
 num_delpages = stats->pages_deleted - stats->pages_free
 ```
+
 然后 `_bt_set_cleanup_info()` 把这个值 WAL-log 到 metapage。
 这个值越大，未来 cleanup-only scan 越可能被触发。
 
 ## 6. 生命周期 / ownership / cleanup
 
 ### 6.1 `dead_items`
+
 创建者：
 
 - `dead_items_alloc()`。
@@ -528,6 +544,7 @@ ERROR 兜底：
 - 如果 bypass 或 failsafe 发生，heap `LP_DEAD` 可以留下，等待未来 VACUUM。
 
 ### 6.2 B-tree VACUUM cycle ID
+
 创建者：
 
 - `btbulkdelete()` 调用 `_bt_start_vacuum()`。
@@ -547,6 +564,7 @@ ERROR 兜底：
 - cycle ID 可以 false positive，但不能 false negative。
 
 ### 6.3 leaf page lock 与 pin
+
 创建者：
 
 - buffer manager 返回 pinned buffer。
@@ -565,6 +583,7 @@ ERROR 兜底：
 - 不是每个 B-tree 结构修改都需要 cleanup lock；insert path 的 simple deletion 持 exclusive lock。
 
 ### 6.4 `_bt_pagedel()` 临时内存
+
 创建者：
 
 - `btvacuumscan()` 创建 `vstate.pagedelcontext`。
@@ -581,6 +600,7 @@ ERROR 兜底：
 - 调用者用临时 context 把复杂 cleanup 简化成生命周期边界。
 
 ### 6.5 pending FSM 数组
+
 创建者：
 
 - `_bt_pendingfsm_init()`。
@@ -599,6 +619,7 @@ fallback：
 - 未记录 page 仍然 deleted，只是不会在本轮 scan 末尾尝试进入 FSM。
 
 ### 6.6 metapage cleanup 信息
+
 创建者或更新者：
 
 - `_bt_set_cleanup_info()`。
@@ -617,6 +638,7 @@ WAL：
 ## 7. 正确性机制层次
 
 ### 7.1 MVCC visibility
+
 heap pruning 决定哪些 heap tuple version dead to all。
 只有 heap 侧能最终判断 TID 是否可以从所有 index 中删除。
 B-tree 通过 callback 问“这个 heap TID 是否在 VACUUM 当前 dead set 中”。
@@ -627,6 +649,7 @@ deleted page 的 `safexid` 用 `GlobalVisCheckRemovableFullXid()` 判断。
 这里 visibility 保护的是 physical navigation tombstone，不是 heap tuple 可见性。
 
 ### 7.2 buffer pin 与 cleanup lock
+
 pin 表示 buffer 正在被使用。
 cleanup lock 表示没有其他 backend 持有 pin。
 B-tree index scan 可以选择是否在访问 heap 时继续 pin leaf page。
@@ -637,6 +660,7 @@ VACUUM 删除 index tuple 前必须拿 cleanup lock。
 这是防止 heap TID 复用与正在访问 heap 的 scan 交错。
 
 ### 7.3 page split 与 cycle ID
+
 VACUUM 物理线性扫描不是 key-order scan。
 并发 split 能把 tuple 移到已扫描过的低 block。
 
@@ -666,6 +690,7 @@ crash 后 redo 能重放：
 如果 crash 卡在 half-dead 与 unlink 之间，下一次 VACUUM 继续完成。
 
 ### 7.5 B-tree physical ordering
+
 page deletion 不能随意合并 key space。
 PostgreSQL 选择把被删 page 的 key space 移到右 sibling。
 因此不能删除 parent 的 rightmost child，除非 parent 也要一起删除。
@@ -674,6 +699,7 @@ PostgreSQL 选择把被删 page 的 key space 移到右 sibling。
 fast root 是对 skinny tree 的性能补偿，而不是物理高度 shrink。
 
 ### 7.6 FSM 与 deleted page tombstone
+
 从 tree unlink 不等于可复用。
 deleted page 必须保留一段时间作为 tombstone。
 旧 search 可以看到 deleted page，然后沿 sibling link 恢复。
@@ -700,6 +726,7 @@ page deletion 改变 key space 归属，predicate lock 也必须迁移。
 这不是普通 coding style，而是因为 transaction abort cleanup 还没机会释放这个 LWLock。
 
 ### 8.2 heap VACUUM bypass optimization
+
 当 `dead_items` 接近 0 且只会有一轮 index scan 时，`lazy_vacuum()` 可能 bypass index vacuuming。
 它把行为近似成“没有 dead items”。
 这会留下少量 `LP_DEAD` 与对应 index tuple。
@@ -726,6 +753,7 @@ page deletion 改变 key space 归属，predicate lock 也必须迁移。
 只有 metapage 记录的 non-recyclable deleted page 足够多时，cleanup-only scan 才值得做。
 
 ### 8.5 half-dead page 恢复
+
 page deletion 第一阶段已经让 tree 对 search 保持一致。
 如果 VACUUM 中断，half-dead leaf page 可以留在 index 中。
 下一次 `btvacuumpage()` 遇到 `P_ISHALFDEAD` 会调用 `_bt_pagedel()` 继续。
@@ -752,6 +780,7 @@ VACUUM 会继续处理 index 的其它部分。
 这是性能优化降级，不是数据丢失。
 
 ### 8.8 incomplete split
+
 VACUUM 通常避免完成 incomplete split，因为补 downlink 可能需要 split parent，进而消耗磁盘空间。
 VACUUM 的目标往往是释放空间。
 让 VACUUM 在 out-of-space 场景中要求额外扩展 index 是糟糕的 fallback。
@@ -761,6 +790,7 @@ VACUUM 的目标往往是释放空间。
 ## 9. 成本、资源与跨模块传播
 
 ### 9.1 成本模型
+
 B-tree VACUUM 的主成本不是只看 dead tuple 数。
 更关键的变量包括：
 
@@ -783,6 +813,7 @@ heap scan 一段
   -> heap scan 下一段
   -> full index scan again
 ```
+
 这时成本近似变成：
 
 `index_size * index_scan_rounds`。
@@ -798,6 +829,7 @@ plain MVCC scan 常能 drop pin，减少阻塞。
 也可能是 I/O、WAL、cost delay、old snapshot、parallel worker 分配、heap pruning 成本。
 
 ### 9.3 WAL 与 checkpoint 传播
+
 删除 index tuple 写 `XLOG_BTREE_VACUUM`。
 simple deletion/bottom-up deletion 写 `XLOG_BTREE_DELETE`。
 page deletion 写 `XLOG_BTREE_MARK_PAGE_HALFDEAD` 与 `XLOG_BTREE_UNLINK_PAGE`。
@@ -813,6 +845,7 @@ standby 上 replay VACUUM record 也要维护 B-tree 物理结构。
 不要只看 primary 的 SQL latency。
 
 ### 9.4 FSM 传播
+
 B-tree tuple 删除释放的是 page 内空间。
 这不一定更新 FSM。
 只有 page 变成 deleted 且安全可复用，才通过 `RecordFreeIndexPage()` 进入 FSM。
@@ -835,6 +868,7 @@ FSM 是物理 page 复用入口，不是 bloat 自动消失器。
 它们的目标是减少不必要 page split 与长期 bloat 增长速度。
 
 ### 9.6 后台进程与 shared state
+
 主动推进本节状态的主要执行者是：
 
 - 用户 backend 执行手动 `VACUUM`。
@@ -855,6 +889,7 @@ deleted page 的可回收性由 global visibility horizon 决定。
 ## 10. 观测与诊断入口
 
 ### 10.1 先锁定 runtime truth
+
 诊断本节问题时先问：
 空间卡在哪一层？
 建议按这个顺序判断：
@@ -908,6 +943,7 @@ VACUUM 也可能删除了 page，但 old snapshot 让 page 暂时不能进入 FS
 它不是 bloat 视图。
 
 ### 10.3 pageinspect 与 pgstattuple
+
 如果允许安装 contrib extension，可以用 `pageinspect` 看 B-tree page 物理状态。
 常用入口：
 
@@ -931,6 +967,7 @@ VACUUM 也可能删除了 page，但 old snapshot 让 page 暂时不能进入 FS
 它们只能告诉你“此刻 index 物理形态大致如何”。
 
 ### 10.4 WAL 与源码断点
+
 如果要验证源码主链路，可以用 `pg_waldump` 查 B-tree WAL record。
 你会看到 tuple vacuum、delete、unlink、meta cleanup 的记录类型。
 这适合确认 page deletion 是否真的发生。
@@ -960,6 +997,7 @@ VACUUM 也可能删除了 page，但 old snapshot 让 page 暂时不能进入 FS
 - `GlobalVisCheckRemovableFullXid()` 返回值。
 
 ### 10.5 可直接观测、只能推断、几乎不可见
+
 可直接观测：
 
 - VACUUM 当前 phase。
@@ -983,6 +1021,7 @@ VACUUM 也可能删除了 page，但 old snapshot 让 page 暂时不能进入 FS
 需要 SQL 现象、page extension、WAL、源码断点或 perf 组合判断。
 
 ## 11. 常见误区
+
 误区一：`VACUUM` 后 index 文件应该马上变小。
 纠正：B-tree VACUUM 主要让空间在 index 内部可复用。
 relation file shrink 不是常规 B-tree VACUUM 的承诺。
@@ -1004,6 +1043,7 @@ relation file shrink 不是常规 B-tree VACUUM 的承诺。
 ## 12. 课堂实验
 
 ### 实验一：观察 index tuple 删除不等于文件 shrink
+
 目标：
 
 - 看到 VACUUM 删除 index tuple 后，index relation size 未必下降。
@@ -1031,6 +1071,7 @@ VACUUM (VERBOSE, INDEX_CLEANUP ON) bt_vac_lab;
 SELECT pg_size_pretty(pg_relation_size('bt_vac_lab_k_idx')) AS after_size;
 SELECT * FROM pgstatindex('bt_vac_lab_k_idx');
 ```
+
 解释入口：
 
 - UPDATE indexed column 产生新的 index tuple。
@@ -1045,6 +1086,7 @@ SELECT * FROM pgstatindex('bt_vac_lab_k_idx');
 - `_bt_delitems_vacuum()` 物理删除 tuple。
 
 ### 实验二：观察删除连续 key range 后的 deleted page 与复用
+
 目标：
 
 - 尽量制造全空 leaf page。
@@ -1075,6 +1117,7 @@ FROM generate_series(100000, 300000) AS g;
 SELECT pg_size_pretty(pg_relation_size('bt_page_del_lab_pkey')) AS after_reinsert_size;
 SELECT * FROM pgstatindex('bt_page_del_lab_pkey');
 ```
+
 解释入口：
 
 - 连续 key range 更容易让若干 leaf page 完全空。
@@ -1088,6 +1131,7 @@ SELECT * FROM pgstatindex('bt_page_del_lab_pkey');
 - `_bt_pendingfsm_finalize()` 判断 newly deleted page 是否能进 FSM。
 
 ### 实验三：断点跟读一次 B-tree VACUUM
+
 目标：
 
 - 把 SQL 现象映射到源码状态。
@@ -1104,6 +1148,7 @@ b _bt_pagedel
 b _bt_pendingfsm_finalize
 b btvacuumcleanup
 ```
+
 建议观察：
 
 ```text
@@ -1120,6 +1165,7 @@ p stats->pages_newly_deleted
 p stats->pages_deleted
 p stats->pages_free
 ```
+
 实验变化：
 
 - 一轮只删除少量 tuple，观察是否 bypass index vacuuming。
@@ -1150,6 +1196,7 @@ p stats->pages_free
 8. 哪些现象能从 `pg_stat_progress_vacuum` 直接看到，哪些必须靠 pageinspect、WAL 或断点推断？
 
 ## 14. 本节小结
+
 本节唯一主问题是：
 在并发访问和 heap TID 复用存在时，B-tree VACUUM 如何安全回收空间并控制 bloat。
 核心链路是：
@@ -1164,6 +1211,7 @@ heap pruning 产生 LP_DEAD TID
   -> deleted page 等 safexid 安全后进入 FSM
   -> btvacuumcleanup 更新 cleanup hint 或触发 cleanup-only scan
 ```
+
 核心状态和边界：
 
 - `dead_items` 是 heap 与 index AM 的批处理桥。

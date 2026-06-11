@@ -1,6 +1,7 @@
 # PostgreSQL Heap page pruning、redirect/dead line pointer 与空间回收
+
 ## 课程定位
-本节主题：Heap page pruning、redirect/dead line pointer 与空间回收。
+
 上一节已经建立 heap page layout、line pointer、tuple header 和 `t_ctid` 的基本模型。
 本节只讨论一个主问题：
 已经被 UPDATE/DELETE 留在 heap page 上的旧 tuple version，什么时候能被安全剪掉，并且为什么剪掉时不能破坏 index TID？
@@ -28,43 +29,15 @@ index entry 的最终删除交给 VACUUM/index AM。
 - WAL record 为什么需要记录 redirect/dead/unused offsets 和 snapshot conflict horizon。
 - pageinspect、pg_visibility、pg_stat 和 WAL dump 分别能看到什么。
 本节最重要的一句话运行模型：
+
 ```text
 pruning 在 cleanup lock 下，用 visibility horizon 判断哪些 tuple version 可移除；它把 HOT chain 的稳定 index 入口保留为 root line pointer，把旧 tuple bytes 剪掉并 compact page，同时用 WAL 记录足够的信息让 redo 和 standby 冲突处理重放同一个边界。
 ```
-## 源码基线
-源码仓库：
-```text
-/home/nail/postgres-lab
-```
-源码基线：
-```text
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
-```
-本节重点源码：
-```text
-src/backend/access/heap/pruneheap.c
-src/backend/access/heap/heapam.c
-src/backend/access/heap/heapam_indexscan.c
-src/backend/access/heap/heapam_visibility.c
-src/backend/access/heap/heapam_xlog.c
-src/backend/access/heap/vacuumlazy.c
-src/backend/access/heap/README.HOT
-src/include/storage/itemid.h
-src/include/storage/bufpage.h
-src/include/access/htup_details.h
-src/include/access/heapam.h
-src/include/access/heapam_xlog.h
-```
-阅读顺序不要按文件名排序。
-先读 `itemid.h` 和 `README.HOT`，建立 root TID 不能丢的约束。
-再读 `heap_update()`，看 HOT chain 怎么形成。
-然后读 `heap_page_prune_opt()` 和 `heap_page_prune_and_freeze()`，看 pruning 怎么被触发。
-接着读 `heap_prune_chain()` 和 `heap_page_prune_execute()`，看 line pointer 状态如何真实变化。
-最后读 `heapam_visibility.c`、`vacuumlazy.c` 和 `heapam_xlog.c`，看 horizon、VACUUM 两阶段和 WAL redo。
-行号来自当前基线源码的 `rg -n` / `nl -ba` 结果。
-源码会继续演化，所以本课把函数名和状态边界当稳定知识，把具体行号当定位辅助。
+
+源码基线：本课使用当前实际源码路径 `/home/highgo/postgres`，branch `master`，commit `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`；核心源码分工见第 3 节。
+
 ## 1. 本节在总主线中的位置
+
 前面几节讲的是 page 能不能安全读写和落盘。
 这一节进入 page 内部的生命周期。
 一个 heap page 不是只存当前行。
@@ -83,6 +56,7 @@ index entry 仍然指向旧 root TID。
 这就是 index corruption。
 所以本节不是泛泛介绍 VACUUM。
 本节主线是：
+
 ```text
 HOT update 形成 chain
   -> 旧版本变得 globally removable
@@ -92,6 +66,7 @@ HOT update 形成 chain
   -> WAL/redo/standby 保持同样边界
   -> VACUUM 最终删除 index entry 并释放 LP_DEAD
 ```
+
 这条链路里每个状态都有明确边界。
 `LP_REDIRECT` 是保留 index 入口并跳到 heap-only successor。
 `LP_DEAD` 是保留 index TID 的墓碑。
@@ -99,11 +74,24 @@ HOT update 形成 chain
 三者不能互换。
 `LP_REDIRECT` 和 `LP_DEAD` 都不代表 tuple bytes 还在。
 `LP_UNUSED` 才代表 offset number 可复用。
-本节的系统 tension 可以压缩为：
+本节的系统矛盾可以压缩为：
+
 ```text
 page-local reclaim wants to erase bytes now; index stability and MVCC horizon require a durable, replayable, delayed ownership transfer for TID slots.
 ```
-## 2. 核心文件分工与阅读顺序
+
+## 2. 核心矛盾与一句话运行模型
+
+一句话运行模型：
+
+```text
+pruning 在 cleanup lock 下按 visibility horizon 规划 page-local changes，保留必要的 root line pointer，把可移除 tuple bytes 剪掉并 compact page，再用 WAL 记录 redirect/dead/unused offsets 和 conflict horizon，让 redo 与 standby 能重放同一条边界。
+```
+
+核心矛盾是：heap page 希望尽早回收旧版本空间，index TID、HOT root、旧 snapshot、standby query 和 VACUUM 两阶段清理又要求 offset number 的归属不能被过早转移。
+
+## 3. 核心文件分工与阅读顺序
+
 `src/include/storage/itemid.h` 定义 `ItemIdData`。
 这里能看到 `lp_off`、`lp_flags`、`lp_len` 和四个 `LP_*` 状态。
 `LP_UNUSED` 表示 immediate re-use。
@@ -156,7 +144,9 @@ hint 可以帮助触发 pruning，但不能作为 correctness 事实。
 `heap_xlog_prune_freeze()` 会按 WAL 里的 flags 决定是否拿 cleanup lock。
 它重放 line pointer state change、freeze 和 VM change。
 hot standby 下还会按 snapshot conflict horizon 处理恢复冲突。
-## 3. 核心状态：line pointer 不是 tuple
+
+## 4. 核心状态：line pointer 不是 tuple
+
 `ItemIdData` 是 heap page 内最关键的间接层。
 索引里的 heap TID 是 `(block, offset)`。
 这个 offset 是 line pointer number。
@@ -165,11 +155,13 @@ tuple bytes 可以在 `PageRepairFragmentation()` 中移动。
 只要 line pointer number 仍然指向正确含义，index TID 就没变。
 这就是 slotted page 支持 compaction 的根本原因。
 `itemid.h` 把 `ItemIdData` 压到 32 bits：
+
 ```text
 lp_off    15 bits
 lp_flags   2 bits
 lp_len    15 bits
 ```
+
 这个布局也解释了为什么 PostgreSQL page size 上限和 line pointer 有关系。
 `lp_off` 在 `LP_NORMAL` 下是 tuple bytes 起点。
 `lp_len` 在 `LP_NORMAL` 下是 tuple bytes 长度。
@@ -177,12 +169,14 @@ lp_len    15 bits
 raw field 不是语义。
 `lp_off + lp_flags + lp_len + HOT context` 才是语义。
 四个状态的边界如下：
+
 | 状态 | 是否有 tuple storage | 是否可被新 tuple 复用 | index 还能否安全指向它 | pruning 语义 |
 | --- | --- | --- | --- | --- |
 | `LP_UNUSED` | 否 | 是 | 否 | 空 slot，可复用 |
 | `LP_NORMAL` | 是 | 否 | 可能 | 正常 tuple 或 HOT chain member |
 | `LP_REDIRECT` | 否 | 否 | 是 | HOT root 被剪掉后，保留 root TID 并跳到 successor |
 | `LP_DEAD` | 否或曾有 | 否 | 是，但表示 dead | index entry 可能还没删，VACUUM 后才能释放 |
+
 `LP_UNUSED` 是唯一能立即复用的状态。
 这句话非常重要。
 `LP_REDIRECT` 没有 tuple bytes，但不能复用。
@@ -207,18 +201,22 @@ raw field 不是语义。
 新插入 tuple 可以重用这个 offset number。
 如果有旧 index entry 还指向它，就会造成旧 index entry 命中新行。
 这就是为什么 `LP_UNUSED` 需要最严格的前置条件。
-## 4. HOT chain 如何形成
+
+## 5. HOT chain 如何形成
+
 HOT 的核心目标是减少 index entry。
 如果 UPDATE 不改变任何 HOT-blocking index 相关列，并且新 tuple 能放在同一个 heap page，就可以 HOT update。
 普通 index 继续指向 root TID。
 新版本作为 heap-only tuple 插在同页。
 旧版本的 `t_ctid` 指向新版本。
 `README.HOT` 给的基本图是：
+
 ```text
 index -> lp 1
 lp[1] normal tuple, HEAP_HOT_UPDATED, t_ctid -> lp[2]
 lp[2] normal tuple, HEAP_ONLY_TUPLE
 ```
+
 `heap_update()` 里对应的关键判断在 `heapam.c:3976` 附近。
 如果 `newbuf == buffer`，说明新 tuple 放在旧页。
 如果 `modified_attrs` 不和 `hot_attrs` 重叠，就设置 `use_hot_update = true`。
@@ -250,7 +248,9 @@ root 不能在 index entry 删除前变成 `LP_UNUSED`。
 heap-only tuple 的 offset 没有普通 index entry 直接指向。
 因此一旦它在 chain 中被证明可移除，pruning 可以把它设成 `LP_UNUSED`。
 这就是 root 和 heap-only successor 在空间回收上的不对称。
-## 5. index scan 如何读取被压缩的 HOT chain
+
+## 6. index scan 如何读取被压缩的 HOT chain
+
 理解 pruning 前，先看消费者。
 如果 index scan 不能正确读取 redirect/dead 状态，pruning 就没有意义。
 入口在 `heapam_indexscan.c`。
@@ -278,7 +278,9 @@ heap-only tuple 的 offset 没有普通 index entry 直接指向。
 pruning 可以释放 heap-only tuple 的 line pointer。
 读路径必须准备好遇到空 slot、dead slot 或 unrelated tuple。
 系统安全来自双方共同遵守协议。
-## 6. on-access pruning 的触发条件
+
+## 7. on-access pruning 的触发条件
+
 普通 SELECT/UPDATE/DELETE 访问 heap page 时可能触发 on-access pruning。
 入口是 `heap_page_prune_opt()`。
 它是 opportunistic 函数。
@@ -321,7 +323,9 @@ on-access pruning 不传 `HEAP_PAGE_PRUNE_MARK_UNUSED_NOW`。
 它避免把 unrelated UPDATE/INSERT 产生的 free space 立刻报告给 FSM。
 这样新释放的空间更倾向被同一 page 的 UPDATE 复用。
 这也是 HOT locality 的一部分。
-## 7. 主流程：`heap_page_prune_and_freeze()`
+
+## 8. 主流程：`heap_page_prune_and_freeze()`
+
 `heap_page_prune_and_freeze()` 是 pruning、freezing、VM update 的共享实现。
 本节只关注 pruning 相关部分。
 调用者必须持有 heap buffer pin 和 cleanup lock。
@@ -390,7 +394,9 @@ pruning 规划必须基于一次一致的 per-tuple classification。
 这主要处理 aborted HOT update 产生的孤儿 heap-only tuple。
 如果 dead heap-only tuple 仍然显示自己 hot-updated，却没有被任何 chain 链到，源码选择报错。
 因为继续删除可能隐藏 page 结构损坏。
-## 8. HOT chain pruning 如何压缩 chain
+
+## 9. HOT chain pruning 如何压缩 chain
+
 核心决策在 `heap_prune_chain()`。
 它从 root offset 开始。
 root 可能是 `LP_NORMAL`。
@@ -433,31 +439,37 @@ dead prefix 中的 heap-only tuple 变 `LP_UNUSED`。
 后面的 normal tuple 保持不变。
 这就是 HOT chain 压缩。
 压缩前：
+
 ```text
 index -> lp[1]
 lp[1] normal old root, HOT-updated, dead
 lp[2] normal heap-only, dead
 lp[3] normal heap-only, live or recently dead
 ```
+
 压缩后：
+
 ```text
 index -> lp[1]
 lp[1] redirect -> lp[3]
 lp[2] unused
 lp[3] normal heap-only, live or recently dead
 ```
+
 注意 `lp[3]` 仍然是 heap-only tuple。
 它没有自己的普通 index entry。
 但 index scan 先从 `lp[1]` 进入，再通过 redirect 到 `lp[3]`。
 这就是为什么 redirect target 必须是 heap-only tuple。
 `heap_page_prune_execute()` 的 assertion 也检查了这一点。
 如果整条 chain 都 dead：
+
 ```text
 index -> lp[1]
 lp[1] dead
 lp[2] unused
 lp[3] unused
 ```
+
 此时 index entry 仍可能指向 `lp[1]`。
 所以 `lp[1]` 是 `LP_DEAD`，不是 `LP_UNUSED`。
 VACUUM index pass 删除 index entry 后，heap pass 才能把 `lp[1]` 改成 `LP_UNUSED`。
@@ -465,7 +477,9 @@ VACUUM index pass 删除 index entry 后，heap pass 才能把 `lp[1]` 改成 `L
 这时 would-be `LP_DEAD` 可以直接 `LP_UNUSED`。
 因为没有 index entry 需要保留 root TID。
 这是重要的边界例外。
-## 9. `LP_REDIRECT`、`LP_DEAD`、`LP_UNUSED` 的精确边界
+
+## 10. `LP_REDIRECT`、`LP_DEAD`、`LP_UNUSED` 的精确边界
+
 `LP_REDIRECT` 的含义是：
 这个 offset number 仍然是外部 TID 入口。
 它已经没有 tuple storage。
@@ -502,12 +516,15 @@ tuple bytes 的洞要靠 `PageRepairFragmentation()` compact 后才变成 `pd_lo
 所以“有没有 tuple bytes”不是判断能否复用的标准。
 能否复用要看是否还有外部引用和协议阶段。
 边界总结：
+
 ```text
 LP_REDIRECT: root TID still needed; chain still has reachable successor.
 LP_DEAD: root/simple TID may still exist in indexes; tuple logically removable.
 LP_UNUSED: no remaining external TID obligation; slot can be reused.
 ```
-## 10. 为什么不能破坏 index TID
+
+## 11. 为什么不能破坏 index TID
+
 普通 btree index tuple 里存 heap TID。
 这个 heap TID 是 `(heap block, line pointer offset)`。
 index AM 并不知道 heap tuple bytes 被移动到哪里。
@@ -537,7 +554,9 @@ VACUUM 时批量清理 index。
 这正是 line pointer bloat 的来源之一。
 PostgreSQL 用 `MaxHeapTuplesPerPage` 限制最坏情况。
 `PageGetHeapFreeSpace()` 在 line pointer 数达到上限且没有 free line 时返回 0。
-## 11. visibility horizon：什么时候算可移除
+
+## 12. visibility horizon：什么时候算可移除
+
 pruning 不是按当前查询 snapshot 判断。
 它要判断 tuple 是否还可能被任何相关事务看到。
 这就是 vacuum-style visibility。
@@ -575,7 +594,9 @@ long transaction 会拖住 horizon。
 standby query 也要考虑。
 WAL replay 物理移除 tuple 时，如果 standby 上有 query 还可能看到这些 tuple，recovery 需要冲突处理。
 这就是 WAL record 中 snapshot conflict horizon 的来源。
-## 12. cleanup lock：为什么普通 exclusive lock 不够
+
+## 13. cleanup lock：为什么普通 exclusive lock 不够
+
 pruning 会移动 tuple bytes。
 它也会把 line pointer 改成 redirect/dead/unused。
 其它 backend 可能持有 buffer pin，并且有指向 page 内 tuple bytes 的 `HeapTuple` 指针。
@@ -605,7 +626,9 @@ aggressive VACUUM：必要时等待。
 redo：如果 WAL record 要移动 tuple 或处理 redirect/dead，按 record flag 获取 cleanup lock。
 这些差异来自同一个不变量：
 移动 tuple bytes 或改变外部 TID 语义时，必须排除并发 pin 引用。
-## 13. 执行阶段：从 plan arrays 到 page change
+
+## 14. 执行阶段：从 plan arrays 到 page change
+
 `heap_page_prune_and_freeze()` 规划完成后，会决定三个布尔值。
 `do_prune` 表示有 redirect/dead/unused 变化。
 `do_hint_prune` 表示只需要更新 `pd_prune_xid` 或清 `PD_PAGE_FULL`。
@@ -647,7 +670,9 @@ to 必须是 normal tuple，且 tuple header 是 heap-only。
 如果只是 `ItemIdSetUnused()` 而不 compact，页面中间只是洞。
 新 tuple 通常不能直接利用那些碎片。
 因此 pruning 和 defragmentation 通常一起出现。
-## 14. WAL：pruning 不是无日志内存整理
+
+## 15. WAL：pruning 不是无日志内存整理
+
 pruning 改的是 heap page 物理内容。
 它可能改变 line pointer 状态。
 它可能移动 tuple bytes。
@@ -698,7 +723,9 @@ WAL 还处理 full-page image。
 只要真的改 page physical layout，就必须遵守 WAL-before-data。
 如果只有 `pd_prune_xid` 或 `PD_PAGE_FULL` hint 更新，且没有 prune/freeze/VM change，可以走 `MarkBufferDirtyHint()`。
 这类 hint 不构成本节的空间回收主体。
-## 15. VACUUM 的两阶段边界
+
+## 16. VACUUM 的两阶段边界
+
 VACUUM 不只是调用 pruning。
 它还负责最终清理 index entry。
 `lazy_scan_prune()` 在第一轮 heap pass 中调用 `heap_page_prune_and_freeze()`。
@@ -722,7 +749,9 @@ VACUUM 不只是调用 pruning。
 它可能是正常的两阶段中间状态。
 如果 VACUUM 被取消、failsafe 跳过 index cleanup、或者 cleanup lock 拿不到，`LP_DEAD` 可能延后存在。
 下次 VACUUM 再收尾。
-## 16. 错误路径、异常路径与 fallback
+
+## 17. 错误路径、异常路径与 fallback
+
 第一类 fallback 是 on-access pruning 拿不到 cleanup lock。
 `heap_page_prune_opt()` 直接返回。
 前台查询继续走正常 visibility。
@@ -764,7 +793,9 @@ standby replay 需要移除 tuple 时，如果 standby query 仍可能看到它�
 VACUUM 为避免 wraparound failure，可能绕过非必要 index vacuuming、index cleanup 和 heap truncation。
 这会让某些 `LP_DEAD` 或 dead items 延后清理。
 但它优先保证 anti-wraparound 安全。
-## 17. 成本、资源与跨模块传播
+
+## 18. 成本、资源与跨模块传播
+
 pruning 的 CPU 成本随 page 上 line pointer 数增长。
 `prune_freeze_plan()` 要扫描每个 line pointer。
 对 `LP_NORMAL` tuple 要做 visibility classification。
@@ -797,7 +828,9 @@ visibility horizon 是跨模块传播点。
 最终表现为 heap bloat、HOT chain 变长、VACUUM 不能清理。
 这不一定是 heapam 本身性能问题。
 它可能是 workload 和事务生命周期问题。
-## 18. 可观测入口：能看到什么，不能看到什么
+
+## 19. 可观测入口：能看到什么，不能看到什么
+
 `pageinspect` 能看到 page 当前物理状态。
 `heap_page_items(get_raw_page(...))` 能看到 `lp`、`lp_off`、`lp_flags`、`lp_len`、`t_xmin`、`t_xmax`、`t_ctid`、`t_infomask`、`t_infomask2`。
 `heap_tuple_infomask_flags()` 能把 `HEAP_HOT_UPDATED`、`HEAP_ONLY_TUPLE` 等 flag 解码。
@@ -834,13 +867,16 @@ cleanup lock contention 可能表现为 dead tuples missed。
 `redirected[]`。
 `nowdead[]`。
 `nowunused[]`。
-## 19. 课堂实验一：观察 HOT chain 变成 `LP_REDIRECT`
+
+## 20. 课堂实验一：观察 HOT chain 变成 `LP_REDIRECT`
+
 这个实验目标是看到：
 HOT update 后，index entry 仍指向 root TID。
 on-access pruning 后，root line pointer 变 `LP_REDIRECT`。
 中间 heap-only tuple 变 `LP_UNUSED`。
 最新版本仍然是 `LP_NORMAL` + `HEAP_ONLY_TUPLE`。
 准备：
+
 ```sql
 CREATE EXTENSION IF NOT EXISTS pageinspect;
 DROP TABLE IF EXISTS hp_hot;
@@ -851,9 +887,11 @@ CREATE TABLE hp_hot (
 ) WITH (fillfactor = 70, autovacuum_enabled = off);
 INSERT INTO hp_hot VALUES (1, 0, repeat('x', 1000));
 ```
+
 执行多次 HOT-safe update。
 `id` 是索引列，不改。
 `v` 和 `pad` 没有普通 index。
+
 ```sql
 DO $$
 BEGIN
@@ -862,7 +900,9 @@ BEGIN
   END LOOP;
 END $$;
 ```
+
 先看 page 原始状态：
+
 ```sql
 SELECT lp, lp_flags, lp_off, lp_len, t_ctid, t_xmin, t_xmax,
        raw_flags, combined_flags
@@ -871,18 +911,22 @@ LEFT JOIN LATERAL heap_tuple_infomask_flags(h.t_infomask, h.t_infomask2) f
        ON h.lp_flags = 1
 ORDER BY lp;
 ```
+
 你通常会看到多个 `LP_NORMAL`。
 旧版本带 `HEAP_HOT_UPDATED`。
 新版本带 `HEAP_ONLY_TUPLE`。
 某些环境下，读取 page 前可能已经触发过 pruning。
 这是正常的 timing-dependent 现象。
 强制走 index fetch 并触发 on-access pruning：
+
 ```sql
 SET enable_seqscan = off;
 SELECT * FROM hp_hot WHERE id = 1;
 RESET enable_seqscan;
 ```
+
 再次查看：
+
 ```sql
 SELECT lp, lp_flags, lp_off, lp_len, t_ctid,
        raw_flags, combined_flags
@@ -891,6 +935,7 @@ LEFT JOIN LATERAL heap_tuple_infomask_flags(h.t_infomask, h.t_infomask2) f
        ON h.lp_flags = 1
 ORDER BY lp;
 ```
+
 期望观察：
 `lp_flags = 2` 的行表示 `LP_REDIRECT`。
 这一行的 `lp_off` 是 redirect target offset，不是 tuple byte offset。
@@ -903,26 +948,33 @@ ORDER BY lp;
 第二，有长事务拖住 horizon。
 第三，更新没有形成同页 HOT chain。
 可以增加 update 次数，或检查 `n_tup_hot_upd`：
+
 ```sql
 SELECT n_tup_upd, n_tup_hot_upd, n_dead_tup
 FROM pg_stat_all_tables
 WHERE relname = 'hp_hot';
 ```
+
 把现象回到源码：
 `heap_update()` 设置 `HEAP_HOT_UPDATED` / `HEAP_ONLY_TUPLE`。
 `heapam_index_fetch_tuple()` 调 `heap_page_prune_opt()`。
 `heap_prune_chain()` 把 dead prefix 压缩成 redirect。
 `heap_page_prune_execute()` 调 `ItemIdSetRedirect()` 和 `ItemIdSetUnused()`。
 `PageRepairFragmentation()` 合并 tuple bytes 空洞。
-## 20. 课堂实验二：长事务如何阻止 pruning
+
+## 21. 课堂实验二：长事务如何阻止 pruning
+
 这个实验目标是看到 visibility horizon 不是当前 session 的可见性。
 Session A：
+
 ```sql
 BEGIN;
 SELECT * FROM hp_hot WHERE id = 1;
 ```
+
 保持事务不提交。
 Session B：
+
 ```sql
 DO $$
 BEGIN
@@ -934,41 +986,53 @@ SET enable_seqscan = off;
 SELECT * FROM hp_hot WHERE id = 1;
 RESET enable_seqscan;
 ```
+
 Session B 查看 page：
+
 ```sql
 SELECT lp, lp_flags, lp_off, lp_len, t_ctid
 FROM heap_page_items(get_raw_page('hp_hot', 0))
 ORDER BY lp;
 ```
+
 你可能看到旧 tuple 仍然保留为 `LP_NORMAL`。
 因为 Session A 的 snapshot 可能还需要旧版本。
 Session B 当前查询看不到这些旧版本，不代表系统能物理移除它们。
 查看 horizon 线索：
+
 ```sql
 SELECT pid, state, xact_start, backend_xmin, query
 FROM pg_stat_activity
 WHERE backend_xmin IS NOT NULL
 ORDER BY xact_start;
 ```
+
 提交 Session A：
+
 ```sql
 COMMIT;
 ```
+
 Session B 再触发一次访问或 VACUUM：
+
 ```sql
 SET enable_seqscan = off;
 SELECT * FROM hp_hot WHERE id = 1;
 RESET enable_seqscan;
 ```
+
 再查看 page。
 旧版本更可能被 redirect/unused 压缩。
 把现象回到源码：
 `HeapTupleSatisfiesVacuumHorizon()` 先给出 `RECENTLY_DEAD`。
 `heap_prune_satisfies_vacuum()` 用 `GlobalVisTestIsRemovableXid()` 判断是否能升级为 `DEAD`。
 长事务让 `GlobalVisState` 不能越过旧 XID。
-## 21. 课堂实验三：观察 `LP_DEAD` 与 VACUUM 收尾
+
+## 22. 课堂实验三：观察 `LP_DEAD` 与 VACUUM 收尾
+
 这个实验目标是理解 `LP_DEAD` 是 index cleanup 前的协议状态。
 准备一张有 index 的表：
+
 ```sql
 DROP TABLE IF EXISTS hp_dead;
 CREATE TABLE hp_dead (
@@ -980,31 +1044,40 @@ SELECT g, repeat('x', 500)
 FROM generate_series(1, 20) g;
 DELETE FROM hp_dead WHERE id = 10;
 ```
+
 让 page 有 prune 机会：
+
 ```sql
 SET enable_seqscan = off;
 SELECT * FROM hp_dead WHERE id = 1;
 RESET enable_seqscan;
 ```
+
 观察 page：
+
 ```sql
 SELECT lp, lp_flags, lp_off, lp_len, t_ctid
 FROM heap_page_items(get_raw_page('hp_dead', 0))
 ORDER BY lp;
 ```
+
 如果看到 `lp_flags = 3`，就是 `LP_DEAD`。
 这表示 heap tuple bytes 可以没有了。
 但 index entry 可能还没删，所以 slot 不能复用。
 执行 VACUUM：
+
 ```sql
 VACUUM hp_dead;
 ```
+
 再观察：
+
 ```sql
 SELECT lp, lp_flags, lp_off, lp_len
 FROM heap_page_items(get_raw_page('hp_dead', 0))
 ORDER BY lp;
 ```
+
 VACUUM 可能把 `LP_DEAD` 变成 `LP_UNUSED`。
 如果这个 offset 在 line pointer array 尾部，还可能被 `PageTruncateLinePointerArray()` 收缩掉。
 这个实验具有 timing 依赖。
@@ -1014,9 +1087,12 @@ VACUUM 可能把 `LP_DEAD` 变成 `LP_UNUSED`。
 它只是没抓到中间态。
 想稳定观察中间态，可以在源码里给 `lazy_scan_prune()`、`lazy_vacuum_heap_page()` 加临时日志或断点。
 不要把调试日志提交到课程仓库。
-## 22. 源码跟读实验
+
+## 23. 源码跟读实验
+
 用 debug build 启动 PostgreSQL。
 设置断点：
+
 ```text
 break heap_update
 break heap_page_prune_opt
@@ -1026,6 +1102,7 @@ break heap_page_prune_execute
 break PageRepairFragmentation
 break log_heap_prune_and_freeze
 ```
+
 在 `heap_update()` 里观察：
 `use_hot_update`。
 `oldtup.t_data->t_infomask2`。
@@ -1059,7 +1136,9 @@ surviving line pointer 的 `lp_off`。
 `conflict_xid`。
 是否写 FPI。
 这条实验能把 SQL 现象、line pointer 状态和 WAL record 连接起来。
-## 23. 常见误区
+
+## 24. 常见误区
+
 误区一：
 把 `LP_DEAD` 当成可复用 slot。
 正确理解是：
@@ -1098,7 +1177,9 @@ cleanup lock、horizon、failsafe、index cleanup 和 aggressive freeze 都会�
 正确理解是：
 它只是 oldest potentially prunable XID hint。
 它不计数，也不保证一定能 prune。
-## 24. 讨论题
+
+## 25. 讨论题
+
 为什么 HOT update 必须限制在同一个 heap page？
 如果 `LP_REDIRECT` 可以指向跨页 tuple，会破坏哪些边界？
 为什么 root tuple bytes 可以被删除，但 root line pointer 不能立即变 `LP_UNUSED`？
@@ -1109,7 +1190,9 @@ VACUUM 在 relation 没有 index 时为什么可以传 `HEAP_PAGE_PRUNE_MARK_UNU
 redo 为什么不能重新运行 visibility 判断来决定 pruning？
 如果 standby query 和 pruning WAL record 冲突，应该牺牲谁，为什么？
 `pageinspect` 看到 `lp_flags = 2` 时，`lp_off` 为什么不能按 byte offset 解释？
-## 25. 本节小结
+
+## 26. 本节小结
+
 本节唯一主问题是：
 旧 tuple version 什么时候能被安全剪掉，并且为什么不能破坏 index TID。
 核心链路是：

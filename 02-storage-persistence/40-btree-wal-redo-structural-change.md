@@ -1,6 +1,7 @@
 # PostgreSQL B-tree WAL 与结构变化 redo
+
 ## 课程定位
-本节主题：B-tree WAL 与结构变化 redo。
+
 上一节已经讲过 B-tree leaf deletion、deduplication 与 bottom-up cleanup。
 再上一节讲过 page split、parent insertion 与 incomplete split。
 现在把视角切到 crash recovery：
@@ -29,6 +30,7 @@ B-tree 结构变化天然跨页、跨层。
 如果把每个物理页修改都写成互不相关的小 record，crash recovery 中间状态又可能让搜索找不到 key range，或让后续写路径无法判断结构债务。
 
 PostgreSQL 的选择是：
+
 ```text
 把结构变化拆成一组可 redo 的 WAL 原子动作。
 每个原子动作完成后，B-tree 对读者保持可搜索。
@@ -48,39 +50,14 @@ PostgreSQL 的选择是：
 - 为什么 `btree_mask()` 要屏蔽部分 hint 或 recovery 不重放的差异。
 - 哪些状态可用 `pageinspect`、`pg_waldump`、日志、断点看到，哪些只能从现象推断。
 
-## 源码基线
-源码仓库：
-```text
-/home/nail/postgres-lab
-```
-
-基线：
-```text
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
-```
-
-本节重点阅读：
-```text
-src/backend/access/nbtree/nbtxlog.c
-src/backend/access/nbtree/nbtinsert.c
-src/backend/access/nbtree/nbtpage.c
-src/backend/access/nbtree/nbtdedup.c
-src/include/access/nbtxlog.h
-src/include/access/nbtree.h
-src/backend/access/nbtree/README
-```
-
-行号来自：
-```text
-nl -ba <source-file>
-```
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。行号来自 `nl -ba <source-file>`；重点源码统一放在第 3 节的阅读顺序里。
 
 本节不把 `nbtxlog.c` 写成 rmgr API 清单。
 我们只关心一个问题：
 WAL record 如何表达 B-tree 结构变化的最小 durable 状态，redo 如何把这个状态恢复成读者可接受、写者可继续推进的树。
 
 ## 1. 本节在总主线中的位置
+
 前面几节已经建立了三条线。
 第一条是 buffer/WAL 线：
 数据页先在 shared buffer 中被修改。
@@ -98,6 +75,7 @@ index tuple deletion、dedup、page deletion 和 FSM reuse 都不是事务 abort
 它们必须 crash-safe，也必须和 standby snapshot 冲突处理对齐。
 
 本节把这三条线合在一起：
+
 ```text
 前台结构变化
   -> 写出特定 B-tree WAL record
@@ -116,11 +94,13 @@ index tuple deletion、dedup、page deletion 和 FSM reuse 都不是事务 abort
 `XLOG_BTREE_REUSE_PAGE` 不改页，却承担 Hot Standby conflict point。
 
 这一节的运行模型可以压缩成一句话：
+
 ```text
 B-tree redo 重放的是“结构状态转移”，不是“前台控制流”；它依靠 high key/rightlink、durable flags、LSN gating 和后续 lazy repair，把跨页结构变化拆成多个可恢复的局部原子动作。
 ```
 
 ## 2. 核心矛盾与一句话运行模型
+
 先看一个 leaf split。
 前台 `_bt_split()` 会把原页变成左页。
 它会分配并初始化右页。
@@ -140,6 +120,7 @@ split parent 又可能继续 split grandparent。
 还可能在补 parent downlink 前遇到 ERROR、OOM、out-of-disk 或 crash。
 
 所以 split 的 durable 表达分成两类：
+
 ```text
 本层 split record：
   左页和右页已经形成 sibling pair。
@@ -161,6 +142,7 @@ deleted page 还不能马上复用。
 在 standby 上，真正复用前还要用 `XLOG_BTREE_REUSE_PAGE` 和 snapshot conflict 对齐。
 
 本节的核心矛盾是：
+
 ```text
 结构变化需要跨页完整性。
 WAL redo 只能可靠重放有限大小的原子动作。
@@ -170,6 +152,7 @@ WAL redo 只能可靠重放有限大小的原子动作。
 
 PostgreSQL 的工程答案不是追求“每时每刻 parent tree 都完美”。
 它追求的是：
+
 ```text
 每个 WAL record 结束时，读者能找到正确 key range；
 写者看到结构债务时有明确修复入口；
@@ -183,7 +166,8 @@ B-tree 结构变化可以局部完成。
 合法不等于最终状态。
 `BTP_INCOMPLETE_SPLIT`、`BTP_HALF_DEAD`、`BTP_DELETED` 和 `safexid` 都是在表达这种中间但可恢复的合法状态。
 
-## 3. 核心文件分工与源码阅读顺序
+## 3. 核心文件分工与阅读顺序
+
 推荐按 redo contract 读，而不是按文件名顺序读。
 
 | 顺序 | 文件 | 读什么 | 目的 |
@@ -210,6 +194,7 @@ redo 不需要重建前台的所有锁耦合。
 但 redo 仍然保守地维护同层锁顺序，避免读者观察到 sibling chain 的内部不一致。
 
 最短源码主线：
+
 ```text
 nbtinsert.c
   _bt_insertonpg()
@@ -229,6 +214,7 @@ nbtxlog.c
 ```
 
 page deletion 主线：
+
 ```text
 nbtpage.c
   _bt_pagedel()
@@ -249,6 +235,7 @@ nbtxlog.c
 ```
 
 dedup/posting 主线：
+
 ```text
 nbtdedup.c
   _bt_dedup_pass()
@@ -277,9 +264,11 @@ redo 为什么能幂等？
 redo 后哪个 durable state 表示“后续还要收尾”？
 
 ## 4. 关键数据结构与状态
+
 第一组状态在 page special area。
 `nbtree.h:63` 定义 `BTPageOpaqueData`。
 本节需要的字段：
+
 ```text
 btpo_prev
 btpo_next
@@ -295,6 +284,7 @@ btpo_cycleid
 `btpo_cycleid` 主要服务 VACUUM 和 split group，本节只需要知道 redo 会在某些场景把它清零或 mask。
 
 关键 flags 在 `nbtree.h:77-84`：
+
 ```text
 BTP_LEAF
 BTP_ROOT
@@ -316,6 +306,7 @@ BTP_HAS_FULLXID
 第二组状态在 metapage。
 `nbtree.h:104` 定义 `BTMetaPageData`。
 核心字段：
+
 ```text
 btm_root
 btm_level
@@ -335,6 +326,7 @@ redo 通过 `_bt_restore_meta()` 重建 metapage。
 
 第三组状态在 WAL record。
 `nbtxlog.h:27-43` 定义 op code：
+
 ```text
 XLOG_BTREE_INSERT_LEAF
 XLOG_BTREE_INSERT_UPPER
@@ -386,44 +378,55 @@ redo dedup 不是执行完整策略选择。
 deleted page 需要保留一段时间，让可能持有旧链接的 scan/search 能看到 tombstone 并继续移动。
 
 ## 5. WAL record 粒度：哪些动作是原子的
+
 `nbtxlog.h` 是理解 redo 的入口。
 先按粒度分类。
 
 单页 leaf insert：
+
 ```text
 XLOG_BTREE_INSERT_LEAF
 ```
+
 它只给 leaf page 加一个 index tuple。
 redo 用 `PageAddItem()` 把 payload 加回目标 offset。
 
 单页 leaf insert 但伴随 posting list split：
+
 ```text
 XLOG_BTREE_INSERT_POST
 ```
+
 它不是简单插入一个 tuple。
 它还要在同一页原地替换 old posting tuple。
 redo 需要先读取现有 posting tuple，再用 WAL 中的原始 newitem 和 `postingoff` 调 `_bt_swap_posting()`，得到 replacement posting tuple 和最终 newitem。
 
 internal page insert：
+
 ```text
 XLOG_BTREE_INSERT_UPPER
 ```
+
 它不仅在 parent/internal page 插入 downlink。
 它还清 child left page 的 `BTP_INCOMPLETE_SPLIT`。
 这是 parent downlink insert 的结构原子性。
 
 internal page insert 同时更新 metapage fast root：
+
 ```text
 XLOG_BTREE_INSERT_META
 ```
+
 它覆盖 `INSERT_UPPER` 的语义，并且用 `xl_btree_metadata` 重建 metapage。
 这个场景来自非 root、但该 level 原来只有一个 page 的 split。
 
 本层 page split：
+
 ```text
 XLOG_BTREE_SPLIT_L
 XLOG_BTREE_SPLIT_R
 ```
+
 两者共享 `xl_btree_split`。
 差异是 incoming newitem 最终在左页还是右页。
 split record 的原子性是：
@@ -434,60 +437,75 @@ split record 的原子性是：
 但它不插入当前右页的 parent downlink。
 
 新 root：
+
 ```text
 XLOG_BTREE_NEWROOT
 ```
+
 它建立 root page，清 left child incomplete split，并重建 metapage。
 它是 root split 的第二阶段。
 
 dedup：
+
 ```text
 XLOG_BTREE_DEDUP
 ```
+
 它把 leaf page 上连续 duplicate tuple 合并成 posting list。
 它记录 interval 数组，而不是记录整页所有 tuple。
 redo 重新走 `_bt_dedup_start_pending()`、`_bt_dedup_save_htid()`、`_bt_dedup_finish_pending()` 的构造逻辑。
 
 leaf tuple deletion：
+
 ```text
 XLOG_BTREE_VACUUM
 XLOG_BTREE_DELETE
 ```
+
 两者都表达删除 leaf index tuple 或更新 posting tuple。
 `DELETE` 带 standby snapshot conflict horizon。
 `VACUUM` 不需要单独带这个字段，因为 heap pruning/VACUUM 相关冲突已经在别处处理。
 
 page deletion 第一阶段：
+
 ```text
 XLOG_BTREE_MARK_PAGE_HALFDEAD
 ```
+
 它改 parent page 的 downlink/key arrangement，并把 empty leaf 重写成 half-dead leaf。
 
 page deletion 第二阶段：
+
 ```text
 XLOG_BTREE_UNLINK_PAGE
 XLOG_BTREE_UNLINK_PAGE_META
 ```
+
 它改左右 sibling links，把 target 重写成 deleted tombstone。
 如果 fast root 改变，还包含 metapage 重建。
 
 page reuse conflict point：
+
 ```text
 XLOG_BTREE_REUSE_PAGE
 ```
+
 这条 record 不注册 buffer。
 它只在 Hot Standby 中调用 `ResolveRecoveryConflictWithSnapshotFullXid()`。
 它的存在说明 WAL 不只是“把页改回来”。
 WAL 还负责把 primary 上的可见性边界传播到 standby。
 
 metapage cleanup：
+
 ```text
 XLOG_BTREE_META_CLEANUP
 ```
+
 它更新 cleanup 相关 metapage 字段。
 redo 仍然用 `_bt_restore_meta()` 重建 metapage image。
 
 ## 6. 主流程 walkthrough：一次 split 的 redo
+
 先从前台写 WAL 的位置看。
 `_bt_insertonpg()` 在 `nbtinsert.c:1119`。
 它先判断目标页是否需要 split。
@@ -498,6 +516,7 @@ redo 仍然用 `_bt_restore_meta()` 重建 metapage image。
 前台 `_bt_split()` 在 `nbtinsert.c:1582` 给 left page 设置 `BTP_INCOMPLETE_SPLIT`。
 在 `nbtinsert.c:2011-2083` 组装 `xl_btree_split` 和 block data。
 核心 payload 是：
+
 ```text
 xlrec.level
 xlrec.firstrightoff
@@ -523,6 +542,7 @@ redo 入口是 `btree_redo()`。
 然后 redo 重建新右页。
 `XLogInitBufferForRedo(record, 1)` 初始化 block 1。
 redo 设置 right page opaque：
+
 ```text
 btpo_prev = origpagenumber
 btpo_next = spagenumber
@@ -530,6 +550,7 @@ btpo_level = xlrec->level
 btpo_flags = BTP_LEAF 或 0
 btpo_cycleid = 0
 ```
+
 然后 `_bt_restore_page()` 把 block data 中的 tuple bytes 按 item-number order 还原。
 `_bt_restore_page()` 在 `nbtxlog.c:36`。
 它先扫描 tuple size，再反向 `PageAddItem()`。
@@ -552,12 +573,14 @@ redo 从旧页取 old posting tuple。
 这样 redo 生成的左页物理布局与前台一致。
 
 最后 redo 修 left opaque：
+
 ```text
 btpo_flags = BTP_INCOMPLETE_SPLIT
 if leaf: add BTP_LEAF
 btpo_next = rightpagenumber
 btpo_cycleid = 0
 ```
+
 注意 redo 不设置 `BTP_SPLIT_END`。
 `btree_mask()` 后面也会 mask 掉 `BTP_SPLIT_END` 和 `btpo_cycleid`，因为 recovery 里不完全重现这些 VACUUM optimization 细节。
 
@@ -567,6 +590,7 @@ btpo_cycleid = 0
 README 说 redo 对同层锁仍然偏保守，避免 recovery 中读者看到同层链接不一致。
 
 split redo 结束后，树可能处于这个状态：
+
 ```text
 parent 没有指向 rightpagenumber 的 downlink
 left page 的 rightlink 指向 rightpagenumber
@@ -574,10 +598,12 @@ left page 带 BTP_INCOMPLETE_SPLIT
 right page 已经包含正确 key range
 search 可通过 left high key 发现应向右移动
 ```
+
 这不是损坏。
 这是合法的持久中间态。
 
 ## 7. 主流程 walkthrough：parent insertion 和 newroot redo
+
 split 的第二阶段来自 `_bt_insert_parent()`。
 `_bt_insert_parent()` 在 `nbtinsert.c:2130`。
 它拿 left page 的 high key，复制成 parent 中的新 pivot tuple，并把 downlink 改成 right page block number。
@@ -635,6 +661,7 @@ redo 只恢复这个 fact。
 redo 只需要 record 中的 block refs 和 payload。
 
 ## 8. 主流程 walkthrough：dedup 和 posting list redo
+
 dedup 是页内物理表示变化。
 它不改变 logical index contents。
 多个相邻 duplicate tuple 合并成一个 posting list tuple。
@@ -643,10 +670,12 @@ dedup 是页内物理表示变化。
 前台 `_bt_dedup_pass()` 在 `nbtdedup.c:59`。
 它扫描 leaf page，构造 `BTDedupStateData`。
 每个 candidate group 用 `BTDedupInterval` 表达：
+
 ```text
 baseoff
 nitems
 ```
+
 如果没有可 dedup 的 interval，函数直接返回，不写 WAL。
 如果有，它在 critical section 里 `PageRestoreTempPage(newpage, page)`，然后写 `XLOG_BTREE_DEDUP`。
 `nbtdedup.c:265` 是 `XLogInsert(RM_BTREE_ID, XLOG_BTREE_DEDUP)`。
@@ -673,12 +702,15 @@ posting list split 是另一个物理重写点。
 核心函数是 `_bt_swap_posting()`。
 它在 `nbtdedup.c:1022`。
 输入：
+
 ```text
 newitem    caller 的 mutable copy
 oposting   page 上原 posting list tuple
 postingoff posting list 内部 split offset
 ```
+
 输出：
+
 ```text
 nposting   replacement posting tuple
 newitem    被原地修改为最终要插入的 item
@@ -710,6 +742,7 @@ WAL record 不一定记录“发生了什么算法事件”。
 这两个集合经常不同。
 
 ## 9. 主流程 walkthrough：page deletion redo
+
 page deletion 的 redo 分两阶段。
 这和 split 分两阶段是同一类工程选择：
 不能把删除 parent downlink、更新 sibling chain、删除可能的 internal chain、更新 fast root、FSM reuse 都做成一个巨大原子动作。
@@ -727,6 +760,7 @@ leaf high key 被改成 dummy tuple，用 `BTreeTupleSetTopParent()` 保存 top 
 WAL record 的 block 0 是 leaf。
 block 1 是 subtree parent。
 payload 包含：
+
 ```text
 poffset
 leafblk
@@ -745,6 +779,7 @@ redo 先修改 parent page。
 
 然后 redo 用 `XLogInitBufferForRedo(record, 0)` 重写 leaf page。
 它 `_bt_pageinit()` 后设置：
+
 ```text
 btpo_prev = xlrec->leftblk
 btpo_next = xlrec->rightblk
@@ -752,6 +787,7 @@ btpo_level = 0
 btpo_flags = BTP_HALF_DEAD | BTP_LEAF
 btpo_cycleid = 0
 ```
+
 再构造 dummy high key，把 top parent 写进去。
 这一阶段完成后，leaf 没有 parent downlink，但仍在 sibling chain 中。
 search 到达它时会 ignore/move right。
@@ -793,13 +829,16 @@ redo 在 `btree_xlog_reuse_page()` 中只处理 conflict。
 如果 standby 上仍有 snapshot 可能看到旧结构，`ResolveRecoveryConflictWithSnapshotFullXid()` 会让冲突查询退出或等待配置策略生效。
 
 ## 10. `btree_redo()` 的执行模型
+
 `btree_redo()` 在 `nbtxlog.c:1004`。
 它做三件事。
 
 第一，取 record info。
+
 ```text
 info = XLogRecGetInfo(record) & ~XLR_INFO_MASK
 ```
+
 然后 switch 到对应 `btree_xlog_*()`。
 未知 op code 直接 `PANIC`。
 redo 不能“尽量跳过未知 record”。
@@ -815,6 +854,7 @@ redo 不是事务上下文。
 
 第三，各 redo routine 自己负责 buffer 获取、page LSN、dirty 标记、unlock/release。
 典型 pattern：
+
 ```text
 if (XLogReadBufferForRedo(record, block_id, &buf) == BLK_NEEDS_REDO)
 {
@@ -840,6 +880,7 @@ B-tree redo 的工作是恢复 index access method 的物理导航结构。
 这也是为什么 leaf insert、dedup、page deletion redo 只关心 page bytes 和结构 flags。
 
 ## 11. 生命周期 / ownership / cleanup
+
 前台 split 的 ownership：
 `_bt_insertonpg()` 进入时持有目标 page 的 pin 和 write lock。
 如果需要 split，`_bt_split()` 分配 `rbuf`。
@@ -890,6 +931,7 @@ ERROR/abort 兜底：
 后续 `_bt_finish_split()` 会修。
 
 ## 12. 正确性机制层次
+
 第一层是 WAL-before-data。
 前台修改持久页前写 WAL。
 redo 用 page LSN 判断是否需要重放。
@@ -930,6 +972,7 @@ primary 上 deleted page 可复用时，standby 上可能还有旧 snapshot。
 WAL consistency checking 要比较的是 contract 内的持久语义，不是所有 bit。
 
 ## 13. 错误路径 / 异常路径 / fallback
+
 异常路径一：split 写完，parent insertion 失败。
 这可能来自 crash、OOM、磁盘空间不足或 recoverable ERROR。
 恢复后 left page 带 `BTP_INCOMPLETE_SPLIT`。
@@ -985,6 +1028,7 @@ correctness 不依赖这块 local memory。
 它们是 WAL replay 把 primary cleanup/reuse 边界传播给 standby 查询的异常处理。
 
 ## 14. 成本、资源与跨模块传播
+
 WAL 体积成本：
 split record 有意完整记录右页 tuple bytes。
 这样通常比让 XLogInsert 把新右页当成整页 FPI 更省。
@@ -1041,6 +1085,7 @@ posting list 大小受 `maxpostingsize` 控制。
 当前实现选择 lazy dedup 和受限 posting size，是为了控制 hot path 和 redo 复杂度。
 
 ## 15. 观测与诊断入口
+
 能直接观测的状态：
 `pageinspect` 的 `bt_page_stats()` 可以看 page type、live/dead items、free size、btpo flags 的部分表达。
 `bt_page_items()` 可以看 leaf/internal item。
@@ -1069,6 +1114,7 @@ autovacuum verbose log 可以看到 cleanup 频率和 dead tuple 处理。
 
 能通过断点看的状态：
 在开发环境中可以对这些函数打断点：
+
 ```text
 btree_redo
 btree_xlog_split
@@ -1079,7 +1125,9 @@ btree_xlog_unlink_page
 btree_xlog_reuse_page
 _bt_swap_posting
 ```
+
 在前台路径可以断：
+
 ```text
 _bt_split
 _bt_insert_parent
@@ -1109,6 +1157,7 @@ dedup、delete、vacuum、newroot、metapage cleanup 都会产生 B-tree WAL。
 更常见原因是 workload version churn、old snapshot、VACUUM 延迟、dedup 不适用或 fillfactor/index key shape。
 
 ## 16. 常见误区
+
 误区一：
 把 redo 理解成重新执行 `_bt_doinsert()`。
 redo 没有 executor state、BTStack、snapshot、uniqueness wait，也不重新搜索 parent。
@@ -1158,10 +1207,12 @@ FSM reuse 是延迟优化。
 这可以跨 VACUUM 周期发生。
 
 ## 17. 课堂实验一：观察 split、parent insert 与 newroot WAL
+
 目标：
 用小表制造 B-tree split，观察 `pg_waldump` 里的 Btree record 顺序。
 
 步骤：
+
 ```sql
 CREATE EXTENSION IF NOT EXISTS pageinspect;
 CREATE TABLE bt_wal_split_demo(id int primary key, pad text);
@@ -1177,6 +1228,7 @@ SELECT pg_current_wal_lsn() AS lsn_after;
 ```
 
 然后用 `pg_waldump`：
+
 ```bash
 pg_waldump --rmgr=Btree --start=<lsn_before> --end=<lsn_after> $PGDATA/pg_wal
 ```
@@ -1194,6 +1246,7 @@ pg_waldump --rmgr=Btree --start=<lsn_before> --end=<lsn_after> $PGDATA/pg_wal
 redo 中分别进入 `btree_xlog_split()`、`btree_xlog_insert()`、`btree_xlog_newroot()`。
 
 ## 18. 课堂实验二：源码断点跟踪 redo contract
+
 目标：
 在开发环境里验证 redo 不走前台算法。
 
@@ -1204,6 +1257,7 @@ redo 中分别进入 `btree_xlog_split()`、`btree_xlog_insert()`、`btree_xlog_
 重启时 attach startup process。
 
 建议断点：
+
 ```text
 btree_redo
 btree_xlog_split
@@ -1231,6 +1285,7 @@ redo 的输入是 WAL record 和 block refs。
 这就是为什么 `xl_btree_*` record 必须携带足够重建目标 page state 的信息。
 
 ## 19. 讨论题
+
 1. 为什么 `XLOG_BTREE_SPLIT_L/R` 不直接插入 parent downlink？
 2. 为什么 `BTP_INCOMPLETE_SPLIT` 标在左页，而不是缺 downlink 的右页？
 3. redo 中不重现前台跨层 lock coupling，为什么仍然正确？它依赖哪些前提？
@@ -1241,10 +1296,12 @@ redo 的输入是 WAL record 和 block refs。
 8. 如果 `pg_waldump` 看到大量 Btree split record，你还需要哪些信息才能判断根因是 workload、VACUUM 延迟、fillfactor、checkpoint/FPI，还是实现问题？
 
 ## 20. 本节小结
+
 本节唯一主问题是：
 B-tree 跨页、跨层结构变化如何拆成可 redo 的 WAL 原子动作，同时保持搜索正确和后续可修复。
 
 核心链路是：
+
 ```text
 前台结构变化生成 XLOG_BTREE_* record
   -> crash 后 btree_redo() dispatch

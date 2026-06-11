@@ -1,6 +1,7 @@
 # PostgreSQL Index scan、bitmap scan 与 recheck
+
 ## 课程定位
-本节主题：Index scan、Index-only scan、Bitmap index/heap scan 与 recheck。
+
 前置知识：
 - 已理解 heap tuple version、HOT chain 和 MVCC snapshot。
 - 已理解 buffer pin 与 buffer content lock 的区别。
@@ -32,41 +33,11 @@ bitmap scan 可以把大量 TID 压缩成 page-level lossy 表示，但必须把
 - 为什么 bitmap index scan 不走普通 `ExecProcNode` tuple-at-a-time convention。
 - 为什么 `work_mem` 变化会改变 bitmap exact/lossy 形态，而不是改变逻辑查询结果。
 - 为什么 recheck 是 correctness boundary，不是优化器的可选装饰。
-## 源码基线
-源码仓库：
-```text
-/home/nail/postgres-lab
-```
-基线：
-```text
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
-```
-本节重点阅读：
-```text
-src/backend/executor/nodeIndexscan.c
-src/backend/executor/nodeIndexonlyscan.c
-src/backend/executor/nodeBitmapIndexscan.c
-src/backend/executor/nodeBitmapHeapscan.c
-src/backend/access/index/indexam.c
-src/backend/access/heap/heapam_handler.c
-src/backend/access/heap/visibilitymap.c
-```
-辅助阅读：
-```text
-src/include/nodes/execnodes.h
-src/include/access/relscan.h
-src/include/access/tableam.h
-src/include/access/heapam.h
-src/include/nodes/tidbitmap.h
-src/backend/nodes/tidbitmap.c
-src/backend/access/heap/heapam_indexscan.c
-src/backend/commands/explain.c
-src/include/executor/instrument_node.h
-```
-辅助文件不是本节主角。
-它们只用于解释 executor 状态、table AM 边界、TIDBitmap exact/lossy 表示和 EXPLAIN 观测入口。
+
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。重点源码和辅助阅读统一放在第 3 节的阅读顺序里。
+
 ## 1. 本节在总主线中的位置
+
 前面几节已经从 heap tuple version、HOT、B-tree search 和 index tuple cleanup 讲到存储层如何产生 TID。
 现在进入 executor 读路径。
 读路径面对的问题不是“索引能不能找到一个 key”。
@@ -74,17 +45,23 @@ src/include/executor/instrument_node.h
 索引找到的 TID 只是候选事实。
 候选事实必须被 heap snapshot、HOT chain 和 executor qual 重新解释。
 普通 index scan 的对象是：
+
 ```text
 index entry -> heap TID -> heap visible tuple -> optional index qual recheck -> scan qual/filter
 ```
+
 Index-only scan 的对象是：
+
 ```text
 index entry -> heap TID -> VM all-visible? -> optional heap visibility fetch -> index tuple data -> optional recheck
 ```
+
 Bitmap scan 的对象是：
+
 ```text
 index entries -> TIDBitmap -> heap page iterator -> visible tuple offsets -> optional bitmap recheck -> scan qual/filter
 ```
+
 三条路径共享同一个系统规律：
 PostgreSQL 不把“位置查找”误当成“SQL 语义已经成立”。
 位置查找只减少搜索空间。
@@ -96,11 +73,15 @@ PostgreSQL 不把“位置查找”误当成“SQL 语义已经成立”。
 不完整讲 predicate locking 的全部 SSI 语义。
 这些内容会出现，但只服务一个问题：
 候选结果如何被复验、跳过、降级和观测。
+
 ## 2. 核心矛盾与一句话运行模型
+
 一句话运行模型：
+
 ```text
 index AM 产出候选 TID 或 TIDBitmap；table AM 证明 snapshot visibility；executor 在 recheck flag 为真时用原始 qual 复验候选；EXPLAIN 把被复验淘汰的 tuple 和 bitmap exact/lossy 形态暴露出来。
 ```
+
 这个模型有四个边界。
 第一个边界是 index AM。
 它知道 index key、operator class、search strategy 和 AM-specific lossy semantics。
@@ -128,7 +109,9 @@ executor 保留 `indexqualorig`、`recheckqual` 或 `bitmapqualorig`。
 所以 recheck 是跨模块合同。
 它不是单个函数内部的 if 分支。
 它连接 index AM 的“不确定候选”、table AM 的“可见 tuple”、executor 的“原始语义表达式”。
-## 3. 核心文件分工与源码阅读顺序
+
+## 3. 核心文件分工与阅读顺序
+
 推荐按运行时状态推进阅读。
 不要按文件名排序。
 第一读 `src/include/nodes/execnodes.h`。
@@ -237,7 +220,9 @@ bitmap heap scan 如何从 page-level bitmap 变成 visible tuple slot。
 `Heap Blocks: exact/lossy`。
 这一步回答：
 运行时哪些 recheck 成本能观测，哪些只能推断。
+
 ## 4. 关键数据结构与状态
+
 第一组状态是 executor node state。
 `IndexScanState` 是普通 index scan 的 backend-local 状态。
 它持有：
@@ -359,7 +344,9 @@ Plan instrumentation 的 `ntuples2` 在 index-only scan 中显示为 `Heap Fetch
 Plan instrumentation 的 `nfiltered2` 显示为 `Rows Removed by Index Recheck`。
 这些计数是观测入口。
 它们不是完整因果图。
+
 ## 5. 主流程 walkthrough：普通 Index Scan
+
 普通 index scan 从 `ExecInitIndexScan()` 创建 executor 状态。
 它先 `makeNode(IndexScanState)`。
 再 `ExecAssignExprContext()`。
@@ -447,7 +434,9 @@ executor 把 `slot` 放进 expr context。
 `Rows Removed by Index Recheck` 来自 index qual recheck。
 `Rows Removed by Filter` 来自 plan filter。
 它们不是同一件事。
+
 ### ORDER BY recheck path
+
 `IndexNextWithReorder()` 是普通 index scan 的复杂旁路。
 它服务支持 ordering operator 的 AM。
 有些 AM 返回的 order-by distance 可能需要 recheck。
@@ -464,7 +453,9 @@ recheck 不只作用于 where qual。
 它也可以作用于 order semantics。
 不过 index-only scan 当前不支持 lossy distance recheck。
 如果遇到 `xs_recheckorderby`，会报 feature not supported。
+
 ## 6. 主流程 walkthrough：Index-only Scan
+
 Index-only scan 的目标不是“不访问 heap”。
 准确说，它的目标是：
 能从 index tuple 提供 targetlist 数据，并且在 VM 证明 heap page all-visible 时跳过 heap visibility fetch。
@@ -519,7 +510,9 @@ VM 只证明 visibility。
 这是 SSI 边界。
 普通 heap fetch 路径会对 tuple 做 predicate lock。
 跳过 heap fetch 后，需要显式 page-level predicate lock 来保持 serializable conflict 检测语义。
+
 ### VM stale read 为什么可接受
+
 `visibilitymap_get_status()` 通常不锁 VM buffer。
 它读取一个 byte。
 源码注释把 memory ordering 责任交给调用者。
@@ -541,7 +534,9 @@ index-only scan 可能读到旧 VM bit。
 不是 VM bit 永远最新。
 而是对错误方向的 stale read，有其他同步关系排除掉会破坏可见性的情况。
 这也是为什么这段逻辑不能脱离 `IndexOnlyNext()` 的注释单独复用。
+
 ## 7. 主流程 walkthrough：Bitmap Index Scan
+
 Bitmap index scan 的 executor convention 与普通 scan 不同。
 `ExecBitmapIndexScan()` 是 stub。
 如果有人按 `ExecProcNode` tuple-at-a-time 调它，直接报错：
@@ -584,7 +579,9 @@ AM 把候选 TID 加入 `TIDBitmap`。
 `MultiExecBitmapIndexScan()` 完成后返回 `Node *` 指向 `TIDBitmap`。
 这个 bitmap 还没有做 heap visibility。
 它只是 heap TID 候选集合。
+
 ## 8. 主流程 walkthrough：TIDBitmap exact、lossy 与 recheck
+
 `TIDBitmap` 设计目标是：
 能保存很大的 TID 集合，同时把内存限制在近似 `work_mem` 内。
 它的基本单位是 heap block。
@@ -626,7 +623,9 @@ lossy page 必须检查 page 上所有 normal line pointer 的可见 tuple。
 recheck 的区别是：
 `recheck=false` 时，heap visibility 通过后可以认为 index condition 已成立。
 `recheck=true` 时，heap visibility 通过后还要执行 `bitmapqualorig`。
+
 ## 9. 主流程 walkthrough：Bitmap Heap Scan
+
 `ExecInitBitmapHeapScan()` 创建 `BitmapHeapScanState`。
 它断言不支持 backward scan 和 mark/restore。
 它还断言 snapshot 是 MVCC snapshot。
@@ -703,7 +702,9 @@ ordinary filter。
 `EXPLAIN` 中的 `Recheck Cond` 表示用于 recheck 的表达式。
 它不表示所有 tuple 都实际被 recheck。
 是否实际 recheck 取决于 `TBMIterateResult.recheck`。
+
 ## 10. 并行 Bitmap Heap Scan 状态推进
+
 Bitmap heap scan 有并行路径。
 状态结构是 `ParallelBitmapHeapState`。
 它在 DSM 中，包含：
@@ -729,7 +730,9 @@ bitmap 构造由一个 leader-like worker 完成。
 worker 结束时不能简单 memcpy。
 源码用累加方式处理。
 原因是 Gather/GatherMerge rescan 可能关闭旧 worker、启动新 worker。
+
 ## 11. 生命周期 / ownership / cleanup
+
 普通 index scan 的生命周期：
 `ExecInitIndexScan()` 创建 `IndexScanState`。
 `index_open()` 打开 index relation。
@@ -781,7 +784,9 @@ PostgreSQL 的 ERROR unwinding 会释放 ResourceOwner 管理的 pin/lock。
 MemoryContext reset 会释放 backend-local palloc 内存。
 但这不是让代码可以随意跳过 `index_endscan()` 的理由。
 正常结束路径仍要把 AM 私有状态、instrumentation 聚合、iterator shared area 和 relation refcount 按合同清掉。
+
 ## 12. 正确性机制层次
+
 本节正确性不是一个机制保证的。
 它由多层机制叠加。
 第一层是 MVCC snapshot。
@@ -832,7 +837,9 @@ MVCC 才负责解释并发修改。
 parallel bitmap heap scan 用 spinlock 和 condition variable 协调 bitmap 初始化。
 这只保证 workers 不会在 bitmap 未完成时开始 shared iteration。
 它不改变 heap tuple visibility 语义。
+
 ## 13. 错误路径 / 异常路径 / fallback
+
 第一个异常路径是 bitmap heap scan 拒绝非 MVCC snapshot。
 源码在文件头注释说明原因。
 index scan 与 heap access 被解耦后，TID 对应的 line pointer 可能被复用。
@@ -880,7 +887,9 @@ wait event 是 `WAIT_EVENT_PARALLEL_BITMAP_SCAN`。
 它们要求传入覆盖目标 heap block 的 VM buffer。
 如果 buffer 不匹配，直接 `elog(ERROR)`。
 这是为了防止 caller 把 VM bit 写到错误 map page。
+
 ## 14. 成本、资源与跨模块传播
+
 普通 index scan 的主要成本随 returned candidates 增长。
 每个 candidate 可能触发：
 index AM search/advance。
@@ -941,7 +950,9 @@ EXPLAIN 把部分 runtime 状态暴露给用户。
 没有后台进程直接推进本节 scan state。
 但 autovacuum/VACUUM 会推进 visibility map all-visible 状态，间接改变 index-only scan 的 heap fetch 数。
 checkpoint/bgwriter 只影响 IO 背景压力，不改变 recheck 语义。
+
 ## 15. 观测与诊断入口
+
 最直接入口是：
 `EXPLAIN (ANALYZE, BUFFERS)`。
 普通 index scan 关注：
@@ -1012,7 +1023,9 @@ parallel bitmap heap scan 中，如果 worker 等在 bitmap 初始化上，可�
 具体 `TIDBitmap` hash entry 选择哪个 page lossify。
 普通 SQL 层无法直接看到 `xs_heap_continue`。
 executor 内部 slot 与 buffer pin 的精确生命周期。
+
 ## 16. 常见误区
+
 误区一：
 看到 `Index Cond` 就以为返回 tuple 一定满足它。
 正确理解：
@@ -1066,11 +1079,15 @@ heap 的 `heapam_index_fetch_reset()` 故意不释放 `xs_cbuf` 和 `xs_vmbuffer
 以为 bitmap index scan 可以单独执行并返回 rows。
 正确理解：
 它只返回 `TIDBitmap`，必须由 BitmapHeapScan 访问 heap 并返回 tuple。
+
 ## 17. 课堂实验
+
 ### 实验一：观察 bitmap exact/lossy 与 recheck
+
 目标：
 用 `work_mem` 改变 bitmap 形态，观察 `Heap Blocks exact/lossy` 和 `Rows Removed by Index Recheck`。
 准备表：
+
 ```sql
 CREATE TABLE t_bm (id int, grp int, pad text);
 INSERT INTO t_bm
@@ -1079,19 +1096,24 @@ FROM generate_series(1, 1000000) AS g;
 CREATE INDEX t_bm_grp_idx ON t_bm (grp);
 ANALYZE t_bm;
 ```
+
 执行：
+
 ```sql
 SET enable_seqscan = off;
 SET work_mem = '64kB';
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT * FROM t_bm WHERE grp BETWEEN 1 AND 80 AND pad LIKE 'x%';
 ```
+
 再执行：
+
 ```sql
 SET work_mem = '64MB';
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT * FROM t_bm WHERE grp BETWEEN 1 AND 80 AND pad LIKE 'x%';
 ```
+
 观察点：
 低 `work_mem` 下更容易出现 `Heap Blocks: lossy=...`。
 高 `work_mem` 下 exact pages 通常增加。
@@ -1100,10 +1122,13 @@ SELECT * FROM t_bm WHERE grp BETWEEN 1 AND 80 AND pad LIKE 'x%';
 `MultiExecBitmapIndexScan()` 用 `work_mem` 创建 `TIDBitmap`。
 `tbm_lossify()` 在 entry 数超过限制时把 exact page 转 lossy。
 `BitmapHeapScanNextBlock()` 对 lossy page 扫整页并设置 recheck。
+
 ### 实验二：观察 index-only scan 的 heap fetch
+
 目标：
 证明 index-only scan 是否访问 heap 取决于 VM all-visible 状态。
 准备表：
+
 ```sql
 CREATE TABLE t_ios (id int PRIMARY KEY, v int);
 INSERT INTO t_ios
@@ -1113,19 +1138,24 @@ VACUUM (ANALYZE) t_ios;
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT id FROM t_ios WHERE id BETWEEN 1000 AND 2000;
 ```
+
 修改一部分页面：
+
 ```sql
 UPDATE t_ios SET v = v + 1 WHERE id BETWEEN 1000 AND 2000;
 ANALYZE t_ios;
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT id FROM t_ios WHERE id BETWEEN 1000 AND 2000;
 ```
+
 再 vacuum：
+
 ```sql
 VACUUM (ANALYZE) t_ios;
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT id FROM t_ios WHERE id BETWEEN 1000 AND 2000;
 ```
+
 观察点：
 第一次 vacuum 后，index-only scan 的 `Heap Fetches` 通常很低。
 UPDATE 后相关 heap pages 的 VM all-visible bit 被清掉，`Heap Fetches` 可能增加。
@@ -1134,10 +1164,13 @@ UPDATE 后相关 heap pages 的 VM all-visible bit 被清掉，`Heap Fetches` �
 `IndexOnlyNext()` 先 `VM_ALL_VISIBLE()`。
 VM miss 时调用 `index_fetch_heap()`。
 `visibilitymap_clear()` 和 `visibilitymap_set()` 维护 VM bit。
+
 ### 实验三：源码断点跟踪 recheck 传播
+
 目标：
 直接看到 `xs_recheck` 和 bitmap `recheck` 如何进入 executor。
 断点建议：
+
 ```text
 src/backend/executor/nodeIndexscan.c:IndexNext
 src/backend/executor/nodeIndexonlyscan.c:IndexOnlyNext
@@ -1146,11 +1179,13 @@ src/backend/access/heap/heapam_handler.c:BitmapHeapScanNextBlock
 src/backend/access/index/indexam.c:index_getnext_tid
 src/backend/access/index/indexam.c:index_getbitmap
 ```
+
 调试步骤：
 先跑一个普通 B-tree equality index scan，观察 `xs_recheck` 通常为 false。
 再跑一个 GiST、GIN 或需要 lossy recheck 的索引场景，观察 `xs_recheck` 或 bitmap `recheck`。
 如果不方便构造 AM-specific recheck，可以在 `BitmapHeapScanNextBlock()` 观察 low `work_mem` 下 `tbmres->lossy` 变 true。
 需要画出的状态变化：
+
 ```text
 AM candidate
   -> IndexScanDesc.xs_heaptid / TIDBitmap
@@ -1159,7 +1194,9 @@ AM candidate
   -> ExecQualAndReset(original qual)
   -> instrumentation nfiltered2
 ```
+
 ## 18. 讨论题
+
 1. 为什么 `index_getnext_slot()` 不自己执行 `indexqualorig` recheck，而是要求 executor 调用者检查 `xs_recheck`？
 2. Index-only scan 为什么需要 `ioss_TableSlot`，既然最终返回的数据来自 index tuple？
 3. 为什么 VM bit 可以无锁读取，但 `visibilitymap_set()` 需要 VM buffer exclusive lock、heap page lock 和 critical section？
@@ -1168,7 +1205,9 @@ AM candidate
 6. 如果 `Heap Blocks: lossy` 很高，但 `Rows Removed by Index Recheck` 很低，可能说明什么？如果二者都高，又说明什么？
 7. parallel bitmap heap scan 为什么让一个 worker 先构造 shared bitmap，而不是每个 worker 各自扫描 index？
 8. `Rows Removed by Filter` 很高和 `Rows Removed by Index Recheck` 很高分别应该优先回到哪些源码路径和 schema/workload 假设检查？
+
 ## 19. 本节小结
+
 本节唯一主问题是：
 索引访问路径如何在候选位置、heap visibility、近似索引和 lossy bitmap 之间保持正确性。
 核心链路是：

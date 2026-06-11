@@ -10,60 +10,29 @@
 为什么 PostgreSQL 必须把 buffer pin 和 buffer content lock 分成两个机制，而不是用一个锁同时保护 buffer 身份、生命周期和 page 内容？
 ```
 
-核心矛盾：
+核心矛盾：调用者需要一个低成本、可嵌套、能跨函数持有的引用，保证 buffer frame 不被替换；但 page contents 又需要短临界区的读写互斥、cleanup 强度和 wait queue，不能把所有 pin 都变成内容锁。
 
-```text
-调用者需要一个低成本、可嵌套、能跨函数持有的引用，保证 buffer frame 不被替换；
-但 page contents 又需要短临界区的读写互斥、cleanup 强度和 wait queue，不能把所有 pin 都变成内容锁。
-```
-
-本节只讲 pin 与 content lock 的职责边界。
-
-它不重新讲 mapping table。
-
-它不重新讲 clock sweep。
-
-它不展开 heap / btree 的 page 修改协议。
-
-它把这些相邻模块放在边界上说明。
-
-学完后应能判断：
-
-- pin 防止什么，不防止什么。
-- content lock 防止什么，不防止什么。
-- 为什么持有 content lock 前必须持有 pin。
-- 为什么释放 pin 前不能还持有 content lock。
-- shared refcount 与 private refcount 为什么并存。
-- cleanup lock 为什么是 exclusive content lock 加 pin count 条件。
-- ERROR / abort 时 `ResourceOwner` 如何释放 content lock 和 pin。
-- replacement 为什么看 refcount，而 page 修改为什么看 content lock。
-
-源码基线：
-
-```text
-/home/nail/postgres-lab
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
-```
-
-核心源码锚点：
-
-| 顺序 | 文件 | 本节读什么 |
-| --- | --- | --- |
-| 1 | `src/include/storage/buf.h` | `Buffer` handle、shared/local 编码。 |
-| 2 | `src/include/storage/bufmgr.h` | `BufferLockMode`、`LockBuffer()` inline wrapper、`LockBufferForCleanup()`、`ConditionalLockBufferForCleanup()`。 |
-| 3 | `src/include/storage/buf_internals.h` | `BufferDesc.state` layout、`BM_LOCK_VAL_SHARED`、`BM_LOCK_VAL_SHARE_EXCLUSIVE`、`BM_LOCK_VAL_EXCLUSIVE`、`BM_PIN_COUNT_WAITER`。 |
-| 4 | `src/backend/storage/buffer/bufmgr.c` | `PinBuffer()`、`PinBuffer_Locked()`、`UnpinBuffer()`、`WakePinCountWaiter()`、`BufferLockAcquire()`、`BufferLockConditional()`、`UnlockBuffer()`、`LockBufferForCleanup()`、`ResOwnerReleaseBuffer()`。 |
-| 5 | `src/backend/storage/buffer/freelist.c` | `StrategyGetBuffer()` 如何把 refcount 作为 replacement 硬门槛。 |
-| 6 | `src/backend/storage/lmgr/lwlock.c` | 只作为 wait queue / shared-exclusive 语义对照；本基线中 buffer content lock 不再是普通 `LWLock *`。 |
-
-本节一句话模型：
+一句话运行模型：
 
 ```text
 pin 稳定 buffer frame 的身份和生命周期；content lock 稳定该 frame 中 page bytes 的并发访问；cleanup lock 是在 exclusive content lock 下确认没有其他 pin 的更强条件。
 ```
 
-最短主链路：
+学完后应能判断：pin 防止什么、不防止什么；content lock 防止什么、不防止什么；为什么持有 content lock 前必须持有 pin；ResourceOwner 如何在 ERROR 时兜底释放 lock 和 pin。
+
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。
+
+## 1. 本节在总主线中的位置
+
+前面三节分别讲了 identity、mapping uniqueness 和 replacement candidate。拿到 buffer 之后，访问方法真正要面对的是 page bytes 的并发读写。本节把“slot 不被替换”和“page 内容不被并发破坏”拆开讲。
+
+这条边界会贯穿后续 dirty write、heap/btree page 修改、cleanup lock 和 eviction：replacement 看 refcount，page 修改看 content lock，二者不能互相替代。
+
+## 2. 核心矛盾与一句话运行模型
+
+如果只用 content lock 保护一切，scan、executor 和访问方法会把大量长期 buffer 使用变成 page 内容互斥。如果只用 pin，又没有机制防止 page header、line pointer、hint bit 或索引结构在错误窗口被并发修改。
+
+所以本节的模型是：
 
 ```text
 BufferAlloc() hit/miss
@@ -75,7 +44,18 @@ BufferAlloc() hit/miss
   -> ResourceOwner 在 ERROR 时兜底
 ```
 
-## 1. 问题：pin 为什么不是 content lock
+## 3. 核心文件分工与阅读顺序
+
+| 阅读顺序 | 文件 | 本节读什么 |
+| --- | --- | --- |
+| 1 | `src/include/storage/buf.h` | `Buffer` handle、shared/local 编码。 |
+| 2 | `src/include/storage/bufmgr.h` | `BufferLockMode`、`LockBuffer()` inline wrapper、`LockBufferForCleanup()`、`ConditionalLockBufferForCleanup()`。 |
+| 3 | `src/include/storage/buf_internals.h` | `BufferDesc.state` layout、`BM_LOCK_VAL_SHARED`、`BM_LOCK_VAL_SHARE_EXCLUSIVE`、`BM_LOCK_VAL_EXCLUSIVE`、`BM_PIN_COUNT_WAITER`。 |
+| 4 | `src/backend/storage/buffer/bufmgr.c` | `PinBuffer()`、`UnpinBuffer()`、`WakePinCountWaiter()`、`BufferLockAcquire()`、`UnlockBuffer()`、`LockBufferForCleanup()`、`ResOwnerReleaseBuffer()`。 |
+| 5 | `src/backend/storage/buffer/freelist.c` | `StrategyGetBuffer()` 如何把 refcount 作为 replacement 硬门槛。 |
+| 6 | `src/backend/storage/lmgr/lwlock.c` | 只作为 wait queue / shared-exclusive 语义对照；本基线中 buffer content lock 不再是普通 `LWLock *`。 |
+
+## 4. 入口问题：pin 为什么不是 content lock
 
 `ReadBuffer()` 返回的是 pinned buffer。
 
@@ -151,7 +131,7 @@ cleanup lock: physical removal safety
 
 把 cleanup lock 当普通 exclusive content lock，会在物理删除 item 时忽略其他 backend 手里可能存在的 page 内指针。
 
-## 2. 状态：shared refcount、private refcount、lock mode
+## 5. 状态：shared refcount、private refcount、lock mode
 
 `BufferDesc.state` 的低位包含 shared refcount。
 
@@ -265,7 +245,7 @@ local buffer 只有当前 backend 可见。
 
 它仍然要防止本 backend 在使用同一个 local frame 时把它替换掉。
 
-## 3. 主流程：pin、lock、unlock、unpin
+## 6. 主流程：pin、lock、unlock、unpin
 
 从 lookup hit 看 pin 的主流程。
 
@@ -401,7 +381,7 @@ pin 本身不是 interrupt holdoff。
 
 但语义上它们仍是两种机制。
 
-## 4. 正确性边界：replacement、page 修改、cleanup
+## 7. 正确性边界：replacement、page 修改、cleanup
 
 第一条边界：replacement 看 pin/refcount。
 
@@ -590,9 +570,9 @@ ResourceOwner releases leaked ownership on ERROR
 
 具体 lock bits、AIO pin、wait queue 实现会随版本演进。
 
-本节基于 `/home/nail/postgres-lab` 的 master `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。
+本节基于 `/home/highgo/postgres` 的 master `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。
 
-## 5. 异常：等待、ERROR 和错误用法
+## 8. 异常：等待、ERROR 和错误用法
 
 异常路径一：cleanup lock 等待其他 pin。
 
@@ -718,7 +698,7 @@ content lock ownership 本身依赖 private refcount entry。
 
 它可能表现为 vacuum cleanup 变慢、recovery conflict、buffer allocation 压力或 wait event `BufferCleanup`。
 
-## 6. 诊断与实验
+## 9. 诊断与实验
 
 本节可观测的 runtime truth 是：
 
@@ -873,7 +853,7 @@ ERROR 时 ResourceOwner 是否知道这个 pin？
 
 这组问题围绕职责边界，而不是函数背诵。
 
-## 7. 讨论题
+## 10. 讨论题
 
 1. 为什么 pin 只能保护 buffer frame identity，不能保护 page bytes？
 2. cleanup lock 为什么不是一个新锁类型，而是 content lock 与 pin count 条件的组合？
@@ -881,7 +861,7 @@ ERROR 时 ResourceOwner 是否知道这个 pin？
 4. ERROR cleanup 必须按什么顺序释放 content lock 和 pin？
 5. 哪些 bug 来自把 pin、content lock、ResourceOwner 或 MemoryContext 的职责混在一起？
 
-## 8. 本节小结
+## 11. 本节小结
 
 本节核心链路是：
 

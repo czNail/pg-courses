@@ -1,85 +1,64 @@
 # PostgreSQL relation fork 与 block addressing
 
 ## 课程定位
-本节主题：PostgreSQL 怎样把一个 relation 的物理身份、fork、block number 映射到磁盘文件和文件内偏移。
-上一组课程已经看过 WAL record、redo contract、full-page image 和 page LSN。
-从这一节开始，我们把注意力放回 relation storage 本身。
-重点不是 SQL 层的表名、索引名或 catalog 元组。
-重点是 storage manager 看到的物理地址。
+
+前置知识：已经看过 WAL record、redo contract、full-page image 和 page LSN；也知道 buffer manager 最终读写的是某个 relation fork 的 block。
 
 本节唯一主问题：
-一个 SQL relation 在 catalog 里有名称、OID、relfilenode、tablespace 和 persistence，storage manager 为什么仍然需要一套独立的 `RelFileLocatorBackend + ForkNumber + BlockNumber` 坐标？
 
-本节围绕的核心矛盾：
-上层希望用稳定的 SQL 对象身份表达表、索引和临时对象；底层必须用 crash-safe、backend-aware、fork-aware、segment-aware 的物理坐标定位文件，并且不能让 catalog 简写、临时对象、本地 fork 和 WAL/recovery 边界互相污染。
+```text
+一个 SQL relation 在 catalog 里有名称、OID、relfilenode、tablespace 和 persistence，storage manager 为什么仍然需要一套独立的 RelFileLocatorBackend + ForkNumber + BlockNumber 坐标？
+```
 
-这个地址由几个层次组成：
-- `RelFileLocator`
-- `RelFileLocatorBackend`
-- `SMgrRelation`
-- `ForkNumber`
-- `BlockNumber`
-- `RELSEG_SIZE` 和 segment number
-- `BLCKSZ` 和 segment 内 byte offset
+核心矛盾：上层希望用稳定的 SQL 对象身份表达表、索引和临时对象；底层必须用 crash-safe、backend-aware、fork-aware、segment-aware 的物理坐标定位文件，并且不能让 catalog 简写、临时对象、本地 fork 和 WAL/recovery 边界互相污染。
 
-读完本节，你应该能回答：
-- `pg_class.relfilenode` 和 `pg_class.oid` 为什么不是同一个概念。
-- `RelFileLocator` 里的 `spcOid`、`dbOid`、`relNumber` 分别定位什么。
-- 为什么 `RelFileLocator` 不能使用 `reltablespace = 0` 或 `relfilenode = 0` 这种 catalog 简写。
-- `RelFileLocatorBackend` 为什么要额外带一个 `backend`。
-- temp relation 的 backend-local 身份怎样进入文件名。
-- `SMgrRelation` 为什么是物理 relation 的缓存句柄，而不是 catalog relation。
-- `ForkNumber` 有哪些合法值。
-- `main`、`fsm`、`vm`、`init` 四个 fork 各自服务什么目的。
-- 为什么 main fork 文件名没有 `_main` 后缀。
-- `base/dbOid/relfilenode_vm.3` 这种文件名怎样拆成 relation、fork、segment。
-- 一个 `BlockNumber` 怎样换算成 segment number 和 segment 内 offset。
-- `BLCKSZ` 和 `RELSEG_SIZE` 分别限制什么。
-- permanent、unlogged、temp 三种 persistence 的边界在哪里。
-- unlogged relation 为什么既不是 permanent 的完整 WAL，也不是 temp 的 backend-local 文件。
-- storage 层哪些操作通过 `RM_SMGR_ID` 写 WAL。
-- 为什么删除 relation 文件不是由 `storage_xlog.h` 里的 smgr create/truncate record 直接描述。
+一句话运行模型：
 
-## 源码基线
-源码仓库：`/home/nail/postgres-lab`
-基线：`master` = `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`
-本节指定重点源码：
-- `src/include/storage/smgr.h`
-- `src/include/storage/relfilelocator.h`
-- `src/include/storage/block.h`
-- `src/backend/storage/smgr/smgr.c`
-- `src/backend/storage/smgr/md.c`
-- `src/backend/catalog/storage.c`
-- `src/include/catalog/storage_xlog.h`
+```text
+storage manager 用 RelFileLocatorBackend 定位物理 relation，用 ForkNumber 选择 main/fsm/vm/init fork，用 BlockNumber 定位 fork 内 page，再用 RELSEG_SIZE 和 BLCKSZ 换算成 segment 文件名与文件内 offset。
+```
 
-注意：用户题目里写的是 `storage_xlog.h`。
-在这个基线中，它的实际路径是 `src/include/catalog/storage_xlog.h`。
-本节还辅助核对了这些文件：
-- `src/include/common/relpath.h`
-- `src/common/relpath.c`
-- `src/include/storage/md.h`
-- `src/include/storage/procnumber.h`
-- `src/include/catalog/pg_class.h`
-- `src/include/utils/rel.h`
-- `src/include/pg_config.h.in`
-- `configure.ac`
-- `meson.build`
-- `meson_options.txt`
-- `src/backend/storage/file/reinit.c`
-- `src/backend/access/heap/heapam_handler.c`
-- `src/backend/catalog/index.c`
-- `src/backend/commands/sequence.c`
+学完后应能判断：`pg_class.relfilenode` 与 `oid` 为什么不同；temp relation 为什么要进入 `RelFileLocatorBackend.backend`；main/fsm/vm/init fork 各自服务什么目的；`BlockNumber` 如何换算成 segment 和 offset；permanent、unlogged、temp 的持久化边界在哪里。
 
-`ForkNumber` 的正式定义不在 `storage/smgr.h`。
-它在 `src/include/common/relpath.h` 中。
-`relfilelocator.h` 包含 `common/relpath.h`，所以读 `relfilelocator.h` 时必须顺着这个包含关系看。
-文件名生成也不在 `smgr.h`。
-它在 `relpath.h` 和 `src/common/relpath.c` 中。
-`md.c` 再在这个基础上追加 segment 后缀。
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。
 
----
+## 1. 本节在总主线中的位置
 
-## 1. 先给结论
+前面 WAL/recovery 课程说明了如何描述和重放 page 修改。本节把注意力放回 storage 地址本身：WAL、buffer manager、smgr 和 md 层最终都需要一个能稳定定位物理文件和 block 的坐标。
+
+这节是后续 smgr/md segment lifecycle、fd cache、fsync queue、heap/index physical layout 的基础。不要从 SQL 表名开始读，要从 storage manager 需要什么物理地址开始读。
+
+## 2. 核心矛盾与一句话运行模型
+
+catalog 层为了用户和元数据管理需要 OID、relfilenode、tablespace、persistence 等概念；storage 层为了实际读写文件，需要的是没有 catalog 简写、能区分 temp backend、能区分 fork、能跨 segment 换算 block offset 的物理坐标。
+
+地址层次如下：
+
+```text
+RelFileLocator
+  -> RelFileLocatorBackend
+  -> SMgrRelation
+  -> ForkNumber
+  -> BlockNumber
+  -> RELSEG_SIZE / BLCKSZ
+  -> segment filename + byte offset
+```
+
+## 3. 核心文件分工与阅读顺序
+
+| 阅读顺序 | 文件 | 本节读什么 |
+| --- | --- | --- |
+| 1 | `src/include/storage/relfilelocator.h` | `RelFileLocator`、`RelFileLocatorBackend`、backend-local temp relation 身份。 |
+| 2 | `src/include/common/relpath.h`、`src/common/relpath.c` | `ForkNumber`、fork name、relation path 和文件名生成。 |
+| 3 | `src/include/storage/block.h` | `BlockNumber`、`InvalidBlockNumber`、block 地址边界。 |
+| 4 | `src/include/storage/smgr.h`、`src/backend/storage/smgr/smgr.c` | `SMgrRelation`、`smgropen()`、fork size cache、storage manager 抽象。 |
+| 5 | `src/backend/storage/smgr/md.c`、`src/include/storage/md.h` | segment 文件打开、block 到 segment/offset 的换算、md 层 invariant。 |
+| 6 | `src/backend/catalog/storage.c`、`src/include/catalog/storage_xlog.h` | relation create/truncate/unlink 的 storage WAL 边界。 |
+| 7 | `src/include/catalog/pg_class.h`、`src/include/utils/rel.h` | catalog identity、persistence 与 storage identity 的衔接。 |
+| 8 | `src/backend/storage/file/reinit.c`、`src/backend/access/heap/heapam_handler.c`、`src/backend/catalog/index.c` | unlogged/temp 初始化和访问方法调用点辅助核对。 |
+
+## 4. 关键结论：relation 物理地址
+
 PostgreSQL 的 relation 文件地址不是一个单字段。
 它是一个分层坐标。
 最上层是 relation 的物理身份。
@@ -159,9 +138,8 @@ unlogged relation 不使用 temp 文件名。
 这个 `init` fork 的创建和内容需要 WAL 或同步保护。
 这就是 unlogged relation 和 temp relation 最容易混淆的边界。
 
----
+## 5. 从 SQL 名字到物理文件号
 
-## 2. 从 SQL 名字到物理文件号
 SQL 层说的是 relation name。
 catalog 层有 `pg_class.oid`。
 storage 层需要的是 `pg_class.relfilenode` 对应的物理文件号。
@@ -216,9 +194,8 @@ storage manager 不负责知道“默认表空间是谁”。
 storage manager 也不负责把 mapped catalog relation 重新映射成真实 filenode。
 这些必须在更高层完成。
 
----
+## 6. `RelFileLocatorBackend`
 
-## 3. `RelFileLocatorBackend`
 `RelFileLocator` 不含 backend。
 对普通 relation，这正好。
 普通 relation 可以被多个 backend 访问。
@@ -278,9 +255,8 @@ SQL 层有 `pg_temp_N` namespace。
 storage 层只关心文件名里的 proc number。
 这个 proc number 进入 `RelFileLocatorBackend`，再进入 `relpathbackend()`。
 
----
+## 7. `SMgrRelation` 是什么
 
-## 4. `SMgrRelation` 是什么
 `SMgrRelation` 不是 `Relation`。
 `Relation` 是 relcache 里的 catalog-aware 结构。
 `SMgrRelation` 是 storage manager 的物理文件句柄缓存。
@@ -341,9 +317,8 @@ main fork 的 segment 0 和 vm fork 的 segment 0 是不同文件。
 只要它们有 `RelFileLocator`、backend number、fork number 和 block number，就能定位文件。
 它们不需要 SQL 名字。
 
----
+## 8. `ForkNumber`
 
-## 5. `ForkNumber`
 fork 是 relation 物理文件集合中的一个分支。
 `ForkNumber` 定义在 `relpath.h`：
 
@@ -422,9 +397,8 @@ fork 是 vm。
 segment number 是 1。
 它不是“relation 24576 的第 1 个 vm block”。
 
----
+## 9. 文件名生成
 
-## 6. 文件名生成
 文件名生成的入口是 `GetRelationPath()`。
 它接受：
 - `dbOid`
@@ -556,9 +530,8 @@ global/1262
 它不接受 temp 的 `tN_` 前缀。
 这正好说明 unlogged reset 处理的是普通命名空间下的 unlogged relation，不是 backend-local temp relation。
 
----
+## 10. `BlockNumber`
 
-## 7. `BlockNumber`
 `BlockNumber` 定义在 `block.h`：
 
 ```c
@@ -668,9 +641,8 @@ RELSEG_SIZE - (blocknum % RELSEG_SIZE)
 每轮计算当前 segment 内最多能扩展多少 block。
 然后移动到下一个 segment。
 
----
+## 11. `BLCKSZ` 与 `RELSEG_SIZE`
 
-## 8. `BLCKSZ` 与 `RELSEG_SIZE`
 `BLCKSZ` 是 relation data block size。
 它不是 WAL segment size。
 它也不是 OS page size。
@@ -719,9 +691,8 @@ relation segment 是 `base/.../relfilenode.N` 这种数据文件切片。
 两者名字都叫 segment，但属于不同系统。
 本节只讨论 relation fork segment。
 
----
+## 12. md.c 的 segment invariant
 
-## 9. md.c 的 segment invariant
 md.c 顶部注释定义了一个 relation fork 在磁盘上的 segment invariant。
 一个 fork 由连续编号的 segment 文件组成。
 前面可以有零个或多个 full segment。
@@ -786,9 +757,8 @@ WAL replay 可能遇到对高编号 segment 的写入。
 读一个不存在的 block 不应该悄悄造文件。
 这就是 md.c 的 `EXTENSION_*` behavior flags 的意义。
 
----
+## 13. 主流程 walkthrough：storage.c 的正确性创建、截断和 WAL
 
-## 10. 主流程 walkthrough：storage.c 的正确性创建、截断和 WAL
 `storage.c` 是 catalog 层和 smgr 层之间的重要桥。
 `RelationCreateStorage()` 创建物理 storage。
 它只创建 main fork。
@@ -872,9 +842,8 @@ truncate 会直接丢弃 buffer 并截断磁盘文件。
 如果 WAL record 没有先稳定下来，crash 后 standby 或本地 recovery 可能无法知道主 fork、FSM、VM 应该一起收缩。
 这会破坏 relation size 和 visibility/free-space metadata 的一致性。
 
----
+## 14. permanent、unlogged、temp
 
-## 11. permanent、unlogged、temp
 三种 persistence 的常量在 `pg_class.h`：
 - `RELPERSISTENCE_PERMANENT = 'p'`
 - `RELPERSISTENCE_UNLOGGED = 'u'`
@@ -945,9 +914,8 @@ unlogged 的 backend 是 invalid。
 所以 smgr 层从 locator backend 身份上只能区分 temp 和 non-temp。
 unlogged 与 permanent 的差异来自 catalog `relpersistence` 和上层 WAL policy。
 
----
+## 15. 生命周期 / ownership / cleanup
 
-## 12. 生命周期 / ownership / cleanup
 这节的对象不是 SQL relation，而是 relation 文件身份。生命周期要按三层看。
 
 第一层是 catalog relation。`pg_class` 里的 OID、`relfilenode`、`relpersistence` 和 tablespace 由 DDL、rewrite、drop、truncate 等上层路径维护。storage 层不能把 `reltablespace = 0` 或 mapped relation 的 `relfilenode = 0` 当作物理地址，它必须拿到已经解析后的 `RelFileLocator`。
@@ -958,7 +926,8 @@ unlogged 与 permanent 的差异来自 catalog `relpersistence` 和上层 WAL po
 
 unlogged relation 的 ownership 介于两者之间：catalog 长期存在，locator 是 regular relation；但 crash 后 main fork 不靠 WAL redo 恢复，而是由 `ResetUnloggedRelations()` 删除非 init fork，再把 init fork 拷贝成 main fork。
 
-## 13. 错误路径 / 异常路径 / fallback
+## 16. 错误路径 / 异常路径 / fallback
+
 `RelFileLocatorBackend` 最重要的异常边界是 temp 和 non-temp。`RelFileLocatorBackendIsTemp()` 只看 `backend != INVALID_PROC_NUMBER`，不能用来判断 unlogged；unlogged 的物理 locator 仍是 regular relation。
 
 文件创建的 fallback 主要出现在 redo。普通 `mdcreate()` 使用 `O_CREAT | O_EXCL`，文件已存在是错误；redo create 传 `isRedo = true`，文件已存在时可以打开已有文件，让 WAL replay 幂等。
@@ -967,21 +936,24 @@ truncate 是更强的持久化边界。`RelationTruncate()` 和 truncate redo �
 
 unlogged reset 的 fallback 是丢弃 main data，而不是 redo。cleanup pass 找到有 init fork 的 relation，删除其他 fork，再由 init pass 重建 main fork。temp 文件则由临时文件清理路径丢弃残留。
 
-## 14. 成本、资源与观测诊断
+## 17. 成本、资源与观测诊断
+
 这个地址模型的 hot path 成本来自换算和缓存 miss，而不是复杂算法。每次 relation I/O 都要先确定 locator、fork、block，再换算 segment number 和 segment 内 offset。大 relation、多 fork、多 backend 会把成本传播到 `SMgrRelation` 缓存、md segment 打开数组、fd.c VFD LRU 和 checkpointer fsync request。
 
 能直接观察的状态包括 `pg_relation_filepath()`、`pg_relation_filenode()`、`pg_class.relfilenode`、`pg_class.relpersistence`、`pg_relation_size()` 和 `$PGDATA` 下的 fork/segment 文件。能间接推断的是 `SMgrRelation` 是否缓存了某个 fork、某个 segment 是否已经被当前 backend 打开。几乎不可见的是其他 backend 的 smgr handle 和 pending invalidation 细节，需要 gdb 或源码断点。
 
 诊断顺序应该是：先确认 SQL relation 映射到哪个 physical locator；再看是否 temp；再看 fork；再按 `blocknum / RELSEG_SIZE` 找 segment；最后才讨论 WAL、fsync、checkpoint 或 unlogged reset。不要从文件名反推完整语义后直接下结论。
 
-## 15. 常见误区
+## 18. 常见误区
+
 - 把 `pg_class.oid` 当作文件号。普通场景里 OID 和 relfilenode 可能相同，但 rewrite、mapped relation 和系统 catalog 会打破这个直觉。
 - 把 `reltablespace = 0` 当作物理 tablespace OID。`RelFileLocator` 必须使用解析后的真实 tablespace。
 - 把 main fork 理解成 `_main` 后缀文件。main fork segment 0 没有 fork 后缀，也没有 `.0` segment 后缀。
 - 把 temp 和 unlogged 都归为“不写 WAL”。temp 是 backend-local 文件；unlogged 是 regular relation 加 init fork reset。
 - 把 `BlockNumber` 当作单个 OS 文件内 offset。它是 fork 内 block 序号，必须先映射到 segment。
 
-## 16. 课堂实验
+## 19. 课堂实验
+
 实验 1：观察普通、temp、unlogged 三种路径。
 
 ```sql
@@ -1014,7 +986,8 @@ RELSEG_SIZE = 131072
 
 计算 block `0`、`131071`、`131072`、`262144` 的 segment number、segment 内 block offset 和 byte offset。再回到 `md.c` 的 `_mdfd_segpath()`、`mdreadv()`、`mdwritev()` 校验公式。
 
-## 17. 讨论题
+## 20. 讨论题
+
 1. 为什么 `RelFileLocator` 不能直接复用 catalog 里的 `reltablespace = 0` 和 `relfilenode = 0`？
 2. `RelFileLocatorBackend.backend` 能区分哪些语义？哪些语义必须回到 catalog `relpersistence`？
 3. 为什么 main fork segment 0 选择最短文件名，而不是显式写成 `_main.0`？
@@ -1022,7 +995,8 @@ RELSEG_SIZE = 131072
 5. 如果 truncate 没有先 flush WAL，会破坏哪条 crash recovery 不变量？
 6. 哪些状态能用 SQL 和文件系统看到，哪些只能通过 smgr/md 断点推断？
 
-## 18. 本节小结
+## 21. 本节小结
+
 本节的核心链路是：SQL relation 的 catalog 身份先被解析成 `RelFileLocator`，再由 `RelFileLocatorBackend` 加上 backend-local 维度，最后用 `ForkNumber + BlockNumber` 映射到具体 segment 文件和 byte offset。
 
 核心状态边界是：catalog 保存逻辑对象和 persistence；`SMgrRelation` 是 backend-local 物理句柄缓存；md/fd.c 管真实文件和 segment；WAL、fsync request、checkpoint 或临时文件 cleanup 负责 crash 后的收尾。

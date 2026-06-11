@@ -1,6 +1,7 @@
 # PostgreSQL IndexAM build 与 insert 路径
+
 ## 课程定位
-本节主题：IndexAM build 与 insert 路径。
+
 前面几节已经讲过 B-tree page、search、insert、unique check、split、dedup 和 bottom-up deletion。
 本节把视角从 nbtree 内部拉回到通用 IndexAM 边界。
 前置知识：
@@ -36,48 +37,15 @@ executor 负责在 DML path 中枚举所有 ready index、计算 index datums、
 - 为什么 concurrent build 的 validate 阶段还要调用 `index_insert()`。
 - 哪些资源由 MemoryContext 清理，哪些由 relation close、tuplesort end、parallel context、bulk smgr finish 或 ERROR cleanup 收尾。
 - `pg_stat_progress_create_index`、wait event、`pg_stat_wal`、`EXPLAIN` 和 gdb 各自能看到什么，看不到什么。
-## 源码基线
-源码仓库：
-```text
-/home/nail/postgres-lab
-```
-基线：
-```text
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
-```
-行号来自：
-```text
-git -C /home/nail/postgres-lab show bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8:<file> | nl -ba
-```
-本节重点阅读：
-```text
-src/include/access/amapi.h
-src/backend/commands/indexcmds.c
-src/backend/catalog/index.c
-src/backend/access/index/indexam.c
-src/backend/executor/execIndexing.c
-src/backend/access/nbtree/nbtsort.c
-src/backend/access/nbtree/nbtinsert.c
-```
-辅助定位：
-```text
-src/backend/access/nbtree/nbtree.c
-src/include/nodes/execnodes.h
-src/backend/nodes/makefuncs.c
-src/include/access/genam.h
-src/include/access/tableam.h
-src/backend/access/heap/heapam_handler.c
-src/backend/executor/nodeModifyTable.c
-src/backend/commands/constraint.c
-src/backend/catalog/indexing.c
-```
-辅助文件不是本节主角。
-它们只用于解释 callback 如何注册、`IndexInfo` 如何形成、table AM 如何扫描 heap，以及 deferred/speculative 调用如何回到同一个 `index_insert()` 合同。
+
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。行号来自 `git -C /home/highgo/postgres show bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8:<file> | nl -ba`；重点源码和辅助定位统一放在第 3 节的阅读顺序里。
+
 ## 1. 本节在总主线中的位置
+
 前面 B-tree 课程讲的是一个具体 AM 如何维护自己的 page-level 不变量。
 本节讲 core 如何把这类 AM 接入 DDL 和 DML。
 也就是：
+
 ```text
 DDL: CREATE INDEX
   -> DefineIndex()
@@ -86,7 +54,9 @@ DDL: CREATE INDEX
   -> indexRelation->rd_indam->ambuild()
   -> btbuild()
 ```
+
 以及：
+
 ```text
 DML: INSERT/UPDATE/COPY/logical apply
   -> ExecInsertIndexTuples()
@@ -95,6 +65,7 @@ DML: INSERT/UPDATE/COPY/logical apply
   -> btinsert()
   -> _bt_doinsert()
 ```
+
 这两条路都叫“往索引里放 entry”。
 但它们不是同一个问题。
 build path 处理的是一个新建或重建的 index relation。
@@ -116,7 +87,9 @@ unique/exclusion 失败时谁负责抛错或返回待 recheck。
 所以本节不是“B-tree build 源码导览”。
 本节的主线是：
 同一个 IndexAM API 如何把两条不同生命周期的写入路径接到同一套 correctness 语义上。
+
 ## 2. 核心矛盾与一句话运行模型
+
 一句话运行模型：
 IndexAM 把“index entry 的物理组织”留给 AM，把“什么时候需要维护 index、用什么 snapshot 扫 heap、何时允许 planner 使用、何时对 DML ready、谁负责 constraint verdict”留给 core；build path 通过 `ambuild` 批量装载一个关系，insert path 通过 `aminsert` 对单个 heap TID 做原子维护。
 这个模型有四层。
@@ -136,7 +109,7 @@ B-tree 的 `btinsert()` 使用 search、unique check、right move、page split �
 如果 AM 自己决定 catalog 可见性和 concurrent build 阶段，MVCC 与 planner 语义会失控。
 如果 build 走逐条 insert，性能和 WAL/IO 放大不可接受。
 如果 insert 走 bulk build 的排序思路，事务原子性和 per-tuple 约束反馈会消失。
-本节的核心 tension 就是：
+本节的核心矛盾 就是：
 一个足够稳定的通用 API，必须容纳两个完全不同的 runtime path。
 它既不能把接口做成最低公分母，牺牲 AM 的性能。
 也不能把 AM 的内部状态上泄到 executor 和 DDL。
@@ -145,10 +118,13 @@ PostgreSQL 的答案是 callback 合同加状态分层。
 状态分层。
 路径分离。
 正确性在边界上组合。
+
 ## 3. 核心文件分工与阅读顺序
+
 推荐阅读顺序如下。
 不要按文件名排序。
 先看 API，再看 DDL，再看 DML，最后看 B-tree 两条 AM 回调。
+
 | 顺序 | 文件 | 读什么 | 目标 |
 | --- | --- | --- | --- |
 | 1 | `src/include/access/amapi.h` | `ambuild_function`、`aminsert_function`、`IndexAmRoutine` | 先确认 core 和 AM 的合同 |
@@ -161,6 +137,7 @@ PostgreSQL 的答案是 callback 合同加状态分层。
 | 8 | `src/backend/access/nbtree/nbtsort.c` | `btbuild()`、`_bt_spools_heapscan()`、`_bt_leafbuild()`、`_bt_load()` | 看 bulk build 的真实实现 |
 | 9 | `src/backend/access/nbtree/nbtinsert.c` | `_bt_doinsert()`、`_bt_check_unique()`、`_bt_findinsertloc()`、`_bt_insertonpg()` | 看 retail insert 的真实实现 |
 | 10 | `src/backend/access/heap/heapam_handler.c` | `heapam_index_build_range_scan()`、`heapam_index_validate_scan()` | 看 table AM 如何给 build/validate 提供 heap tuple |
+
 `amapi.h:112-128` 定义两个最重要的写入口。
 `ambuild(heapRelation, indexRelation, indexInfo)` 构建一个新 index。
 `aminsert(indexRelation, values, isnull, heap_tid, heapRelation, checkUnique, indexUnchanged, indexInfo)` 插入一个 index tuple。
@@ -188,8 +165,11 @@ B-tree 把 `.ambuild = btbuild`、`.ambuildempty = btbuildempty`、`.aminsert = 
 阅读时要牢记：
 `btbuild()` 和 `_bt_doinsert()` 不是同一条路径的上下游。
 它们是同一个 AM 合同的两个入口。
+
 ## 4. 关键数据结构与状态
+
 ### `IndexAmRoutine`
+
 `IndexAmRoutine` 是 backend-local 的静态 callback 表。
 core 不复制也不释放它。
 `amapi.h:230-231` 注释明确说 AM 通常静态分配，core never copies nor frees。
@@ -203,7 +183,9 @@ core 不复制也不释放它。
 它们是 core 和 AM 的功能合同。
 如果 AM 宣称 `amcanunique`，它的 `aminsert` 就必须在 `UNIQUE_CHECK_YES` 下给出正确 verdict。
 如果 AM 宣称 `amcanbuildparallel`，它的 `ambuild` 就必须能处理 parallel worker 的 snapshot、lock 和 resource 边界。
+
 ### `IndexInfo`
+
 `IndexInfo` 定义在 `execnodes.h:176-241`。
 它是 backend-local 状态。
 它不是 catalog tuple。
@@ -227,7 +209,9 @@ heap table AM 会据此选择 snapshot 语义。
 `ExecInsertIndexTuples()` 还要结合 `indimmediate`、`EIIT_NO_DUPE_ERROR`、deferred constraint 和 speculative insertion 选择 `UNIQUE_CHECK_*`。
 再比如 `ii_ReadyForInserts = false` 不等于 index relation 不存在。
 concurrent build 第一阶段 catalog entry 已经可见，但 index 还不对 DML ready。
+
 ### `IndexUniqueCheck`
+
 `IndexUniqueCheck` 定义在 `genam.h:123-129`。
 `UNIQUE_CHECK_NO` 表示不做唯一性检查。
 `UNIQUE_CHECK_YES` 表示 insertion time 立即 enforce。
@@ -238,7 +222,9 @@ executor 决定模式。
 AM 执行模式。
 如果 AM 在 `UNIQUE_CHECK_PARTIAL` 下阻塞或抛错，就破坏 deferred/speculative 合同。
 如果 AM 在 `UNIQUE_CHECK_YES` 下只做 best effort，就破坏 unique constraint。
+
 ### `BTBuildState` / `BTSpool` / `BTShared`
+
 B-tree build 的核心状态在 `nbtsort.c`。
 `BTSpool` 保存 tuplesort、heap relation、index relation、是否 unique、是否 nulls not distinct。
 它是 backend-local。
@@ -254,7 +240,9 @@ dead tuples 被放到 `spool2`，以避免参与唯一性检查。
 `BTSpool` 由 `btbuild()` 创建并在 `_bt_spooldestroy()` 释放。
 `BTShared` 在 DSM 中，由 parallel context 管理。
 `BTLeader` 在 leader backend 中，由 `_bt_end_parallel()` 关闭 parallel context 后结束。
+
 ### `BTInsertState`
+
 `BTInsertStateData` 定义在 nbtree 头文件中，本节只关心语义。
 它保存待插入 tuple、MAXALIGN 后的 size、scan key、当前 buffer、binary search bounds、posting list offset。
 retail insert 的状态随时间推进。
@@ -267,7 +255,9 @@ retail insert 的状态随时间推进。
 但它持有的 `Buffer` 是 shared buffer 的 pin/lock。
 因此 cleanup 不能只靠 MemoryContext。
 错误路径必须确保 pin/lock 经由 resource owner 和 buffer manager 收回。
+
 ### catalog flags
+
 `pg_index.indisready` 和 `pg_index.indisvalid` 是 build 路径的关键持久状态。
 `indisready` 主要回答：
 新 DML 是否应该维护这个 index。
@@ -282,7 +272,9 @@ planner 是否可以把这个 index 当作查询可用路径。
 它们是 relcache/catalog 语义。
 别把 `indisready` 理解成 index 内部页面已经完整。
 也别把 `indisvalid` 理解成 DML 是否维护 index。
+
 ### tuple identity
+
 build 和 insert 最终都要给 AM 一个 heap TID。
 对 B-tree 来说，heap TID 还是 heapkeyspace 下的隐含 tiebreaker。
 但 build path 遇到 HOT tuple 时可能用 root TID。
@@ -290,8 +282,11 @@ build 和 insert 最终都要给 AM 一个 heap TID。
 `heapam_index_validate_scan()` 也用 root TID 和当前 index 中的 TID list 做 merge。
 这就是为什么 `heap_tid` 不是一个简单物理字段。
 它是“AM entry 指向 heap 可见性链路的身份”。
+
 ## 5. 主流程源码 walkthrough
+
 ### 5.1 普通 `CREATE INDEX` 的 build path
+
 入口是 `DefineIndex()`。
 `indexcmds.c:619-622` 先决定是否真正 concurrent。
 临时表即使用户写了 `CONCURRENTLY`，也会被强制走非 concurrent。
@@ -418,7 +413,9 @@ B-tree 的 `btbuildempty()` 在 `nbtree.c:182-197`，只给 init fork 写 metapa
 最后恢复 GUC、userid 和 security context。
 普通 build 到这里完成。
 catalog commit 后，其他 backend 能看到 ready and valid index。
+
 ### 5.2 `CREATE INDEX CONCURRENTLY` 的 build/validate path
+
 concurrent build 的第一阶段仍然从 `DefineIndex()` 开始。
 但 flags 会设置 `INDEX_CREATE_SKIP_BUILD` 和 `INDEX_CREATE_CONCURRENT`。
 `index_create()` 只创建 catalog entry 和空 relation，不立即 `index_build()`。
@@ -472,7 +469,9 @@ bulk build 只构建 snapshot 可见集合。
 validate 补齐 reference snapshot 可见但缺失的 tuple。
 最终 valid 前还要等待可能看到更旧可见性的事务消失。
 三个动作缺一不可。
+
 ### 5.3 DML `INSERT` 的 insert path
+
 DML path 从 heap tuple 已经插入开始。
 `execIndexing.c:7-9` 注释明确说 `ExecInsertIndexTuples()` 在 heap insert 之后调用。
 入口函数是 `ExecInsertIndexTuples()`。
@@ -550,7 +549,9 @@ DML insert path 的结论是：
 executor 只循环 index relations。
 generic wrapper 只做少量安全检查和 SSI 入口。
 B-tree AM 自己负责物理定位、unique wait/retry、page cleanup、split、WAL 和 buffer release。
+
 ### 5.4 `INSERT ... ON CONFLICT` 的特殊 insert path
+
 `ON CONFLICT` 仍然走 `ExecInsertIndexTuples()` 和 `index_insert()`。
 但它多了 speculative lifecycle。
 `nodeModifyTable.c:1143-1154` 先做 non-conclusive pre-check。
@@ -567,7 +568,9 @@ executor 得到 `specConflict` 后，`nodeModifyTable.c:1248-1249` complete spec
 如果有 conflict，`nodeModifyTable.c:1265-1268` 回到 pre-check。
 这条路径说明 pre-check 不是 correctness 边界。
 正确性边界仍然在 AM 的 atomic insert/unique check 和 speculative token wait/retry。
+
 ### 5.5 deferred unique recheck path
+
 deferrable unique 在 initial insert 时用 `UNIQUE_CHECK_PARTIAL`。
 AM 插入 index tuple，但只返回是否可能冲突。
 executor 把可能冲突的 index OID 放入 recheck list。
@@ -578,8 +581,11 @@ executor 把可能冲突的 index OID 放入 recheck list。
 `_bt_check_unique()` 在 recheck 时还要求找回自己的 tuple。
 如果找不到，`nbtinsert.c:773-779` 报错，提示可能是非 immutable index expression。
 这条路径把表达式 index 的稳定性问题也放进了 AM recheck 边界。
+
 ## 6. 生命周期 / ownership / cleanup
+
 ### DDL build lifecycle
+
 `DefineIndex()` 持有 heap relation lock。
 普通 build 使用 transaction-level lock。
 concurrent build 还持有 session-level heap lock，跨 transaction 保护对象不被 drop。
@@ -601,7 +607,9 @@ B-tree `btbuild()` 拥有 `BTSpool`、tuplesort state、parallel context 和 bul
 课程要注意：
 源码正常路径中看到的 `tuplesort_end()` 不是唯一兜底。
 但正常路径必须调用它，避免把短生命周期资源拖到更大 context。
+
 ### DML insert lifecycle
+
 `ExecOpenIndices()` 在 result relation 初始化时打开所有 index。
 它对每个 index 取得 `RowExclusiveLock` 并构造 `IndexInfo`。
 `ExecCloseIndices()` 遍历 index relations。
@@ -620,7 +628,9 @@ B-tree `_bt_doinsert()` 在每次等待前释放 leaf buffer。
 但源码仍要尽量在调用可能访问 catalog 的错误报告前释放 buffer。
 `_bt_check_unique()` 在构造 duplicate key error 前释放 nbuf 和 insertstate buf。
 `nbtinsert.c:645-655` 注释说明 `BuildIndexValueDescription()` 可能访问 catalog，最坏情况下可能碰同一个 index 并造成死锁。
+
 ### `IndexInfo` ownership
+
 `BuildIndexInfo()` 从 open index relation 构造 `IndexInfo`。
 `index.c:2435-2489` 用 relcache 的 `rd_index`、expression、predicate、exclusion info 初始化它。
 concurrent build 跨 transaction 时不能复用旧 `IndexInfo`。
@@ -629,7 +639,9 @@ parallel worker 中也重新 `BuildIndexInfo()`。
 `nbtsort.c:1927-1934` worker 打开 relation 后构建自己的 `IndexInfo`，再进入 `table_index_build_scan()`。
 这说明 `IndexInfo` 指针不能跨 backend 或 transaction 当稳定对象传递。
 它是当前 backend 当前 memory context 下的运行期视图。
+
 ### relcache invalidation
+
 `index_create()` 在创建 `pg_index` 后对 heap relation 发 relcache invalidation。
 这样其他 backend 会刷新 index list。
 `index_update_stats()` 即使没有实际修改 pg_class，也会发 relcache inval。
@@ -639,15 +651,20 @@ concurrent build 设置 valid 后也对 heap relation 发 inval。
 invalidation 不是 lock。
 它不阻塞正在执行的语句。
 它只让后续 relcache/planner 语义刷新。
+
 ## 7. 正确性机制层次
+
 ### API correctness
+
 `IndexAmRoutine` 是第一层正确性。
 DDL 根据能力位拒绝不支持的组合。
 这避免在 runtime 半路发现 AM 不会处理 unique、include、multicolumn 或 exclusion。
 但是能力位不能保证页面级正确性。
 它只是合同入口。
 真正 correctness 由 AM 实现、table AM scan、catalog 状态和 transaction 机制组合保证。
+
 ### catalog visibility correctness
+
 普通 build 在一个事务内创建 catalog rows、build index、更新 stats。
 外部 backend 在 commit 前看不到新 index。
 所以普通 build 可以用更强 table lock 和 `SnapshotAny` 处理旧 tuple。
@@ -659,7 +676,9 @@ valid means planner 可以使用。
 不能阻塞 writers 太久。
 又不能让 planner 使用不完整 index。
 还不能让 HOT update 在 index definition 可见前制造不兼容链。
+
 ### heap visibility correctness
+
 build path 不直接相信 heap scan 看到的 tuple 都是 live。
 非 concurrent build 用 `SnapshotAny`，再用 `HeapTupleSatisfiesVacuum()` 分类。
 `RECENTLY_DEAD` 可能仍需索引，因为旧 snapshot 可能还需要它。
@@ -668,7 +687,9 @@ concurrent build 使用 MVCC snapshot，只索引 snapshot 可见 tuple。
 validate pass 再补缺失。
 最终 valid 前等待 older snapshots。
 这三者一起保证新 index 对将来 planner 可用时不会漏掉对某些 snapshot 仍重要的 tuple。
+
 ### HOT correctness
+
 heap-only tuple 不一定用自己的 physical TID 建 index entry。
 build path 会把 HOT child 映射到 root TID。
 这保持 index entry 指向 HOT chain root 的语义。
@@ -676,7 +697,9 @@ build path 会把 HOT child 映射到 root TID。
 普通 build 之后可能设置 `indcheckxmin`。
 concurrent build 不设置它，而是通过 valid 前等待相关 snapshot 来解决。
 这说明 HOT correctness 横跨 heap AM、index build、catalog flag 和 snapshot horizon。
+
 ### unique correctness
+
 DML unique correctness 在 AM。
 `execIndexing.c:15-20` 明确说 unique AM insert 同时检查冲突，并负责原子性与等待。
 B-tree 在 `_bt_check_unique()` 中持有第一个可能含该 key 的 leaf write lock。
@@ -686,7 +709,9 @@ B-tree 在 `_bt_check_unique()` 中持有第一个可能含该 key 的 leaf writ
 这样把短 page lock 和长 transaction wait 分离。
 `UNIQUE_CHECK_PARTIAL` 则只返回 potential conflict。
 deferred trigger 或 speculative loop 以后再处理。
+
 ### WAL / crash correctness
+
 build path 使用 bulk smgr loading。
 `nbtsort.c:26-27` 说明它 bypass buffer cache 并高效 WAL-log pages。
 retail insert path 在 critical section 中修改 page、写 WAL、设置 page LSN。
@@ -695,7 +720,9 @@ page split 可能留下 incomplete split。
 后续 inserter 在插入前会 finish split。
 `_bt_finish_split()` 注释说明 crash 或 failure 可能留下 incomplete split，插入例程不会允许直接插到 incompletely split page。
 这保证 crash/retry 后结构修改能继续收尾。
+
 ### lock/pin correctness
+
 build path 的 table lock 和 snapshot 决定 heap tuple 集合。
 retail insert 的 B-tree buffer write lock 决定局部页结构。
 resource owner 管 pin/lock cleanup。
@@ -705,34 +732,45 @@ speculative insertion lock 管 `ON CONFLICT` 中“等 verdict 而非等整个�
 buffer lock 不能表达 SQL unique verdict。
 catalog invalidation 不能保护 page memory。
 transaction wait 不能保证 B-tree page 不被并发 split。
+
 ### SSI correctness
+
 `index_insert()` 在 AM 不处理 predicate locks 时调用 `CheckForSerializableConflictIn()`。
 B-tree 宣称 `ampredlocks = true`。
 B-tree insert 仍在合适 page 上调用 `CheckForSerializableConflictIn()`。
 `nbtinsert.c:247-254` 说明插入 index tuple 时需要检查现有 predicate lock。
 unique violation 前也会做一次 conflict-in check，避免 unique error 掩盖 serializable conflict。
 这是隔离级别 correctness，不是物理结构 correctness。
+
 ## 8. 错误路径 / 异常路径 / fallback
+
 ### AM 不支持功能
+
 `DefineIndex()` 在创建 catalog entry 前检查 AM 能力。
 不支持 unique、include、multicolumn 或 exclusion 会直接 ERROR。
 这是最早失败点。
 好处是不会创建半成品 catalog object。
 这类错误不进入 `index_create()`，也不会调用 `ambuild`。
+
 ### index relation 非空
+
 B-tree `btbuild()` 要求 index relation 为空。
 `nbtsort.c:323-325` 如果已有 block 就 ERROR。
 这保护 `btbuild()` 的假设：
 它会从 metapage 开始顺序构造整棵树。
 它不是向已有树增量填充的 API。
+
 ### unlogged index init fork
+
 `index_build()` build 完主 fork 后，如果 index 是 unlogged 且 init fork 不存在，会创建 init fork。
 然后调用 `ambuildempty()`。
 这是一条 persistence fallback。
 unlogged relation 崩溃后需要 init fork 作为重置模板。
 B-tree 的 `btbuildempty()` 只写一个空 metapage。
 这和 normal `btbuild()` 的 full load 不同。
+
 ### broken HOT chain
+
 普通 build 遇到潜在 broken HOT chain，不是直接失败。
 heap AM 设置 `ii_BrokenHotChain`。
 `index_build()` 在非 reindex、非 concurrent 场景设置 `indcheckxmin`。
@@ -740,7 +778,9 @@ heap AM 设置 `ii_BrokenHotChain`。
 index 可以创建，但对太旧 snapshot 不安全。
 等事务 horizon 推进后才安全使用。
 这是典型的 correctness 延迟策略。
+
 ### concurrent build validate
+
 concurrent build 的初始 build 一定可能漏掉并发写入期间的 tuple。
 系统不把这当错误。
 fallback 是 validate pass。
@@ -748,26 +788,34 @@ fallback 是 validate pass。
 对 unique index，它仍使用 `UNIQUE_CHECK_YES`。
 如果这一步发现真实 unique violation，就报错，concurrent build 失败。
 失败后留下的 invalid index 需要用户或后续命令处理。
+
 ### 等待 in-progress tuple
+
 heap build scan 在 unique 场景遇到 in-progress insert/delete，可能释放 buffer lock 后等待，再 recheck。
 B-tree retail insert 遇到 conflicting in-progress tuple，释放 leaf page lock，等待 xid 或 speculative token，然后从 root 重查。
 exclusion check 也会结束 index scan、等待、重试。
 共同规律是：
 不能在持有局部 index/page/buffer 内部锁时等待事务。
 等待之后也不能复用旧位置。
+
 ### `UNIQUE_CHECK_PARTIAL`
+
 deferred unique 和 speculative insert 不要求 insertion time 得到最终 verdict。
 AM 必须允许插入，并返回 potential conflict。
 这不是放松 correctness。
 这是把 final verdict 推迟到 deferred trigger 或 speculative loop。
 如果后续 recheck 失败，语句或事务再按约束语义处理。
+
 ### speculative livelock avoidance
+
 `execIndexing.c:77-95` 解释 speculative insertion 的 livelock 风险。
 两个 backend 同时 speculative 插入相同 key，如果都 back out 并立即 retry，可能反复冲突。
 PostgreSQL 用 XID 顺序决定谁等待、谁 back out。
 这在 `check_exclusion_or_unique_constraint()` 的 `CEOUC_LIVELOCK_PREVENTING_WAIT` 中体现。
 unique AM 的 `_bt_check_unique()` 也通过 speculative token 让其他 backend 等 verdict。
+
 ### page full fallback
+
 B-tree retail insert 目标 page 空间不足时，不马上 split。
 `_bt_findinsertloc()` 会尝试 `_bt_delete_or_dedup_one_page()`。
 这个函数先 simple deletion，再 bottom-up deletion，再 dedup。
@@ -775,15 +823,20 @@ B-tree retail insert 目标 page 空间不足时，不马上 split。
 这说明 page split 是 slow path，不是唯一 path。
 `indexUnchanged` hint 会提高 bottom-up deletion 的优先级。
 它是性能 hint，不是 correctness 输入。
+
 ### incomplete split
+
 crash 或 failure 可能让 split 处在 incomplete 状态。
 后续 inserter 在遇到 incompletely split page 时必须先 finish split。
 `_bt_stepright()` 和 `_bt_finish_split()` 都参与这个收尾。
 这是结构修改的 redo/fallback 机制。
 reader 依靠 high key/rightlink 通常仍能搜索。
 writer 负责完成 parent downlink。
+
 ## 9. 成本、资源与跨模块传播
+
 ### build path 成本模型
+
 普通 B-tree build 的主要成本是：
 heap scan 成本随 heap pages 和 heap tuples 增长。
 expression/predicate evaluation 成本随 index expression 复杂度和 tuple 数增长。
@@ -802,7 +855,9 @@ worker sortmem 是 `maintenance_work_mem / participants`。
 但 parallel build 仍会增加 CPU 并发、IO 并发、WAL/buffer usage 汇总和 DSM/worker 管理成本。
 如果 DSM 创建失败或 worker 没启动，`_bt_begin_parallel()` 回退 serial build。
 这是性能 fallback，不是 correctness fallback。
+
 ### insert path 成本模型
+
 retail insert 每个 index 都要付出一份成本。
 一个 INSERT 到有 N 个 ready index 的表，至少要形成 N 次 index datums，调用 N 次 `index_insert()`。
 partial index 可以通过 predicate 跳过。
@@ -819,7 +874,9 @@ WAL insertion 和可能的 WAL flush 间接压力。
 当 unique key 冲突指向 in-progress transaction 时，还会有 transaction wait。
 等待时间和被等待事务持续时间相关，不和 B-tree page 大小成比例。
 但等待前后的重查会增加 CPU 和 latch/lock 成本。
+
 ### resource propagation
+
 build path 消耗 `maintenance_work_mem`、temporary files、DSM、worker slots、WAL bandwidth、bulk write IO。
 这些压力会传播到：
 temp tablespace 或临时文件目录。
@@ -830,7 +887,9 @@ autovacuum 的 snapshot horizon 和 bloat 间接压力。
 insert path 消耗 shared buffer、WAL、relation extension、index page locks、transaction lock waits。
 多 index 表会把单条 heap write 放大成多条 index write。
 unique/exclusion index 还会把 heap visibility 和 lock manager wait 引入 hot path。
+
 ### cross-module boundaries
+
 commands 层决定 DDL flags、lock mode、concurrent phases。
 catalog 层创建 relation 和 `pg_index` 状态。
 table AM 层决定 build scan 中哪些 heap tuple 应进入 index。
@@ -841,7 +900,9 @@ storage/WAL 层提供持久化与 crash recovery。
 例如 `CREATE INDEX CONCURRENTLY` 为了降低 writer blocking，增加了多事务阶段、两次等待和 validate scan。
 例如 B-tree retail insert 为了降低 page split，增加了 bottom-up deletion 和 dedup slow path。
 例如 unique constraint 为了用户语义，把 heap visibility check 引入 index insert。
+
 ### background processes
+
 本节没有一个后台进程直接推进 IndexAM build/insert 的 correctness state。
 build 和 insert 都由前台 backend 或 parallel worker 执行。
 但后台进程会承接资源后果。
@@ -850,8 +911,11 @@ checkpointer/bgwriter 可能承接 build 或 insert 产生的 dirty page 写回�
 autovacuum 会影响 OldestXmin、dead tuple、HOT chain 和未来 bloat。
 startup process 在 crash recovery 时重放 B-tree WAL，并可能恢复 incomplete split 可继续完成的状态。
 archiver/replication 会放大 WAL volume 的外部可见成本。
+
 ## 10. 观测与诊断入口
+
 ### `pg_stat_progress_create_index`
+
 `CREATE INDEX` 和 `CREATE INDEX CONCURRENTLY` 最直接看 `pg_stat_progress_create_index`。
 能看到 command、phase、blocks done/total、tuples done/total、partitions done/total 等粒度。
 B-tree build 还会更新 subphase。
@@ -864,7 +928,9 @@ concurrent build 还能看到 wait phases。
 `indexcmds.c:1804-1806` phase wait 3。
 这些指标说明“卡在哪个阶段”。
 它们不能直接说明卡在哪个 tuple、哪个 key 或哪个 page。
+
 ### wait events
+
 build path 可能等待 relation locks、older snapshots、parallel workers、IO、WAL。
 `_bt_parallel_heapscan()` 使用 condition variable，wait event 是 `WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN`。
 concurrent build 等待旧事务时可以从 `pg_stat_activity` 和 lock wait 推断。
@@ -873,24 +939,32 @@ retail insert unique conflict 可能等待 transactionid 或 speculative inserti
 `pg_stat_activity.wait_event_type` 能显示 Lock、IO、LWLock 等大类。
 但 wait event 只说明当前等待点。
 它不等于完整性能归因。
+
 ### `EXPLAIN`
+
 `EXPLAIN (ANALYZE, BUFFERS, WAL)` 对普通 DML 能看到 heap/index 写入造成的 buffer 和 WAL 量。
 它不能直接列出每个 index AM 的内部 slow path。
 例如 B-tree bottom-up deletion、dedup 和 split 不会逐项显示。
 但 WAL 增多、shared dirtied/written 增多、execution time 增长可以提示 insert path 成本。
+
 ### catalog state
+
 `pg_index` 能观察 `indisready`、`indisvalid`、`indcheckxmin`。
 concurrent build 期间这些字段可以帮助定位阶段。
 但 catalog view 有 MVCC 可见性。
 不同 session 在不同 transaction snapshot 下看到的状态可能不同。
 relcache invalidation 也不是瞬时同步所有已执行语句。
+
 ### page-level observation
+
 `pageinspect` 可以观察 B-tree metapage、page opaque、items、high key、posting list 等。
 它适合验证 build 后页面密度、rightlink、root level。
 但它不能安全地在生产高并发下证明完整因果。
 page 状态是瞬时的。
 insert path 中的等待、unique recheck、speculative token 需要日志、gdb 或 injection point 更适合。
+
 ### gdb / breakpoint
+
 源码跟读时常用断点：
 `DefineIndex`
 `index_create`
@@ -912,7 +986,9 @@ build scan 使用的是 `SnapshotAny` 还是 MVCC snapshot。
 `BTBuildState.spool2` 是否存在。
 `_bt_check_unique()` 是否返回 `xwait`。
 `_bt_insertonpg()` 是否进入 split path。
+
 ### 能看见 / 只能推断 / 看不见
+
 能直接看见：
 progress phase、lock wait、catalog flags、relation size、WAL counters、EXPLAIN WAL/buffers。
 可以通过工具观察：
@@ -928,7 +1004,9 @@ AM 私有缓存的完整生命周期。
 诊断时要把这些层次分开。
 不要把 `pg_stat_progress_create_index` 当成完整因果图。
 也不要把 pageinspect 的某个 page snapshot 当成整个 build 历史。
+
 ## 11. 常见误区
+
 误区一：
 `ambuild` 会逐条调用 `aminsert`。
 B-tree 不是这样。
@@ -967,8 +1045,11 @@ retail insert 只是在 leaf page 上插一个 tuple。
 AM 可以拒绝、合并、dedup 或用不同方式存储 tuple。
 table AM 返回 heap tuple count。
 AM 自己返回 index tuple stats。
+
 ## 12. 课堂实验
+
 ### 实验一：跟普通 build 的 callback 边界
+
 目标：
 确认普通 `CREATE INDEX` 不是逐条调用 `btinsert()`，而是调用 `btbuild()`。
 步骤：
@@ -981,7 +1062,9 @@ AM 自己返回 index tuple stats。
 需要回答：
 `_bt_build_callback()` 收到的是 `values/isnull/TID/tupleIsAlive`，不是已经形成好的 B-tree page item。
 AM 可以选择自己的 build strategy。
+
 ### 实验二：观察 concurrent build 的 catalog 阶段
+
 目标：
 确认 `indisready` 和 `indisvalid` 分阶段变化。
 步骤：
@@ -994,7 +1077,9 @@ AM 可以选择自己的 build strategy。
 为什么 ready 之后 planner 仍不能使用？
 为什么 valid 前还要等待 older snapshots？
 为什么不同 session 看到 catalog 状态可能受 transaction snapshot 影响？
+
 ### 实验三：观察 unique insert 的 wait/retry
+
 目标：
 确认 DML unique insert 的冲突等待发生在 AM insert path 内。
 步骤：
@@ -1008,7 +1093,9 @@ AM 可以选择自己的 build strategy。
 为什么等待前必须释放 B-tree leaf buffer？
 为什么等待后从 root 重新 search？
 为什么 `index_insert()` wrapper 本身没有实现 unique wait？
+
 ## 13. 讨论题
+
 1. 为什么 `index_build()` 不直接扫描 heap 后逐条调用 `index_insert()`？请从排序、WAL、buffer cache、page split 和 unique dead tuple 角度回答。
 2. `IndexInfo.ii_ReadyForInserts`、`pg_index.indisready`、`pg_index.indisvalid` 分别服务哪个调用者？如果把它们合并会破坏什么场景？
 3. concurrent build 的 validate pass 为什么先收集 index TID 再扫 heap merge，而不是直接对每个 heap tuple 做 index lookup？
@@ -1017,7 +1104,9 @@ AM 可以选择自己的 build strategy。
 6. B-tree build 的 `spool2` 为什么只在 unique index 中需要？dead tuples 为什么仍可能需要进入最终 index？
 7. 如果一个 AM 宣称 `amcanbuildparallel`，它必须额外处理哪些资源和 snapshot 边界？
 8. 观测一次 insert 变慢时，如何区分 index 数量放大、unique wait、page split、WAL flush 和 expression evaluation 成本？
+
 ## 14. 本节小结
+
 本节唯一主问题是：
 一个统一的 IndexAM 抽象如何同时承接批量 build 和逐条 insert。
 核心答案是路径分离、状态分层、合同稳定。

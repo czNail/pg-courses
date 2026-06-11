@@ -1,6 +1,7 @@
 # PostgreSQL B-tree search、scankey 与并发页面移动
+
 ## 课程定位
-本节主题：B-tree search、scankey 与并发页面移动。
+
 前置知识：
 - 已理解 buffer pin 和 buffer content lock 的区别。
 - 已理解 relation fork、page special area、WAL-before-data。
@@ -37,39 +38,15 @@ PostgreSQL 的选择是：
 - search 下降路径为什么通常不做 parent-child lock coupling。
 - split 写路径在哪些地方必须短暂持有相邻 page 或 parent-child 锁。
 - 哪些现象能用 SQL 和 `pageinspect` 观察，哪些只能用 gdb、日志或源码注入点推断。
-## 源码基线
-源码仓库：
-```text
-/home/nail/postgres-lab
-```
-基线：
-```text
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
-```
-本节重点阅读：
-```text
-src/backend/access/nbtree/nbtsearch.c
-src/backend/access/nbtree/nbtpage.c
-src/backend/access/nbtree/nbtutils.c
-src/backend/access/nbtree/nbtpreprocesskeys.c
-src/backend/access/nbtree/README
-src/include/access/nbtree.h
-```
-为把 split 写路径讲完整，本节还少量对照：
-```text
-src/backend/access/nbtree/nbtinsert.c
-src/backend/access/nbtree/nbtreadpage.c
-contrib/pageinspect
-```
+
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。行号来自 `nl -ba <source-file>`；重点源码和对照入口统一放在第 3 节的阅读顺序里。
+
 这不是把课程扩展成插入课或 pageinspect 课。
 `nbtinsert.c` 只用于解释 split 如何给 `_bt_moveright()` 留下可恢复状态。
 `nbtreadpage.c` 只用于解释 `_bt_preprocess_keys()` 的 required flags 如何在 page 内扫描时收束 `continuescan`。
-行号来自：
-```text
-nl -ba <source-file>
-```
+
 ## 1. 本节在总主线中的位置
+
 前面几节从 heap page、FSM/VM、WAL 和 buffer 边界讲到了“一个 page 内部状态怎么安全变化”。
 本节向 index AM 的查找路径移动。
 heap 的问题通常是：
@@ -84,6 +61,7 @@ PostgreSQL 的 nbtree 不能这样想。
 它的 leaf scan 要把 TID 返回给执行器。
 它的 page deletion 和 VACUUM 还会让物理 sibling 链出现暂时需要绕行的状态。
 本节只抓住一个主流程链路：
+
 ```text
 executor search qual
   -> search-type ScanKey
@@ -95,6 +73,7 @@ executor search qual
   -> leaf 上 _bt_binsrch()
   -> _bt_readfirstpage()/后续 leaf scan
 ```
+
 这条链路对应真实 runtime 现象：
 并发插入触发 leaf split 时，读者不需要重启整棵树搜索。
 它可能落到旧左页。
@@ -107,12 +86,16 @@ executor search qual
 本节不讲 dedup posting list 的空间优化细节。
 这些都会出现，但只服务一个问题：
 搜索如何在页面移动边界时继续找对位置。
+
 ## 2. 核心矛盾与一句话运行模型
+
 一句话运行模型：
+
 ```text
 PostgreSQL nbtree 搜索只把 parent downlink 当作候选入口；
 child page 的 high key/rightlink 才是并发 split 后修正方向的运行时事实。
 ```
+
 普通 B-tree 查找依赖一个隐含条件：
 父节点指向的子节点 key range 在查找期间不变。
 PostgreSQL 不能要求这个条件。
@@ -144,15 +127,18 @@ read path 不长期持有 parent lock。
 这就制造了 race：
 刚才 parent 上看到的 downlink 可能已经被并发 split 弄旧。
 `_bt_search()` 在下一轮开始调用 `_bt_moveright()` 来修正。
-所以本节的核心 tension 不是“B-tree 如何二分查找”。
-真正 tension 是：
+所以本节的核心矛盾 不是“B-tree 如何二分查找”。
+真正的矛盾是：
 搜索必须快到几乎只锁单页。
 但 split 会让页面 keyspace 向右移动。
 系统必须让短锁搜索仍然有可恢复路径。
 这也是为什么 high key/rightlink 不是 pageinspect 里好看的元数据。
 它们是运行时正确性边界。
+
 ## 3. 核心文件分工与阅读顺序
+
 推荐按运行链路读，不按文件名读。
+
 | 顺序 | 文件 | 读什么 | 为什么 |
 | --- | --- | --- | --- |
 | 1 | `src/backend/access/nbtree/README` | Lehman-Yao rightlink/high key、锁规则、split 两阶段 | 先建立 mental model |
@@ -164,12 +150,14 @@ read path 不长期持有 parent lock。
 | 7 | `src/backend/access/nbtree/nbtinsert.c` | `_bt_split()`、`_bt_insert_parent()`、`_bt_finish_split()`、`_bt_getstackbuf()` | split 给搜索留下什么并发状态 |
 | 8 | `src/backend/access/nbtree/nbtreadpage.c` | `_bt_readpage()`、`_bt_checkkeys()` | 预处理 flags 如何结束 leaf scan |
 | 9 | `contrib/pageinspect` | `bt_metap()`、`bt_page_stats()`、`bt_page_items()` | 观察 high key、rightlink 和 page flags |
+
 不要先从 `btgettuple()` 顺读。
 `btgettuple()` 是 AM 对外入口。
 本节的关键是 search key 如何定位 leaf。
 也不要从 `_bt_split()` 的空间计算开始。
 split point 的选择会很有趣，但不是本节主问题。
 先抓住这些入口：
+
 ```text
 _bt_preprocess_keys()
 _bt_first()
@@ -179,6 +167,7 @@ _bt_split()
 _bt_insert_parent()
 _bt_finish_split()
 ```
+
 读源码时优先找状态变化：
 `ScanKey` 变成 `so->keyData[]`。
 `so->keyData[]` 变成 `BTScanInsertData inskey`。
@@ -188,7 +177,9 @@ split 把 old page 变成 left page。
 split 创建 right page。
 parent downlink 延迟补入。
 `BTP_INCOMPLETE_SPLIT` 标志清除。
+
 ## 4. 关键状态与边界
+
 先看 page-level 状态。
 `BTPageOpaqueData` 在 `src/include/access/nbtree.h:63-70`。
 它位于 page special area，不是普通 tuple。
@@ -250,12 +241,16 @@ raw field 不是语义。
 `btpo_next + high key + buffer lock` 才能解释 search 是否要右移。
 `sk_strategy + SK_BT_REQFWD/SK_BT_REQBKWD + scan direction` 才能解释一个 key 是否能结束 scan。
 `scantid + heapkeyspace + nextkey` 才能解释 `_bt_compare()` 的定位结果。
+
 ## 5. scankey preprocessing：从 qual 到可停止边界
+
 执行器传给 AM 的 `ScanKey` 是 search-type scankey。
 它表达谓词，例如：
+
 ```sql
 WHERE x = 1 AND y < 4 AND z < 5
 ```
+
 但 B-tree scan 不只是逐项检查谓词。
 它还要决定：
 从哪里开始。
@@ -333,7 +328,9 @@ scankey preprocessing 不是简单“把 WHERE 条件排个序”。
 第三，当无法证明冗余或矛盾时，不能为了性能假装知道。
 只能保留更多 key，让 `_bt_checkkeys()` 做更多 tuple-level 判断。
 本节后面的 `_bt_first()` 正是消费这些预处理结果。
+
 ## 6. `_bt_first()`：把 search-type keys 变成定位用的 insertion scankey
+
 `_bt_first()` 位于 `src/backend/access/nbtree/nbtsearch.c:883`。
 它的注释 `863-881` 说：
 它寻找 scan 的第一个 item。
@@ -396,9 +393,11 @@ backward scan 等价于 `<=`。
 `nextkey=true` 找 `>`。
 `backward` 决定 `_bt_binsrch()` 在 leaf 上返回第一个候选还是最后一个候选。
 `_bt_first()` 在 `nbtsearch.c:1512-1513` 调用：
+
 ```text
 _bt_search(rel, NULL, &inskey, &so->currPos.buf, BT_READ, false)
 ```
+
 注意第二个参数 `heaprel` 是 NULL。
 读路径不会创建 root，也不会 finish split。
 它只需要找到 leaf。
@@ -418,7 +417,9 @@ MVCC、predicate lock、buffer lock、rightlink/high key 分别解决不同层�
 从这个点开始，课程可以转入 leaf page scan。
 但本节的主问题已经完成了一半：
 预处理和 `_bt_first()` 为 `_bt_search()` 提供了一个能被 high key/rightlink 正确消费的定位 key。
+
 ## 7. `_bt_search()`：候选 downlink 与逐层修正
+
 `_bt_search()` 在 `src/backend/access/nbtree/nbtsearch.c:99-208`。
 它的函数注释 `76-98` 非常直接。
 它搜索某个 scankey。
@@ -495,7 +496,9 @@ internal page 也可能 split。
 只要中间释放过 page lock，就必须准备重新验证 high key。
 `_bt_search()` 本身不保证 parent chain 永远新鲜。
 它只保证最终返回的 leaf 已经按传入 insertion scankey 右追赶过。
+
 ## 8. `_bt_moveright()`：high key 判断与 rightlink 追赶
+
 `_bt_moveright()` 在 `nbtsearch.c:241-322`。
 注释 `211-239` 是本节核心。
 当搜索跟随某个 pointer 到达 page 后，该 page 可能已经改变。
@@ -507,13 +510,17 @@ internal page 也可能 split。
 因为 `nextkey=true` 要找的是第一个 `> key`。
 `nbtsearch.c:257-268` 解释了这个比较。
 代码把比较阈值写成：
+
 ```text
 cmpval = key->nextkey ? 0 : 1
 ```
+
 随后在循环里执行：
+
 ```text
 P_IGNORE(opaque) || _bt_compare(rel, key, page, P_HIKEY) >= cmpval
 ```
+
 如果为真，就通过 `opaque->btpo_next` 右移。
 这段在 `nbtsearch.c:307-311`。
 解释要非常小心。
@@ -564,12 +571,15 @@ README `652-655` 说，缺失 downlink 也可以让 search 通过 rightlink 找�
 它没有 stack。
 也不会修复 incomplete split。
 这里可以形成一个小不变量：
+
 ```text
 缺失 parent downlink 不影响 reader 找到右页；
 缺失 parent downlink 会影响 writer 后续 split；
 所以 reader 追 rightlink，writer 先补 downlink。
 ```
+
 ## 9. `_bt_binsrch()` 与 `_bt_compare()`：页内定位不是并发修正
+
 `_bt_moveright()` 只决定当前 page 是否属于正确 key range。
 它不负责页内 offset。
 页内 offset 由 `_bt_binsrch()` 处理。
@@ -615,7 +625,9 @@ logical duplicates 按 heap TID 排序。
 preprocessing 决定可定位边界。
 `_bt_first()` 转换为 insertion scankey。
 `_bt_compare()` 在 high key、pivot tuple、leaf tuple 上使用同一套排序语义。
+
 ## 10. split 写路径：为什么 rightlink 追赶一定可用
+
 只读 `_bt_moveright()` 会知道“怎么追”。
 但要相信它，还要看 split 如何制造可追的状态。
 split 主体在 `src/backend/access/nbtree/nbtinsert.c`。
@@ -703,7 +715,9 @@ insertion routines 不允许插入到 incompletely split page。
 必要时读 metapage 判断是否 root split。
 然后调用 `_bt_insert_parent()`。
 这就是 `_bt_moveright(forupdate=true)` 遇到 incomplete split 时调用 `_bt_finish_split()` 的原因。
+
 ## 11. latch/lock coupling 边界
+
 PostgreSQL 代码里主要说 buffer lock，而不是直接说 latch。
 很多论文或系统实现会把 page-level mutual exclusion 叫 latch。
 在本节，最好把它具体化为：
@@ -764,6 +778,7 @@ leftlink 是 PostgreSQL 为 backward scan 增加的复杂性。
 `_bt_gettrueroot()` 注释 `576-582` 明确说，持有 metapage lock 再移动到 root 可能和 concurrent root split deadlock。
 所以这里也避免跨层锁链。
 总的锁边界可以压缩成：
+
 ```text
 read descent: usually one page locked at a time
 move right: release current, lock right sibling
@@ -771,10 +786,13 @@ split sibling update: lock left then right
 finish split parent insert: hold child/parent only across atomic update
 move left: validate by walking right, because leftlink may be stale
 ```
+
 如果用 latch coupling 这个词，必须说清楚是哪一类。
 本节里的“latch”不是 PostgreSQL `Latch` 事件等待对象。
 它是 page-level buffer content lock 的并发控制语义。
+
 ## 12. 生命周期、ownership 与 cleanup
+
 search scan 的长期状态在 backend-local memory。
 `BTScanOpaqueData` 由 btree scan 初始化并挂在 `IndexScanDesc->opaque`。
 `_bt_preprocess_keys()` 把输出 key 放到 `so->keyData[]`。
@@ -825,7 +843,9 @@ parent insertion 是第二个 WAL record。
 恢复后 tree 对 reader 仍一致。
 但 writer 后续会补 parent downlink。
 这是一种典型的“局部结构先可搜索，再延迟补全上层索引”的设计。
+
 ## 13. 正确性机制层次
+
 第一层是 B-link tree 不变量。
 非右端 page 有 high key。
 rightlink 指向右 sibling。
@@ -870,7 +890,9 @@ WAL 保证 crash 后结构能恢复到某个一致状态。
 它不减少前台 search 的比较次数。
 predicate lock 保证 SSI 逻辑冲突。
 它不保护 page 内存安全。
+
 ## 14. 错误路径、异常路径与 fallback
+
 第一类是 scan qual 矛盾。
 `_bt_preprocess_keys()` 发现 `x = 1 AND x > 2` 这类条件时设置 `so->qual_ok=false`。
 `_bt_first()` 直接返回 false，边界在 `nbtpreprocesskeys.c:170-175` 和 `nbtsearch.c:904-913`。
@@ -908,7 +930,9 @@ root 也不能绕开 rightlink/high key reasoning。
 `_bt_lock_and_validate_left()` 不直接相信 leftlink。
 它检查候选 left sibling 的 `btpo_next` 是否指回原 page，不符合时向右修正。
 本节主线是 rightlink 追赶，但调试 backward scan 时必须记住这个边界。
+
 ## 15. 成本、资源与跨模块传播
+
 成本一是 tree height。
 普通 `_bt_search()` 每层一次 page 访问和一次 binary search。
 `_bt_getroot()` cache miss 时还要访问 metapage。
@@ -933,7 +957,9 @@ SSI predicate locking 处理 serializable phantom 边界。
 heap/table AM 处理最终 TID 可见性和 unique check 中的 heap 访问。
 VACUUM/page deletion 维护 half-dead/deleted page，并依赖 rightlink 可恢复性。
 pageinspect 把 page opaque 和 high key 暴露给 SQL 观察。
+
 ## 16. 观测与诊断入口
+
 能直接观察的状态包括 `bt_metap()` 的 root/level/fastroot，`bt_page_stats()` 的 sibling link、level、flags，以及 `bt_page_items()` 的 page item。
 非右端 page 的 itemoffset 1 通常是 high key。
 `EXPLAIN (ANALYZE, BUFFERS)`、`pg_stat_all_indexes.idx_scan` 和 `pg_stat_io` 可以辅助观察访问成本。
@@ -941,6 +967,7 @@ pageinspect 把 page opaque 和 high key 暴露给 SQL 观察。
 这些通常需要 gdb、perf、tracepoint、临时日志或源码计数器。
 短暂 buffer lock coupling、critical section 内的 split 两阶段、某个 writer 是否刚调用 `_bt_finish_split()`，几乎不能从 SQL 直接看到。
 实验时可以使用这些断点：
+
 ```text
 break _bt_preprocess_keys
 break _bt_first
@@ -951,23 +978,29 @@ break _bt_insert_parent
 break _bt_finish_split
 break _bt_getstackbuf
 ```
+
 如果 PostgreSQL 构建启用了 injection points，可以关注：
+
 ```text
 nbtree-leave-leaf-split-incomplete
 nbtree-leave-internal-split-incomplete
 nbtree-finish-incomplete-split
 ```
+
 这些注入点正好位于 split 第一阶段和 finish split 路径。
 没有 injection point 时，gdb breakpoint 也足够完成课堂实验。
 诊断时不要把所有 index scan 变慢都归因于 `_bt_moveright()`。
 更常见的原因包括 selectivity 错估、heap fetch 太多、visibility map 不足、cache miss、rightmost page insert contention、unique check 等待 heap 事务，以及 VACUUM/page deletion 干扰。
 如果你怀疑 concurrent split 影响 search，先用 pageinspect 看页面 sibling/high key 结构，再用 gdb/perf 观察 `_bt_moveright()` 是否频繁命中右移路径。
+
 ## 17. 课堂实验一：用 pageinspect 观察 high key 和 rightlink
+
 目标：
 看到 B-tree leaf page 的 high key、rightlink 和 level。
 准备：
 需要安装 `pageinspect` extension。
 SQL：
+
 ```sql
 CREATE EXTENSION IF NOT EXISTS pageinspect;
 DROP TABLE IF EXISTS btree_move_demo;
@@ -988,6 +1021,7 @@ FROM bt_page_items('btree_move_demo_id_idx', 1)
 ORDER BY itemoffset
 LIMIT 5;
 ```
+
 观察点：
 如果 block 1 是非右端 leaf，它的 `btpo_next` 不是 0。
 `btpo_level=0` 表示 leaf。
@@ -1003,12 +1037,15 @@ LIMIT 5;
 `pageinspect` 看到的是某一刻 page 内容。
 它不能告诉你某个查询是否刚刚调用了 `_bt_moveright()`。
 这个实验只是把源码字段和物理页面对应起来。
+
 ## 18. 课堂实验二：观察 `_bt_first()` 选择起点与 scankey preprocessing
+
 目标：
 理解 search-type scankey 如何变成定位用 insertion scankey。
 准备：
 用 debug build 或可附加 gdb 的本地 PostgreSQL。
 建立复合索引：
+
 ```sql
 DROP TABLE IF EXISTS btree_scankey_demo;
 CREATE TABLE btree_scankey_demo(a int, b int, c int, payload text);
@@ -1018,26 +1055,33 @@ FROM generate_series(1, 200000) AS g;
 CREATE INDEX btree_scankey_demo_abc_idx ON btree_scankey_demo(a, b, c);
 ANALYZE btree_scankey_demo;
 ```
+
 查询一：
+
 ```sql
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT *
 FROM btree_scankey_demo
 WHERE a = 10 AND b < 4 AND c < 5;
 ```
+
 查询二：
+
 ```sql
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT *
 FROM btree_scankey_demo
 WHERE b = 4;
 ```
+
 gdb 断点：
+
 ```text
 break _bt_preprocess_keys
 break _bt_first
 break _bt_search
 ```
+
 观察点：
 在 `_bt_preprocess_keys()` 后查看 `((BTScanOpaque) scan->opaque)->keyData`。
 关注 `sk_attno`、`sk_strategy`、`sk_flags`。
@@ -1055,7 +1099,9 @@ strategy 到 `nextkey/backward` 的映射在 `nbtsearch.c:1435-1506`。
 如果没有 skip support 或成本不合适，表现可能接近宽扫描。
 这个实验的重点不是性能数字。
 重点是看 `so->keyData[]` 如何从 SQL predicate 变成 scan 状态机。
+
 ## 19. 课堂实验三：让 split 和 `_bt_moveright()` 出现在调试现场
+
 目标：
 观察并发插入触发 split 时，搜索侧如何进入 `_bt_moveright()`。
 准备：
@@ -1063,6 +1109,7 @@ strategy 到 `nextkey/backward` 的映射在 `nbtsearch.c:1435-1506`。
 最好关闭过多优化。
 让两个 psql session 并发操作同一索引。
 建表：
+
 ```sql
 DROP TABLE IF EXISTS btree_split_demo;
 CREATE TABLE btree_split_demo(id bigint, payload text);
@@ -1072,19 +1119,25 @@ SELECT g, repeat('x', 400)
 FROM generate_series(1, 50000) AS g;
 ANALYZE btree_split_demo;
 ```
+
 Session A 持续插入：
+
 ```sql
 INSERT INTO btree_split_demo
 SELECT g, repeat('y', 400)
 FROM generate_series(50001, 200000) AS g;
 ```
+
 Session B 持续查询：
+
 ```sql
 SELECT count(*)
 FROM btree_split_demo
 WHERE id BETWEEN 75000 AND 76000;
 ```
+
 gdb 断点：
+
 ```text
 break _bt_split
 break _bt_moveright
@@ -1093,6 +1146,7 @@ commands
   continue
 end
 ```
+
 如果输出太多，可以在 `_bt_moveright()` 内部 `P_IGNORE` 或 high key compare 分支附近加条件断点。
 源码级观察点：
 在 `_bt_split()` 看 `origpagenumber`、`rightpagenumber`。
@@ -1111,7 +1165,9 @@ writer 遇到 incomplete split 会补 parent downlink。
 如果没有命中 `_bt_moveright()` 右移分支，不说明机制不存在。
 它只说明当次查询没有踩到 stale downlink 窗口。
 可以增大并发、降低 fillfactor、使用大 payload、或用 injection point 扩大窗口。
+
 ## 20. 常见误区
+
 误区一：
 把 parent downlink 当作永远准确的 child key range。
 在 nbtree 中，downlink 是候选入口。
@@ -1148,7 +1204,9 @@ README `88-101` 说 scan 会记住扫描页面当时的 rightlink。
 rightlink chase 可能贡献 buffer hit。
 但 buffer hit 还包括 root/internal/leaf 正常访问、heap fetch、visibility map 等。
 需要源码断点或计数器才能确认。
+
 ## 21. 讨论题
+
 1. 为什么 `_bt_search()` 不能只在 root 读到 downlink 后一路相信 parent 指针？
 2. 如果 split 后先插 parent downlink，再更新 left page high key/rightlink，会破坏哪些读者假设？
 3. `BTP_INCOMPLETE_SPLIT` 为什么标在左页，而不是标在缺 downlink 的右页？
@@ -1157,7 +1215,9 @@ rightlink chase 可能贡献 buffer hit。
 6. 为什么 read-only index scan 不修复 incomplete split？
 7. 为什么 backward scan 不能像 forward scan 一样简单相信 sibling link？
 8. `pageinspect` 能帮助你看到什么？它看不到 `_bt_moveright()` 的哪些 runtime 事实？
+
 ## 22. 本节小结
+
 本节唯一主问题是：
 nbtree 如何在短 page lock 搜索下，仍然对 concurrent split 保持正确定位。
 核心答案是：

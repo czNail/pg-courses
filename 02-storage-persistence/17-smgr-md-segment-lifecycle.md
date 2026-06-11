@@ -1,9 +1,6 @@
 # PostgreSQL smgr/md segment create、extend、truncate
 
 ## 课程定位
-本节主题：PostgreSQL 的 storage manager 如何把一个 relation fork 映射成一组磁盘 segment 文件。 重点是 `smgr` API 到 `md` 实现之间的边界。 也就是从 `smgrcreate()`、`smgrextend()`、`smgrzeroextend()`、`smgrread()`、`smgrwrite()`、`smgrtruncate()`、`smgrdounlinkall()` 这些入口，走到 `md.c` 里真正的文件创建、扩展、读取、写入、截断和删除。
-本节只讲 heap/index 等普通 relation 文件的 storage manager 侧生命周期。 不展开 buffer replacement。 不展开 WAL record 格式。
-不展开 heap tuple、btree page split 等访问方法语义。 但会解释这些上层模块为什么依赖 `smgr/md` 提供清晰的错误边界和持久化边界。
 
 本节唯一主问题：
 一个 relation fork 可以持续扩展、被截断、被删除、被 redo 重放，为什么 PostgreSQL 不让上层直接操作文件，而是在 `smgr` 和 `md.c` 之间维护 segment 生命周期协议？
@@ -33,8 +30,29 @@
 - `bulk_write.c` 为什么可以直接调用 `smgrextend()`，以及它怎样补齐 checkpoint 竞态。
 - 哪些错误是 `ERROR`，哪些路径必须降级成 `WARNING`，哪些路径会 `FATAL` 或 `PANIC`。
 
-## 源码基线
-源码仓库：`/home/nail/postgres-lab` 基线：`master` = `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`
+源码基线：本课使用当前实际源码路径 `/home/highgo/postgres`，branch `master`，commit `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`；核心源码分工见第 3 节。
+
+## 1. 本节在总主线中的位置
+
+上一节已经把 relation fork、block number 和 relpath 的寻址边界讲清楚。本节往下一层，看这个 fork 在磁盘上怎样落成一个或多个 segment 文件，以及为什么 buffer manager、redo、catalog storage 和 bulk writer 都不直接绕过 `smgr` 去操作普通 relation 文件。
+
+这节的入口不是“md.c 有多少函数”，而是：当上层只说读写某个 fork 的 block 时，哪一层负责 segment 拆分、fd 生命周期、短读短写、truncate、unlink 和 fsync 责任。
+
+## 2. 核心矛盾与一句话运行模型
+
+一句话运行模型：
+
+```text
+上层模块把 I/O 表达成 relation fork + block number，smgr 维护 backend-local SMgrRelation 并分派到 md.c，md.c 再把 block 映射到 segment 文件、VFD File 和 checkpoint fsync/unlink 请求。
+```
+
+核心矛盾是：上层需要稳定的 block 语义，文件系统只提供有限大小文件、fd、write、truncate、fsync 和 unlink；`smgr/md` 的价值就是把这些不整齐的 OS 行为收束成 PostgreSQL 可恢复的 relation storage 协议。
+
+## 3. 核心文件分工与阅读顺序
+
+本节把源码基线、重点入口和辅助核对路径集中放在这里，避免课程定位之后再漂一个未编号大节。
+
+源码仓库：`/home/highgo/postgres` 基线：`master` = `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`
 
 本节重点阅读：
 - `src/backend/storage/smgr/smgr.c`
@@ -64,9 +82,8 @@
 - `smgr.c` 当前只有一个 `smgrsw[]` entry，也就是 `md.c`。
 - `md.c` 的文件名历史上叫 magnetic disk，但注释已经说明它实际是 Unix-like filesystem storage manager。
 
----
+## 4. 主流程入口：smgr 到 md 的分层
 
-## 1. 先给结论
 `smgr` 是 relation file I/O 的公共入口。 它不直接拼文件名。 它不直接 `open()`、`write()`、`fsync()`。
 它维护每个 backend 的 `SMgrRelation` 缓存，然后把操作分派到具体 storage manager。 当前源码基线里具体实现只有 `md.c`。 所以大多数调用路径长这样：
 
@@ -111,9 +128,8 @@ seekpos_bytes      = BLCKSZ * segoff_blocks
 这个不变量解释了很多看起来奇怪的行为。 `mdtruncate()` 不急着删除 inactive segment。 `mdunlink()` 删除 relation 时会先 truncate 再 unlink 后续 segment。
 `mdregistersync()` 和 `mdimmedsync()` 会关心 active 和 inactive segment。 这些设计都是为了处理其他 backend、checkpointer 或 kernel 仍持有旧 fd 的情况。
 
----
+## 5. 从 `smgr.h` 看公开 API
 
-## 2. 从 `smgr.h` 看公开 API
 先读 `src/include/storage/smgr.h`。 `SMgrRelationData` 是 `SMgrRelation` 的实体。 它的第一个字段是 `smgr_rlocator`。
 注释说明这个字段必须放在第一位，因为它是 hash table lookup key。
 
@@ -166,9 +182,8 @@ smgrwrite(...) -> smgrwritev(..., &buffer, 1, skipFsync)
 
 这说明当前源码已经把底层读写 API 向 vector I/O 迁移。 上层仍然可以用单页 `smgrread()` 和 `smgrwrite()`。 但真正的 dispatch 函数是 `smgrreadv()` 和 `smgrwritev()`。
 
----
+## 6. `smgr.c` 是 switch 层
 
-## 3. `smgr.c` 是 switch 层
 读 `src/backend/storage/smgr/smgr.c:78-126`。 这里定义 `struct f_smgr`。 它是一组函数指针。
 这个结构就是 `smgr.c` 和某个 storage manager module 之间的 ABI。
 
@@ -219,9 +234,8 @@ procsignal 又可能触发 `smgrreleaseall()`。 如果这发生在 `smgr.c` 或
 unlink 通常发生在 transaction commit/abort 后的 cleanup。 那时已经太晚，不能再把事务变成失败。 所以 unlink 失败应该报 `WARNING`，而不是 `ERROR`。
 `mdunlink()` 正是按这个约定实现的。
 
----
+## 7. `smgropen()` 与 `SMgrRelation` 缓存
 
-## 4. `smgropen()` 与 `SMgrRelation` 缓存
 读 `src/backend/storage/smgr/smgr.c:225-289`。 `smgropen()` 的注释很关键。 它返回一个 `SMgrRelation` 对象。
 如果 hash table 中已经有这个 relation，就返回同一个 entry。 如果没有，就创建一个新的 entry。 这个函数不打开底层文件。
 它只创建或查找 backend-local 的 smgr cache entry。
@@ -260,9 +274,8 @@ unlink 通常发生在 transaction commit/abort 后的 cleanup。 那时已经�
 这和 procsignal barrier 相关。 `PROCSIGNAL_BARRIER_SMGRRELEASE` 要求 backend 立即关闭 open files。 `ProcessBarrierSmgrRelease()` 调用 `smgrreleaseall()`。
 这不会销毁 `SMgrRelation` 对象。 它只关闭 fd、清 cached size。 因为 barrier 可能发生在事务中间，不能让仍被调用栈引用的 `SMgrRelation *` 失效。
 
----
+## 8. segment 拆分与路径规则
 
-## 5. segment 拆分与路径规则
 `md.c` 文件头是本节最重要的注释之一。 它说明 PostgreSQL 把大 relation 拆成多个 segment 文件，是为了避开操作系统单文件大小限制。 segment size 由 `RELSEG_SIZE` 决定。
 
 `RELSEG_SIZE` 的单位不是 byte。 它的单位是 PostgreSQL block。 单个 segment 文件最大大小是：
@@ -338,9 +351,8 @@ base/5/16384.2
 
 fork 后缀和 segment 后缀是两个不同概念。 FSM fork、VM fork、INIT fork 的基础路径由 `relpath()` 处理。 segment 后缀由 `md.c` 在基础路径后继续追加 `.segno`。
 
----
+## 9. `MdfdVec` 与 open segment array
 
-## 6. `MdfdVec` 与 open segment array
 `md.c` 中 `MdfdVec` 很小：
 - `mdfd_vfd` 是 fd.c descriptor pool 中的 `File`。
 - `mdfd_segno` 是 segment number。
@@ -363,9 +375,8 @@ fork 后缀和 segment 后缀是两个不同概念。 FSM fork、VM fork、INIT 
 `mdnblocks()` 有一个副作用。 它会打开所有 active segment，并把它们加入 `md_seg_fds`。 这就是为什么 `mdtruncate()` 的注释要求 caller 必须先调用 `smgrnblocks()` 得到当前大小。
 `mdtruncate()` 不自己探索磁盘上的 active segments。 它依赖 `mdnblocks()` 已经把 active segments 都打开。 这样 truncate loop 才能从最后一个 active segment 往前处理。
 
----
+## 10. `mdcreate()`：创建第 0 个 segment
 
-## 7. `mdcreate()`：创建第 0 个 segment
 `smgrcreate()` 在 `smgr.c` 中只是 dispatch。 真正实现是 `mdcreate()`。 读 `src/backend/storage/smgr/md.c:217-274`。
 
 `mdcreate()` 的语义是创建一个 relation fork 的第 0 个 segment。 它不创建 `.1`、`.2`。 后续 segment 由 `_mdfd_getseg()` 在 extend 路径中按需创建。
@@ -403,9 +414,8 @@ fork 后缀和 segment 后缀是两个不同概念。 FSM fork、VM fork、INIT 
 
 注意 deletion 不在这里作为普通 `XLOG_SMGR_DELETE`。 `storage_xlog.h` 注释说 deletion 由 `xact.c` 处理，因为它是 transaction commit 的一部分。
 
----
+## 11. `_mdfd_getseg()`：segment lifecycle 的枢纽
 
-## 8. `_mdfd_getseg()`：segment lifecycle 的枢纽
 `_mdfd_getseg()` 是理解 `md.c` 的核心函数。 读 `src/backend/storage/smgr/md.c:1746-1878`。 它根据 block number 找到目标 segment。
 如果目标 segment 不存在，根据 behavior 决定报错、返回 NULL、创建 segment，或 recovery 下创建 segment。
 
@@ -445,9 +455,8 @@ block = nextsegno * RELSEG_SIZE - 1
 最后 `_mdfd_openseg()` 打开或创建下一个 segment。 `_mdfd_openseg()` 要求 segment 按顺序打开。 它 assert `segno == md_num_open_segs[forknum]`。
 这保证 array index 和 segment number 对齐。
 
----
+## 12. `mdextend()`：写一个 block 并可能创建 segment
 
-## 9. `mdextend()`：写一个 block 并可能创建 segment
 `smgrextend()` 是公共 API。 读 `src/backend/storage/smgr/smgr.c:610-639`。 它的注释说语义接近 `smgrwrite()`，但用于 relation extension。
 也就是 `blocknum` 在当前 EOF 或 EOF 之后。 它还假设在当前 EOF 之后写一个 block 时，中间空洞会被文件系统读作 zero。
 
@@ -471,9 +480,8 @@ block = nextsegno * RELSEG_SIZE - 1
 `skipFsync` 不是“允许丢数据”。 它表示调用者会用其他机制补上 durability。 普通 buffer flush 传 false。
 bulk write 会传 true，然后在 finish 阶段整体注册或立即 fsync。 temp relation 无论如何都不需要 fsync。
 
----
+## 13. `mdzeroextend()`：批量扩展 zero blocks
 
-## 10. `mdzeroextend()`：批量扩展 zero blocks
 `smgrzeroextend()` 用于一次扩展多个 zero blocks。 当前 buffer manager 的 relation extension 路径会用它。 读 `src/backend/storage/buffer/bufmgr.c:3008-3018`。
 共享 buffer extension 先分配 buffer descriptor 和 tag，然后调用 `smgrzeroextend()` 真正扩展磁盘文件。 注释还说如果 `smgrzeroextend()` 失败，会留下 allocated 但非 valid 的 buffer。 下一次 relation extension 会选择同一个 block number，再尝试扩展。
 
@@ -498,9 +506,8 @@ bulk write 会传 true，然后在 finish 阶段整体注册或立即 fsync。 t
 `FileFallocate()` 的优点是可能不用把 zero pages 放进 page cache。 对大扩展通常更高效。 但注释说小扩展使用 fallocate 可能破坏某些文件系统的 delayed allocation。
 当前阈值是大于 8 blocks 才考虑 fallocate。
 
----
+## 14. `mdreadv()`：读 block、短读和 EOF
 
-## 11. `mdreadv()`：读 block、短读和 EOF
 当前基线的 read path 是 vector I/O。 `smgrread()` 是单页 wrapper。 `smgrreadv()` dispatch 到 `mdreadv()`。
 
 `mdreadv()` 读 `src/backend/storage/smgr/md.c:855-991`。 它循环处理 `nblocks`，但当前实现要求一次调用不能跨 segment。 它先计算当前 segment 能读多少 blocks。
@@ -541,9 +548,8 @@ direct I/O build 下还会 assert 每个 buffer 对齐。
 AIO 版本是 `mdstartreadv()`。 它没有复制 `zero_damaged_pages` 的逻辑。 注释解释原因：AIO 的 definer 和 completor 之间设置可能不同，而且这段逻辑本来就有问题。
 `md_readv_complete()` 把 byte count 转成 block count。 0 blocks read 被视为失败。 partial read 标记为 `PGAIO_RS_PARTIAL`，由上层重试未读部分。
 
----
+## 15. `mdwritev()`：写 existing blocks
 
-## 12. `mdwritev()`：写 existing blocks
 `smgrwrite()` 是单页 wrapper。 `smgrwritev()` dispatch 到 `mdwritev()`。
 
 `smgrwritev()` 的注释非常重要。 它只用于更新已存在 blocks。 扩展 relation 必须用 `smgrextend()`。
@@ -578,9 +584,8 @@ if (!skipFsync && !SmgrIsTemp(reln))
 
 local buffer flush 路径在 `src/backend/storage/buffer/localbuf.c:203-212`。 它也设置 checksum，然后调用 `smgrwrite(..., false)`。 temp relation 虽然传 false，但 `mdwritev()` 因 `SmgrIsTemp(reln)` 不注册 fsync。
 
----
+## 16. `mdnblocks()` 与 cached size
 
-## 13. `mdnblocks()` 与 cached size
 `smgrnblocks()` 是 size 查询入口。 读 `src/backend/storage/smgr/smgr.c:814-837`。 它先调用 `smgrnblocks_cached()`。
 如果得到有效值，就直接返回。 否则 dispatch 到 `mdnblocks()`。 然后把结果写回 `smgr_cached_nblocks[forknum]`。
 
@@ -608,9 +613,8 @@ segno * RELSEG_SIZE
 `_mdnblocks()` 用 `FileSize()` 得到单个 segment 的 byte length。 然后返回 `len / BLCKSZ`。 注释明确说 partial block at EOF 会被忽略。
 也就是说，如果文件尾部有不是整 block 的残片，`mdnblocks()` 不会把它算成一个 PostgreSQL block。
 
----
+## 17. `smgrtruncate()` 与 `mdtruncate()`
 
-## 14. `smgrtruncate()` 与 `mdtruncate()`
 `smgrtruncate()` 是上层 truncate API。 读 `src/backend/storage/smgr/smgr.c:860-925`。 它一次可以 truncate 多个 fork。
 caller 传入：
 - `forknum[]`
@@ -669,9 +673,8 @@ lastsegblocks * BLCKSZ
 
 如果当前 segment 完全仍被需要，就 break。 更早的 segment 都不需要处理。
 
----
+## 18. `mdunlink()`：删除 relation 文件
 
-## 15. `mdunlink()`：删除 relation 文件
 `smgrdounlinkall()` 是 smgr 层的删除入口。 读 `src/backend/storage/smgr/smgr.c:527-607`。 它用于立即 unlink 给定 relations 的所有 forks。
 注释明确说这不应该用于 transactional operations，因为不能 undo。 事务性 relation drop 通过 pending delete 在 commit/abort 后调用它。
 
@@ -715,9 +718,8 @@ temp relation 不写 WAL，文件名模式也不同。
 `mdunlink()` 的错误级别是 `WARNING`。 这符合 `smgr.c` 的约定。 删除通常发生在事务结尾后的 cleanup。
 这时不能因为 unlink 失败把已经决定 commit/abort 的事务改回失败。
 
----
+## 19. fsync 注册：dirty、sync、unlink、forget
 
-## 16. fsync 注册：dirty、sync、unlink、forget
 `md.c` 不只负责读写。 它还负责把 relation segment 纳入 checkpoint fsync 体系。
 
 核心 helper 是 `register_dirty_segment()`。 读 `src/backend/storage/smgr/md.c:1509-1557`。 它用 `INIT_MD_FILETAG()` 构造 `FileTag`。
@@ -758,9 +760,8 @@ RegisterSyncRequest(&tag, SYNC_REQUEST, false)
 `mdimmedsync()` 是立即 fsync。 它也会 sync active 和 inactive segments。 它用于 caller 明确需要在返回前保证文件稳定落盘的场景。
 例如不逐页 WAL-log 的新 index build，需要在 commit 前 fsync 完整 relation。
 
----
+## 20. `bulk_write.c`：绕过 buffer manager 后怎样补偿
 
-## 17. `bulk_write.c`：绕过 buffer manager 后怎样补偿
 `bulk_write.c` 主题是高效且可靠地填充一个新 relation。 文件头注释说它绕过 buffer manager，直接调用 `smgrextend()`。 好处是避免 buffer manager 锁和管理开销。
 代价是 build 完成后第一次访问仍要重新读入 shared buffers。
 
@@ -810,9 +811,8 @@ bulk writer 的处理方式：
 
 这解释了为什么 `skipFsync` 是可控优化，而不是绕过持久性。
 
----
+## 21. WAL redo 中的 smgr 边界
 
-## 18. WAL redo 中的 smgr 边界
 本节主文件是 `smgr.c`、`md.c`、`bulk_write.c`。 但 create/truncate 的 redo 入口在 `src/backend/catalog/storage.c`。 这是因为 `RM_SMGR_ID` 的 redo routine 是 `smgr_redo()`。
 
 `storage_xlog.h` 说明：
@@ -847,9 +847,8 @@ bulk writer 的处理方式：
 
 注释明确说 recovery 中不需要 relation extension lock。 这是因为 recovery 进程按 WAL 顺序重放，普通并发修改者不存在。 这和 normal execution 下通过 buffer manager extension lock 控制扩展竞态形成对比。
 
----
+## 22. EOF、短读和扩展竞态
 
-## 19. EOF、短读和扩展竞态
 这一节把几个容易混淆的边界放在一起。
 
 第一，短读不等于 EOF。 `mdreadv()` 如果读到正数但不足请求大小，会调整 offset 和 iovec 继续读。 只有 `nbytes == 0` 才进入 EOF/partial block at EOF 分支。
@@ -875,9 +874,8 @@ bulk writer 的处理方式：
 第九，`mdwriteback()` 特意不重新打开 segment。 它使用 `EXTENSION_DONT_OPEN`。 如果 segment 没打开，直接 return。
 注释解释这是为了避免和 `PROCSIGNAL_BARRIER_SMGRRELEASE` 竞态。 writeback 只是 hint，不值得为了 hint 打开一个可能即将被释放或删除的 fd。
 
----
+## 23. 错误边界速查
 
-## 20. 错误边界速查
 `smgr.c` 层的通用约定：
 - 大多数 smgr subfunction 失败是 `ERROR`。
 - unlink 失败应该是 `WARNING`。
@@ -931,9 +929,8 @@ bulk writer 的处理方式：
 - truncate redo 在真正截断前 flush WAL record LSN。
 - truncate 的物理操作放在 critical section 中。
 
----
+## 24. 主流程源码 walkthrough
 
-## 21. 主流程源码 walkthrough
 按一条对象生命周期读，不要按文件名平铺。
 
 ```text
@@ -979,7 +976,8 @@ smgrDoPendingDeletes()
 
 源码阅读顺序保持为：`smgr.h` 的 `SMgrRelationData`，`smgr.c` 的 `smgrsw[]` 和 `smgropen()`，`md.c` 的 segment invariant、`mdcreate()`、`_mdfd_getseg()`、`mdextend()`/`mdreadv()`/`mdwritev()`、`mdtruncate()`/`mdunlink()`，最后接 `bulk_write.c` 和 `storage.c` redo。
 
-## 22. 生命周期 / ownership / cleanup
+## 25. 生命周期 / ownership / cleanup
+
 `SMgrRelation` 是 backend-local handle，owner 是当前 backend 的 smgr hash table。relcache 可以 pin 它；未 pin 的 entry 可被释放。它保存 locator、每 fork cached size、每 fork 已打开 segment 数组和 smgr switch index。
 
 segment 文件的 owner 是 relation fork 生命周期。`mdcreate()` 创建第 0 segment，`mdextend()`/`mdzeroextend()` 创建后续 segment，`mdclose()` 只关闭当前 backend 打开的 VFD，不删除 relation 文件。删除语义来自 `mdunlink()`、transaction pending delete、checkpoint unlink request 和 crash recovery。
@@ -988,14 +986,16 @@ cleanup 分两类：正常结束时 caller 显式 close 或 unlink；ERROR/abort
 
 `bulk_write.c` 是特殊 ownership：它直接写 relation 文件并传 `skipFsync = true`，但 `smgr_bulk_finish()` 必须用 `DELAY_CHKPT_START`、redo pointer 检查、`smgrregistersync()` 或 `smgrimmedsync()` 补齐 checkpoint 竞态。
 
-## 23. 成本、资源与观测诊断
+## 26. 成本、资源与观测诊断
+
 成本随四个变量扩张：relation fork 的 block 数决定 segment 数；同时打开的 relation/fork 数决定 `SMgrRelation` 和 `MdfdVec` 数组压力；写入量决定 fsync request 数；bulk write、truncate 和 redo 会把成本传播到 checkpointer、WAL flush、fd.c VFD LRU 和 storage invalidation。
 
 能直接观察的是文件系统里的 `.1`、`.2` segment、`pg_relation_size()`、`pg_relation_filepath()`、checkpoint 日志和 `pg_stat_io` 中的数据文件 I/O。只能推断的是当前 backend 打开了多少 `MdfdVec`、size cache 是否可信、writeback hint 是否被跳过。需要断点的状态包括 `_mdfd_getseg()` behavior、`register_dirty_segment()`、`mdtruncate()` 中 inactive segment 的形成。
 
 诊断 relation storage 问题时先问：是 caller 读写了不存在的 block，还是 segment layout 被破坏；是普通运行时路径，还是 recovery 允许创建缺失 relation；是 fd pressure，还是 fsync/checkpoint 压力；是 `skipFsync` 优化被正确补偿，还是漏了 durability contract。
 
-## 24. 常见误区
+## 27. 常见误区
+
 - `smgropen()` 不打开文件；它只创建或查找 backend-local `SMgrRelation`。
 - `md_num_open_segs == N` 只表示当前 backend 打开了 N 个 segment，不表示磁盘上只有 N 个 active segment。
 - `smgr_cached_nblocks` 不是普通运行时的共享大小真相；当前主要在 recovery 能可靠使用。
@@ -1004,7 +1004,8 @@ cleanup 分两类：正常结束时 caller 显式 close 或 unlink；ERROR/abort
 - `skipFsync = true` 不是放弃持久化，而是 caller 承诺用另一条路径补偿。
 - 当前基线导出的是 `mdreadv()`/`mdwritev()`；单页 `smgrread()`/`smgrwrite()` 是 `smgr.h` 的 inline wrapper。
 
-## 25. 课堂实验
+## 28. 课堂实验
+
 实验 1：手算 segment 并回源码校验。
 
 ```text
@@ -1017,7 +1018,7 @@ RELSEG_SIZE = 131072
 实验 2：小 segment build 观察 `.1`、`.2`。
 
 ```bash
-cd /home/nail/postgres-lab
+cd /home/highgo/postgres
 meson setup build-segtest -Dsegsize_blocks=16 -Dcassert=true
 ninja -C build-segtest
 ```
@@ -1035,7 +1036,8 @@ break mdunlink
 
 触发表重写或 truncate，观察哪些 segment 变成 0 长度、哪些请求进入 dirty sync 或 delayed unlink。
 
-## 26. 讨论题
+## 29. 讨论题
+
 1. 为什么 `smgr.c` 仍保留 switch 层，即使当前基线只有 `md.c` 一个实现？
 2. `_mdfd_getseg()` 为什么要在创建后续 segment 前 pad 前序 segment？
 3. 为什么 `mdreadv()` 在 recovery 中允许创建缺失 relation，而普通运行时不允许？
@@ -1044,7 +1046,8 @@ break mdunlink
 6. `skipFsync` 的正确性责任从 md 层转移到了哪个 caller？
 7. 哪些错误应该是 `ERROR`，哪些 cleanup 错误只能是 `WARNING`？
 
-## 27. 本节小结
+## 30. 本节小结
+
 `smgr.c` 是 relation file I/O 的稳定入口和 backend-local handle cache；`md.c` 是当前基线唯一 concrete storage manager，把 fork/block 映射成 segment 文件操作。
 
 核心状态是 `SMgrRelation`、每 fork 的 open segment 数组、segment layout invariant 和 dirty sync request。ownership 分层：smgr handle 属于 backend；segment 文件属于 relation fork；删除和持久化由 transaction cleanup、md unlink、sync request、checkpoint 和 redo 共同收尾。

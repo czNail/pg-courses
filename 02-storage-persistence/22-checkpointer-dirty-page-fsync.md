@@ -1,6 +1,7 @@
 # PostgreSQL Checkpointer 脏页扫描、写回与 fsync
 
 ## 课程定位
+
 本节需要你已经理解 shared buffer 的 tag、pin、content lock、dirty bit、page LSN、WAL-before-data，以及上一节 checkpoint redo pointer 的基本语义。
 本节只回答一个主问题：
 PostgreSQL 如何在业务 backend 持续制造新脏页时，为一次 checkpoint 定义一个有限的脏页集合，并把这个集合安全推进到 write 和 fsync 完成？
@@ -13,13 +14,7 @@ checkpoint 必须给 crash recovery 一个已经持久化的数据边界；
 - 一个 buffer 的 `BM_DIRTY`、`BM_CHECKPOINT_NEEDED`、`BM_IO_IN_PROGRESS` 分别处在什么生命周期。
 - 为什么 checkpoint 期间新变脏的页通常不属于本轮 checkpoint 的责任。
 - 为什么数据页 `write()` 成功以后，还必须有后续 fsync 请求队列和 sync 阶段。
-本课基于本地源码 `/home/nail/postgres-lab`，commit `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。
-重点源码文件是：
-- `src/backend/postmaster/checkpointer.c`
-- `src/backend/storage/buffer/bufmgr.c`
-- `src/backend/storage/sync/sync.c`
-- `src/backend/access/transam/xlog.c`
-- `src/include/storage/buf_internals.h`
+源码基线：本课使用当前实际源码路径 `/home/highgo/postgres`，branch `master`，commit `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`；核心源码分工见第 3 节。
 本节不是 checkpointer 源码百科。
 我们只沿一条主链路走：
 backend 写脏页和登记 fsync 责任；
@@ -30,6 +25,7 @@ checkpointer 接受 checkpoint 请求；
 最后 checkpoint WAL record 和 control file 把边界发布给 crash recovery。
 
 ## 1. 本节在总主线中的位置
+
 前面的存储持久化课程已经拆过几个相邻问题。
 buffer tag 和 descriptor 说明了“一个 shared buffer 指向哪个 relation fork block”。
 buffer lookup、clock sweep、pin 和 content lock 说明了“这个 buffer 如何被并发访问和替换”。
@@ -52,6 +48,7 @@ checkpoint lifecycle redo pointer 说明了“checkpoint 记录如何成为 reco
 - 异常时哪些状态可以重试，哪些失败必须升级。
 
 ## 2. 核心矛盾与一句话运行模型
+
 一句话运行模型：
 checkpoint 先用 redo pointer 和 `BM_CHECKPOINT_NEEDED` 给本轮建立一个有限集合，再通过 buffer write、fsync request absorption、pendingOps cycle counter 和 checkpoint WAL/control file 顺序，把这个集合推进到 crash-safe。
 这里有两个“有限集合”。
@@ -78,6 +75,7 @@ PostgreSQL 的选择是：
 它是多个状态机按顺序拼出来的正确性边界。
 
 ## 3. 核心文件分工与阅读顺序
+
 本课建议按下面顺序读源码，而不是按文件名排序。
 
 | 顺序 | 文件 | 入口 | 本节只关心的职责 |
@@ -88,6 +86,7 @@ PostgreSQL 的选择是：
 | 4 | `src/backend/storage/buffer/bufmgr.c` | `CheckPointBuffers()`、`BufferSync()`、`SyncOneBuffer()`、`FlushBuffer()` | 扫描脏页、打本轮标记、写出 buffer、清 dirty/checkpoint-needed |
 | 5 | `src/backend/storage/sync/sync.c` | `SyncPreCheckpoint()`、`AbsorbSyncRequests()`、`ProcessSyncRequests()` | 将 backend fsync 请求吸收到 `pendingOps`，按 cycle 处理 data-file fsync |
 | 6 | `src/backend/storage/smgr/md.c` | `register_dirty_segment()`、`mdsyncfiletag()` | 解释 `smgrwrite()` 之后 fsync request 从哪里来，以及队列满时的 backend fallback |
+
 虽然用户常把这些都叫“checkpoint 写盘”，源码里至少有四个不同动作。
 第一，buffer write。
 这是 `smgrwrite()` 把 8KB page 内容写给内核。
@@ -109,6 +108,7 @@ PostgreSQL 不是“一个 checkpoint 函数把所有东西刷干净”。
 ## 4. 关键数据结构与状态
 
 ### 4.1 `BufferDesc.state` 不是一个 dirty bool
+
 `src/include/storage/buf_internals.h` 中的 `BufferDesc` 是每个 shared buffer 的共享 descriptor。
 它包含：
 - `tag`：这个 buffer 当前代表哪个 relation fork block。
@@ -127,6 +127,7 @@ PostgreSQL 不是“一个 checkpoint 函数把所有东西刷干净”。
 | `BM_IO_ERROR` | 上一次 I/O 失败，后续路径需要看到失败历史 |
 | `BM_PERMANENT` | 该 buffer 属于需要 WAL/data durability 的永久对象 |
 | `BM_VALID` | buffer 内容有效，可以被写出或读取 |
+
 raw field 不是语义。
 `BM_DIRTY` 单独只说明“这页曾被修改且还没清 dirty”。
 `BM_DIRTY + BM_CHECKPOINT_NEEDED` 才说明“这页属于当前 checkpoint 的写回集合”。
@@ -135,6 +136,7 @@ raw field 不是语义。
 `tag + pin` 才说明“我读到的 tag 在使用期间不会被替换掉”。
 
 ### 4.2 `BM_CHECKPOINT_NEEDED` 是本轮边界，不是持久化状态
+
 `BM_CHECKPOINT_NEEDED` 很容易被误读。
 它不是“已经写入 checkpoint record”。
 它不是“已经 fsync”。
@@ -153,6 +155,7 @@ raw field 不是语义。
 这个 flag 的存在让 checkpoint 不必追逐“扫描后才变脏”的页。
 
 ### 4.3 `CheckpointerShmemStruct` 有两个不同责任
+
 `checkpointer.c` 的共享内存结构同时服务两个通道。
 第一个通道是 checkpoint request。
 相关字段是：
@@ -184,6 +187,7 @@ fsync request 说“这个文件段被写过，下一次 checkpoint sync 阶段�
 一个 backend fsync request 也不是在请求立刻 checkpoint。
 
 ### 4.4 `pendingOps` 是 checkpointer-local，不在共享内存
+
 `sync.c` 里的 `pendingOps` 是一个 hash table。
 它只在 standalone backend 或 checkpointer 进程中存在。
 普通 backend 不维护自己的 pending fsync table。
@@ -198,6 +202,7 @@ fsync request 说“这个文件段被写过，下一次 checkpoint sync 阶段�
 这就是为什么 checkpoint log 里能打印 “sync files=N”，但不能直接告诉你 “fsync 了多少 buffer page”。
 
 ### 4.5 `SyncRequestType` 不是只有 fsync
+
 `sync.h` 定义的 request type 包括：
 - `SYNC_REQUEST`：安排下次 checkpoint 调 sync handler。
 - `SYNC_UNLINK_REQUEST`：安排 checkpoint 后 unlink。
@@ -210,6 +215,7 @@ fsync request 说“这个文件段被写过，下一次 checkpoint sync 阶段�
 所以失败时要先 absorb 新来的 cancel/filter request，再决定是否重试或报错。
 
 ### 4.6 `CheckpointStatsData` 是单次 checkpoint 的局部统计
+
 `src/include/access/xlog.h` 中的 `CheckpointStatsData` 包含：
 - `ckpt_start_t`
 - `ckpt_write_t`
@@ -231,6 +237,7 @@ fsync request 说“这个文件段被写过，下一次 checkpoint sync 阶段�
 它不能还原每一次 checkpoint 的全部内部状态。
 
 ### 4.7 `WritebackContext` 是 OS 调度 hint，不是 fsync 责任
+
 `WritebackContext` 保存 pending writeback tags。
 `ScheduleBufferTagForWriteback()` 把写过的 buffer tag 收集起来。
 `IssuePendingWritebacks()` 排序、合并相邻 blocks，然后调用 `smgrwriteback()`。
@@ -241,6 +248,7 @@ writeback 只是改善 OS I/O scheduling，尽量不报错。
 真正 checkpoint 是否 durable，要看后续 `ProcessSyncRequests()` 里的 fsync。
 
 ## 5. 主流程源码 walkthrough
+
 下面沿一次 online checkpoint 的主流程走。
 为了减少跳转，先看总调用链。
 
@@ -279,6 +287,7 @@ CheckPointBuffers()
         -> ScheduleBufferTagForWriteback()
   -> IssuePendingWritebacks()
 ```
+
 这条链路有一个容易被忽略的事实：
 `smgrwrite()` 发生在 buffer write 阶段。
 `mdsyncfiletag()` 发生在 sync 阶段。
@@ -286,6 +295,7 @@ CheckPointBuffers()
 checkpoint 能完成，是因为它不把所有“此刻新发生的一切”都纳入本轮。
 
 ### 5.1 backend 先制造脏页
+
 普通数据页修改通常先持有 buffer pin 和 content lock。
 重要修改会写 WAL。
 `MarkBufferDirty()` 要求 shared buffer 被 pin，并持有 exclusive content lock。
@@ -301,6 +311,7 @@ hint bit 的路径 `MarkSharedBufferDirtyHint()` 也强调一个顺序：
 它只意味着后续 `BufferSync()` 的 dirty scan 有机会正确分类它。
 
 ### 5.2 backend 或 WAL 层发起 checkpoint request
+
 checkpoint request 有多种来源。
 手工 `CHECKPOINT` 走 `ExecCheckpoint()`，再走 `RequestCheckpoint()`。
 WAL segment 消耗过多时，`XLogWrite()` 在 segment end 附近可能调用 `RequestCheckpoint(CHECKPOINT_CAUSE_XLOG)`。
@@ -320,6 +331,7 @@ checkpointer 主循环自己也会因为 `checkpoint_timeout` 到期而做 timed
 这是一个低成本共享状态协议。
 
 ### 5.3 `CheckpointerMain()` 合并请求并开始 checkpoint
+
 checkpointer 主循环醒来后，先 `AbsorbSyncRequests()`，再处理信号和配置 reload。
 它检查 `ckpt_flags` 是否非零，也检查 timeout。
 决定要 checkpoint 后，它在 `ckpt_lck` 下：
@@ -338,6 +350,7 @@ checkpointer 同时设置进程私有状态：
 它们服务 `CheckpointWriteDelay()` 中的“是否按进度睡眠”判断。
 
 ### 5.4 `CreateCheckPoint()` 先做 pre-checkpoint，再固定 redo
+
 `CreateCheckPoint()` 一开始清空 `CheckpointStats`，记录 `ckpt_start_t`。
 然后调用 `SyncPreCheckpoint()`。
 这个调用必须在确定 checkpoint redo pointer 之前发生。
@@ -357,6 +370,7 @@ redo pointer 之前需要的数据状态最终会被写盘并 fsync。
 redo pointer 之后的新修改仍然靠 WAL recovery。
 
 ### 5.5 checkpoint 等待 commit critical section 边界
+
 在真正刷 buffer 之前，`CreateCheckPoint()` 会检查 delaying checkpoint 的 virtual transactions。
 代码使用 `GetVirtualXIDsDelayingChkpt()` 和 `HaveVirtualXIDsDelayingChkpt()`。
 它等待 `DELAY_CHKPT_START`。
@@ -373,6 +387,7 @@ checkpoint 延迟等待不是静态睡眠。
 它还要继续推进 fsync request ownership。
 
 ### 5.6 `CheckPointGuts()` 把 write 阶段和 sync 阶段分开
+
 `CheckPointGuts()` 是本节主链路的中段。
 它先 checkpoint 一组非 buffer pool 的状态：
 - relation map
@@ -396,6 +411,7 @@ checkpoint 延迟等待不是静态睡眠。
 `log_checkpoints` 和 `pg_stat_checkpointer` 的 `write_time`、`sync_time` 正是沿这个边界来的。
 
 ### 5.7 `BufferSync()` 第一遍扫描 `NBuffers`
+
 `BufferSync()` 首先决定 mask。
 普通 online checkpoint 只写 permanent dirty buffers。
 shutdown、end-of-recovery 或显式 flush unlogged 时，会包含 unlogged dirty buffers。
@@ -421,6 +437,7 @@ header lock 足够检查 dirty bit 和设置 checkpoint-needed bit。
 所以 checkpoint 的工作集合是有边界的。
 
 ### 5.8 `BufferSync()` 排序并按 tablespace 平衡写
+
 扫描得到候选 buffer 后，`BufferSync()` 调用 `sort_checkpoint_bufferids()`。
 排序目标是降低随机 I/O。
 候选项里带有 tablespace、relation、fork、block。
@@ -432,6 +449,7 @@ header lock 足够检查 dirty bit 和设置 checkpoint-needed bit。
 它试图让 checkpoint write pressure 分布得更平滑。
 
 ### 5.9 `SyncOneBuffer()` 重新检查状态
+
 写某个 buffer 前，`BufferSync()` 先用 atomic read 快速看 `BM_CHECKPOINT_NEEDED`。
 这个检查有 race，但源码认为可接受。
 如果刚检查后别人已经写掉并清掉 flag，`SyncOneBuffer()` 会发现 clean 后什么都不做。
@@ -451,6 +469,7 @@ checkpointer 调 `SyncOneBuffer(buf_id, false, ...)`，不会因为 recently-use
 接着走 `FlushUnlockedBuffer()`。
 
 ### 5.10 `FlushUnlockedBuffer()` 获取 content lock
+
 `FlushUnlockedBuffer()` 很小，但语义重要。
 它根据 buffer id 获取 `Buffer`，然后拿 `BUFFER_LOCK_SHARE_EXCLUSIVE`。
 再调用 `FlushBuffer()`。
@@ -462,6 +481,7 @@ checkpointer 调 `SyncOneBuffer(buf_id, false, ...)`，不会因为 recently-use
 `FlushBuffer()` 中读取 page LSN、计算 checksum、调用 `smgrwrite()`，都依赖 content lock 保护页面内容。
 
 ### 5.11 `FlushBuffer()` 先拥有 I/O，再 flush WAL
+
 `FlushBuffer()` 首先调用 `StartSharedBufferIO(buf, false, true, NULL)`。
 如果返回 already done，说明别人已经把它写干净，当前调用直接返回。
 否则当前进程设置 `BM_IO_IN_PROGRESS`，并通过 ResourceOwner 记住 buffer I/O ownership。
@@ -481,6 +501,7 @@ unlogged relation 不走这个规则。
 所以只有 `BM_PERMANENT` 才 `XLogFlush(page_lsn)`。
 
 ### 5.12 `smgrwrite()` 写数据页并登记 fsync 责任
+
 `FlushBuffer()` 之后调用：
 - `PageSetChecksum()`
 - `smgrwrite(reln, fork, block, bufBlock, false)`
@@ -497,6 +518,7 @@ standalone backend 也有。
 它通常很贵，但比丢失 fsync 责任正确。
 
 ### 5.13 `TerminateBufferIO()` 清理 buffer 写状态
+
 `smgrwrite()` 成功后，`FlushBuffer()` 统计 I/O，并调用：
 `TerminateBufferIO(buf, true, 0, true, false)`
 `clear_dirty=true` 会清掉：
@@ -514,6 +536,7 @@ buffer 内容已经成功交给内核的 data file write。
 durability 还要等 fsync request 在 sync 阶段完成。
 
 ### 5.14 `CheckpointWriteDelay()` 控制写速率并吸收请求
+
 每处理一个候选 buffer 后，`BufferSync()` 调 `CheckpointWriteDelay(flags, progress)`。
 如果不是 fast checkpoint，不在 shutdown，没收到新的 fast request，而且 `IsCheckpointOnSchedule(progress)` 认为进度合适，checkpointer 会睡 100ms。
 睡前它会：
@@ -531,6 +554,7 @@ durability 还要等 fsync request 在 sync 阶段完成。
 如果 WAL 消耗很快，checkpoint 会认为自己落后，减少睡眠。
 
 ### 5.15 `ProcessSyncRequests()` 在写阶段之后兜住 race
+
 `CheckPointGuts()` 在 `CheckPointBuffers()` 之后调用 `ProcessSyncRequests()`。
 这个函数开头再次 `AbsorbSyncRequests()`。
 源码解释了最紧的 race：
@@ -542,6 +566,7 @@ durability 还要等 fsync request 在 sync 阶段完成。
 那会破坏 checkpoint durability。
 
 ### 5.16 `ProcessSyncRequests()` 用 cycle 防止无限追赶
+
 `ProcessSyncRequests()` 的关键步骤是：
 - 如果上次 sync 没完成，先把所有 entry 的 `cycle_ctr` 归到当前 cycle。
 - `sync_cycle_ctr++`。
@@ -559,6 +584,7 @@ durability 还要等 fsync request 在 sync 阶段完成。
 如果不保留新 entry，下一轮会漏 fsync。
 
 ### 5.17 fsync 失败时先吸收 cancel，再决定错误
+
 relation segment 可能在 fsync 前被 drop 或 truncate。
 `ProcessSyncRequests()` 不能简单把 `ENOENT` 当成功。
 它的策略是：
@@ -571,6 +597,7 @@ relation segment 可能在 fsync 前被 drop 或 truncate。
 后者不能被吞掉。
 
 ### 5.18 checkpoint record 和 control file 最后发布边界
+
 `CheckPointGuts()` 完成 write 和 sync 后，`CreateCheckPoint()` 还没有结束。
 它还要等待 `DELAY_CHKPT_COMPLETE` 的事务边界。
 如果 hot standby 需要，还会 `LogStandbySnapshot()`。
@@ -589,6 +616,7 @@ relation segment 可能在 fsync 前被 drop 或 truncate。
 PostgreSQL 不这样做。
 
 ### 5.19 checkpoint 后清理旧文件和 WAL
+
 checkpoint record 和 control file 更新后，`CreateCheckPoint()` 调 `SyncPostCheckpoint()`。
 这会处理旧 cycle 的 pending unlink。
 再更新 checkpoint distance estimate。
@@ -599,6 +627,7 @@ checkpoint record 和 control file 更新后，`CreateCheckPoint()` 调 `SyncPos
 ## 6. 生命周期 / ownership / cleanup
 
 ### 6.1 dirty page 的生命周期
+
 一个 shared buffer page 的本节生命周期可以写成：
 1. backend pin buffer，并持有 content lock。
 2. 修改 page bytes。
@@ -621,6 +650,7 @@ filesystem dirty page cache 阶段 owner 已经不在 PostgreSQL 内部，而在
 PostgreSQL 通过 fsync 把责任收回来。
 
 ### 6.2 checkpoint request 的生命周期
+
 checkpoint request 的状态生命周期是：
 1. requestor 在 `ckpt_lck` 下 OR flags 到 `ckpt_flags`。
 2. requestor 记录 `old_started`、`old_failed`。
@@ -638,6 +668,7 @@ checkpoint request 的状态生命周期是：
 真实 lifecycle 在共享计数器上。
 
 ### 6.3 fsync request 的生命周期
+
 普通 relation data file fsync request 的生命周期是：
 1. `smgrwrite()` 写某 relation fork block。
 2. md layer 调 `register_dirty_segment()`。
@@ -658,6 +689,7 @@ checkpoint request 的状态生命周期是：
 checkpoint sync 阶段按 file tag 处理，避免每个 buffer write 都独立 fsync。
 
 ### 6.4 ResourceOwner 在 buffer I/O 中兜底
+
 `StartSharedBufferIO()` 设置 `BM_IO_IN_PROGRESS` 后，调用 `ResourceOwnerRememberBufferIO()`。
 正常成功路径中，`TerminateBufferIO(... forget_owner=true ...)` 会 `ResourceOwnerForgetBufferIO()`。
 如果 ERROR 在中间发生，ResourceOwner release callback `ResOwnerReleaseBufferIO()` 会调用 `AbortBufferIO()`。
@@ -668,6 +700,7 @@ checkpoint sync 阶段按 file tag 处理，避免每个 buffer write 都独立 
 如果清掉 dirty，就等于丢失了持久化责任。
 
 ### 6.5 checkpointer ERROR cleanup
+
 `CheckpointerMain()` 有自己的 `sigsetjmp` 顶层错误恢复。
 发生 ERROR 后，它会：
 - 清 `error_context_stack`。
@@ -695,6 +728,7 @@ checkpoint sync 阶段按 file tag 处理，避免每个 buffer write 都独立 
 一些 data sync failure 会通过 `data_sync_elevel()` 升级为 PANIC。
 
 ### 6.6 smgr cache cleanup
+
 checkpoint 完成后，`CheckpointerMain()` 调 `smgrdestroyall()`。
 注释说明原因：
 checkpointer 不处理 shared invalidation messages，也不在正常事务边界调用 `AtEOXact_SMgr()`。
@@ -703,10 +737,12 @@ checkpointer 不处理 shared invalidation messages，也不在正常事务边�
 长期后台进程不能假设 backend 的 transaction cleanup 自然发生。
 
 ## 7. 正确性机制层次
+
 本节的正确性不是一个机制保证的。
 它至少有八层。
 
 ### 7.1 WAL-before-data
+
 `FlushBuffer()` 在写 permanent buffer 之前调用 `XLogFlush(BufferGetLSN(buf))`。
 它保证：
 如果数据页落盘带着某个修改，那么描述该修改的 WAL 至少已经 durable。
@@ -716,6 +752,7 @@ checkpointer 不处理 shared invalidation messages，也不在正常事务边�
 后续还要 data-file fsync。
 
 ### 7.2 redo pointer 边界
+
 online checkpoint 插入 `XLOG_CHECKPOINT_REDO`，redo pointer 指向这个位置。
 checkpoint 完成后插入 `XLOG_CHECKPOINT_ONLINE`，记录这个 redo pointer。
 crash recovery 从 checkpoint record 中的 redo pointer 开始 replay。
@@ -724,6 +761,7 @@ redo pointer 之后的修改不要求本轮 checkpoint 写入数据文件。
 它们靠 WAL replay。
 
 ### 7.3 `BM_CHECKPOINT_NEEDED` 的有界集合
+
 `BufferSync()` 第一遍扫描 dirty permanent buffers 并设置 `BM_CHECKPOINT_NEEDED`。
 这个 flag 是本轮写回集合。
 它保证：
@@ -734,6 +772,7 @@ checkpoint 不会无限追逐新 dirty page。
 这不破坏本轮 redo 边界。
 
 ### 7.4 content lock 和 header lock 分工
+
 buffer header lock 保护 `BufferDesc.state` 和 `tag` 变更。
 content lock 保护 page bytes 和 page LSN 的一致读取/写出。
 pin 保证 buffer identity 不会在你使用期间被替换。
@@ -744,6 +783,7 @@ pin 保证 buffer identity 不会在你使用期间被替换。
 这三个不能互相替代。
 
 ### 7.5 fsync request queue 承接 write 和 sync 的缝隙
+
 `smgrwrite()` 成功后必须登记 fsync request。
 这弥补了 `write()` 和 `fsync()` 分离带来的责任缝隙。
 如果 backend 或 bgwriter 替 checkpointer 写掉了某个 `BM_CHECKPOINT_NEEDED` buffer，checkpoint sync 阶段仍然要 fsync 对应 file segment。
@@ -751,6 +791,7 @@ pin 保证 buffer identity 不会在你使用期间被替换。
 这是 checkpoint write 阶段和 sync 阶段的 ordering bridge。
 
 ### 7.6 `sync_cycle_ctr` 防止新请求污染本轮
+
 `ProcessSyncRequests()` 增加 `sync_cycle_ctr` 后，跳过新 cycle entry。
 它保证本轮 sync 集合有限。
 如果 fsync 失败导致下一次重试，`sync_in_progress` 会让函数先把旧 entry 的 cycle 归一，避免 counter wrap 或 stale cycle 让旧责任被误认为新责任。
@@ -758,6 +799,7 @@ pin 保证 buffer identity 不会在你使用期间被替换。
 它是 retry correctness。
 
 ### 7.7 checkpoint record flush 先于 control file
+
 `CreateCheckPoint()` 插入 checkpoint WAL record 后立即 `XLogFlush(recptr)`。
 然后才更新 control file。
 control file 是 crash recovery 找 checkpoint 的入口。
@@ -766,6 +808,7 @@ control file 是 crash recovery 找 checkpoint 的入口。
 它发布的是整个 checkpoint 边界。
 
 ### 7.8 delayed unlink 和 cancel/filter
+
 relation 删除不能随便立刻删除所有文件。
 `SYNC_UNLINK_REQUEST` 进入 pending unlink list。
 `SyncPostCheckpoint()` 在 checkpoint 之后处理旧 cycle unlink。
@@ -777,6 +820,7 @@ checkpoint 前后跨越的文件生命周期不会和 fsync 阶段互相踩踏�
 ## 8. 错误路径 / 异常路径 / fallback
 
 ### 8.1 checkpoint request 通知失败
+
 `RequestCheckpoint()` 唤醒 checkpointer 时，可能发现 `ProcGlobal->checkpointerProc` 还没设置。
 如果 request 不等待，失败只 LOG。
 因为 `ckpt_flags` 已经在共享内存中设置，checkpointer 启动后仍可能看到。
@@ -788,6 +832,7 @@ latch 只是加速。
 共享 flags 才是 request state。
 
 ### 8.2 fsync request queue 满
+
 `ForwardSyncRequest()` 在 `CheckpointerCommLock` 下检查 queue。
 如果满，它先尝试 `CompactCheckpointerRequestQueue()`。
 compact 用 hash 找重复 request，保留后出现的 request，跳过更早重复项。
@@ -802,6 +847,7 @@ md layer 的 `register_dirty_segment()` 在 `retryOnError=false` 时会 backend 
 等待事件是 `REGISTER_SYNC_REQUEST`。
 
 ### 8.3 buffer write 失败
+
 `FlushBuffer()` 中的 `smgrwrite()` 可能 ERROR。
 比如磁盘满、I/O error、权限问题。
 错误上下文会报告 relation path、fork、block。
@@ -812,6 +858,7 @@ md layer 的 `register_dirty_segment()` 在 `retryOnError=false` 时会 backend 
 后续再写该 buffer 时能看到失败历史。
 
 ### 8.4 data-file fsync 失败
+
 `ProcessSyncRequests()` 调 sync handler 失败时，最终通过 `data_sync_elevel(ERROR)` 报错。
 `data_sync_retry` 默认 off 时，`data_sync_elevel()` 返回 PANIC。
 源码注释给出的理由很硬：
@@ -823,6 +870,7 @@ WAL 可能是唯一剩余副本。
 这个配置只适合明确知道 OS 不会丢 dirty buffered data 的场景。
 
 ### 8.5 `ENOENT` 不是立即成功
+
 fsync 时发现文件不存在，可能是合法 drop/truncate。
 也可能是真错误。
 `ProcessSyncRequests()` 第一次遇到 `FILE_POSSIBLY_DELETED(errno)` 时，不立刻忽略。
@@ -833,6 +881,7 @@ fsync 时发现文件不存在，可能是合法 drop/truncate。
 它要求删除路径显式发送 forget/filter/unlink 语义。
 
 ### 8.6 WAL fsync 失败直接 PANIC
+
 `issue_xlog_fsync()` 根据 `wal_sync_method` 选择 `fsync`、`fdatasync` 或 write-through。
 如果 `enableFsync=off` 或 WAL 以 `open_datasync` 方式已经同步，它可以直接返回。
 否则 fsync 失败会 `ereport(PANIC)`。
@@ -843,6 +892,7 @@ data file 还有 WAL 可恢复。
 WAL 自己没有更低层的 redo。
 
 ### 8.7 `enableFsync=off` 是正确性降级，不是优化开关
+
 `enableFsync` 关闭时：
 - `ScheduleBufferTagForWriteback()` 不再追踪 writeback。
 - `ProcessSyncRequests()` 会跳过实际 file sync。
@@ -852,6 +902,7 @@ WAL 自己没有更低层的 redo。
 课程讨论性能时不能把 `fsync=off` 当正常调优建议。
 
 ### 8.8 restartpoint 的特殊退化
+
 `CheckpointerMain()` 在 recovery 中可能做 restartpoint 而非 checkpoint。
 如果无法执行 restartpoint，源码会把 `last_checkpoint_time` 调整到 15 秒后再试。
 这不是本节主链路，但它提醒我们：
@@ -861,6 +912,7 @@ standby recovery 下的持久化边界受已 replay 的 checkpoint record 限制
 ## 9. 成本、资源与跨模块传播
 
 ### 9.1 `NBuffers` 扫描成本
+
 `BufferSync()` 每次 checkpoint 都扫描 `NBuffers`。
 这是和 `shared_buffers` 大小线性相关的 CPU/cache 成本。
 即使 dirty buffers 只有很少，扫描也要读每个 descriptor state。
@@ -870,6 +922,7 @@ descriptor 被 cache line padding 后降低 false sharing，但大 buffer pool �
 但在极大 buffer pool、频繁 checkpoint、dirty set 很小的 workload 中，它会变得可见。
 
 ### 9.2 dirty set 排序和写回成本
+
 候选 dirty buffer 数记为 `D`。
 `BufferSync()` 要对 `D` 个 `CkptSortItem` 排序。
 还要按 tablespace 构建进度状态和 heap。
@@ -880,6 +933,7 @@ descriptor 被 cache line padding 后降低 false sharing，但大 buffer pool �
 它不告诉你文件分布、write amplification、fsync queue depth 或设备 flush latency。
 
 ### 9.3 checkpoint pacing 的两个压力源
+
 `CheckpointWriteDelay()` 同时看时间和 WAL 消耗。
 `checkpoint_completion_target` 会把目标进度压到 checkpoint interval 的某个比例。
 但如果 WAL segment 消耗过快，checkpoint 会减少 sleep。
@@ -895,6 +949,7 @@ descriptor 被 cache line padding 后降低 false sharing，但大 buffer pool �
 共同影响。
 
 ### 9.4 bgwriter 和 checkpointer 的边界
+
 bgwriter 调 `BgBufferSync()`，主要围绕 clock sweep 清理可复用 buffer。
 它可以提前写掉 dirty buffers。
 如果写的是 checkpoint-needed buffer，`TerminateBufferIO()` 也会清 `BM_CHECKPOINT_NEEDED`。
@@ -905,6 +960,7 @@ bgwriter 的 `buffers_clean` 和 checkpointer 的 `buffers_written` 是不同职
 但 fsync responsibility 仍然会通过 request queue 进入 checkpoint sync phase。
 
 ### 9.5 backend write 和 backend fsync fallback
+
 当 backend 找不到可用 clean buffer，或者 bulk 操作绕过部分常规路径时，backend 也可能直接写 dirty buffer。
 backend 写成功后同样要登记 fsync request。
 如果 checkpointer request queue 满到无法 forward，backend 会本地 fsync。
@@ -913,6 +969,7 @@ backend 写成功后同样要登记 fsync request。
 这说明 fsync responsibility 已经从后台传播到了前台。
 
 ### 9.6 fsync 粒度是 file tag，不是 page
+
 多个 buffer write 可以对应同一个 relation segment。
 `pendingOps` hash 会合并重复 `FileTag`。
 所以 fsync count 更接近“被写过的文件段数量”，不是“被写过的 page 数量”。
@@ -921,6 +978,7 @@ backend 写成功后同样要登记 fsync request。
 这就是 schema shape 对 checkpoint sync phase 的影响。
 
 ### 9.7 WAL pressure 会反向触发 checkpoint
+
 `XLogWrite()` 在 segment 完成时会判断是否消耗了太多 WAL。
 如果 `XLogCheckpointNeeded(openLogSegNo)` 为真，会 `RequestCheckpoint(CHECKPOINT_CAUSE_XLOG)`。
 这条边界说明：
@@ -931,6 +989,7 @@ WAL generation rate 会反向推动 checkpoint frequency。
 它更常表示 WAL 产生速度和 checkpoint/WAL retention 配置不匹配。
 
 ### 9.8 OS page cache 和 storage cache 是外部状态
+
 `smgrwrite()` 成功后，数据通常只是进入 OS page cache 或 kernel I/O 队列。
 `FileWriteback()` 是 hint。
 `FileSync()` 才请求 durable storage。
@@ -947,6 +1006,7 @@ PostgreSQL 能调用正确系统调用并按顺序组织。
 这是诊断中的 hardware-dependent 边界。
 
 ### 9.9 参与状态推进的后台进程
+
 本节至少涉及这些后台进程或辅助进程：
 - checkpointer：主导 checkpoint request、dirty scan、write pacing、sync phase。
 - bgwriter：提前清理 dirty buffers，可能清掉 `BM_CHECKPOINT_NEEDED`。
@@ -961,6 +1021,7 @@ PostgreSQL 能调用正确系统调用并按顺序组织。
 ## 10. 观测与诊断入口
 
 ### 10.1 本节锚定的 runtime truth
+
 本节要锚定的 runtime truth 是：
 一次 checkpoint 的 write phase 和 sync phase 是分离的；
 `BufferSync()` 只追 checkpoint 开始时标记的 dirty set；
@@ -972,12 +1033,14 @@ checkpoint 期间新写入可以继续发生，并通过下一轮 dirty scan 或
 3. sync phase 是否卡在少数慢文件或大量文件上。
 
 ### 10.2 `pg_stat_checkpointer`
+
 SQL 入口：
 
 ```sql
 SELECT *
 FROM pg_stat_checkpointer;
 ```
+
 重要字段：
 - `num_timed`：timeout 触发次数。
 - `num_requested`：request 触发次数。
@@ -993,6 +1056,7 @@ FROM pg_stat_checkpointer;
 诊断时最好在实验前后记录 delta。
 
 ### 10.3 `log_checkpoints`
+
 打开 `log_checkpoints=on` 后，checkpoint 结束日志会包含：
 - wrote N buffers
 - wrote N SLRU buffers
@@ -1019,6 +1083,7 @@ FROM pg_stat_checkpointer;
 - `pendingOps` hash 的瞬时大小。
 
 ### 10.4 `pg_stat_io`
+
 当前版本有 `pg_stat_io`。
 可按 backend_type、object、context、operation 看 I/O。
 本节重点看：
@@ -1033,6 +1098,7 @@ FROM pg_stat_checkpointer;
 它可能是在等待 WAL durability。
 
 ### 10.5 wait events
+
 相关 wait events 包括：
 
 | wait event | 说明 |
@@ -1048,12 +1114,14 @@ FROM pg_stat_checkpointer;
 | `DataFileSync` | relation data file fsync |
 | `DataFileFlush` | writeback hint |
 | `WALSync` | WAL fsync |
+
 wait event 是当前位置，不是完整因果。
 一个 backend 在 `CheckpointDone` 上等待，只说明它请求了 wait checkpoint。
 它不告诉你 checkpoint 现在卡在 write、sync、WAL flush、delay xact 还是 storage。
 必须结合日志和统计。
 
 ### 10.6 gdb / probe / tracepoint
+
 源码跟踪时，建议断点：
 
 ```gdb
@@ -1066,6 +1134,7 @@ break FlushBuffer
 break ProcessSyncRequests
 break mdsyncfiletag
 ```
+
 在 `BufferSync()` 中观察：
 - `num_to_scan`
 - `CkptBufferIds[0]`
@@ -1099,6 +1168,7 @@ break mdsyncfiletag
 | OS 是否真的把 fsync 传到可靠介质 | PostgreSQL 内部不可证明 |
 
 ### 10.8 一个诊断推理例子
+
 现象：
 `log_checkpoints` 显示 checkpoint complete 中 `write=2s, sync=45s, sync files=12000, longest=8s, average=4ms`。
 第一层判断：
@@ -1118,6 +1188,7 @@ sync phase 很长，且 files 很多。
 ## 11. 常见误区
 
 ### 误区 1：checkpoint 会把所有 dirty buffers 写干净
+
 不对。
 online checkpoint 只需要保证 redo pointer 边界之前的必要数据状态 durable。
 `BufferSync()` 用 `BM_CHECKPOINT_NEEDED` 固定扫描时的 dirty set。
@@ -1125,41 +1196,48 @@ online checkpoint 只需要保证 redo pointer 边界之前的必要数据状态
 checkpoint 结束时仍可能存在 dirty buffers。
 
 ### 误区 2：`write()` 成功就等于 checkpoint 已经安全
+
 不对。
 `FlushBuffer()` 的 `smgrwrite()` 只把 page 写给 OS。
 checkpoint 还需要 `ProcessSyncRequests()` 对相关 file tags fsync。
 最后还要 checkpoint WAL record flush 和 control file update。
 
 ### 误区 3：`BM_CHECKPOINT_NEEDED` 表示这个页一定由 checkpointer 写
+
 不对。
 bgwriter 或 backend 可能先写掉该 buffer。
 成功写出时会清 `BM_CHECKPOINT_NEEDED`。
 checkpointer 后续看到 flag 没了就跳过。
 
 ### 误区 4：`pg_stat_checkpointer.buffers_written` 等于本轮所有被 checkpoint 覆盖的页
+
 不对。
 它统计 checkpointer 自己写出的 buffers。
 其他进程提前写掉的 page 不在这里。
 另外这是累计统计，不是单次值。
 
 ### 误区 5：fsync request queue 满只是后台慢一点
+
 不对。
 queue 满后会 compact。
 compact 失败时，backend 可能本地 fsync。
 这会把 checkpoint/storage 压力传导到前台 query latency。
 
 ### 误区 6：`DataFileSync` 等待一定是 checkpointer
+
 不对。
 checkpointer sync phase 会出现 data file fsync。
 但 backend fallback、immediate sync、bulk load 边界也可能出现。
 必须结合 `backend_type`、调用路径和 workload。
 
 ### 误区 7：增加 `checkpoint_completion_target` 一定降低 checkpoint 压力
+
 不一定。
 它让 checkpoint 更分散，但如果 WAL 消耗过快或 checkpoint 已经落后，`CheckpointWriteDelay()` 会减少睡眠。
 如果 storage sync phase 才是瓶颈，单纯调 pacing 不会消除慢 fsync。
 
 ### 误区 8：把 `fsync=off` 当性能优化
+
 这是 durability 降级。
 它会让 WAL fsync、data-file fsync、writeback tracking 的语义都变化。
 测试可以用。
@@ -1168,6 +1246,7 @@ checkpointer sync phase 会出现 data file fsync。
 ## 12. 课堂实验
 
 ### 实验 1：用 SQL 和日志拆分 write phase / sync phase
+
 目标：
 观察 checkpoint 的 write time、sync time、buffers_written 与 WAL pressure 的关系。
 步骤：
@@ -1191,6 +1270,7 @@ CHECKPOINT;
 SELECT *
 FROM pg_stat_checkpointer;
 ```
+
 观察点：
 - `buffers_written` 是否明显增加。
 - `write_time` 和 `sync_time` 哪个增长更多。
@@ -1203,6 +1283,7 @@ FROM pg_stat_checkpointer;
 - 日志中的 `sync files` 对应 `pendingOps` 被处理的 file tag 数。
 
 ### 实验 2：源码断点跟 `BM_CHECKPOINT_NEEDED`
+
 目标：
 确认 checkpoint 的 dirty set 是先扫描打标，再逐步写回。
 建议只在本地 lab 跑。
@@ -1223,6 +1304,7 @@ FROM pg_stat_checkpointer;
 - 清标发生在 `TerminateBufferIO(clear_dirty=true)`。
 
 ### 实验 3：给 `pendingOps` 加最小 instrumentation
+
 目标：
 观察 fsync request 从 shared queue 被吸收到 checkpointer-local hash，再按 cycle 处理。
 这是源码练习，不要求提交产品 patch。
@@ -1242,6 +1324,7 @@ FROM pg_stat_checkpointer;
 - `ProcessSyncRequests()` 的 cycle counter 给本轮 sync 集合划边界。
 
 ## 13. 讨论题
+
 1. 为什么 `BufferSync()` 要先扫描并设置 `BM_CHECKPOINT_NEEDED`，而不是一边扫描一边把所有当前 dirty buffers 写到没有 dirty 为止？
 2. `BM_DIRTY`、`BM_CHECKPOINT_NEEDED`、`BM_IO_IN_PROGRESS` 三个 bit 分别解决什么问题？哪两个 bit 不能互相替代？
 3. 如果 backend 在 checkpoint 期间写掉了一个本轮 checkpoint-needed buffer，checkpoint 为什么仍然不会漏掉 fsync？
@@ -1252,6 +1335,7 @@ FROM pg_stat_checkpointer;
 8. 为什么 control file 必须在 checkpoint WAL record flush 之后更新？如果顺序反过来，crash recovery 会面对什么风险？
 
 ## 14. 本节小结
+
 本节唯一主问题是：
 PostgreSQL 如何在持续写入下，为一次 checkpoint 定义并完成一个有限的脏页和 fsync 责任集合？
 核心链路是：

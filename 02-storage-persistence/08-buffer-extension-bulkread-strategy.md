@@ -1,43 +1,53 @@
 # PostgreSQL Relation extension 与 bulk read strategy
+
 ## 课程定位
-本节主题：PostgreSQL 在 shared buffer 体系里如何扩展 relation 文件，如何把大规模读写限制在较小的 buffer ring 中，以及 heap insert、sequential scan、VACUUM/COPY 这些上层访问路径如何把策略传进 buffer manager。
-本节唯一主问题：PostgreSQL 如何在保证 relation extension 不产生重复 block 的同时，让 bulk read/write 不把普通工作集挤出 shared buffers？
+
+前置知识：已经理解 buffer identity、lookup、replacement、dirty writeback 和 `BufferAccessStrategy` 的基本位置，知道 relation fork 由 block 组成。
+
+本节唯一主问题：
+
+```text
+PostgreSQL 如何在保证 relation extension 不产生重复 block 的同时，让 bulk read/write 不把普通工作集挤出 shared buffers？
+```
+
 核心矛盾：扩展 relation 需要全局一致地推进物理 EOF；而大规模扫描和批量写入又必须限制自己的 buffer footprint，不能让一次大操作污染整个 shared buffer pool。
-本节主流程：heap/scan 调用者选择 access strategy -> `ReadBuffer_common()` 或 `ExtendBufferedRelBy()` 进入 buffer manager -> relation extension lock 推进 EOF -> zero page 进入 buffer -> 上层初始化 page 或 bulk read 通过 ring 复用 buffer。
-生命周期 / ownership / cleanup：extension lock 保护 EOF 分配，buffer pin 保护 slot identity，content lock 保护新页初始化，ResourceOwner 清理 pin/lock，bulk strategy ring 是 backend-local 对象，查询结束后随 backend-private state 释放。
-观测与诊断入口：关注 relation extension lock 等待、`pg_stat_io` 的 bulk read/write IO context、`EXPLAIN (ANALYZE, BUFFERS)` 的大扫描 footprint，以及断点中的 `BufferAccessStrategyData` ring slot 变化。
-这一节把三条线放在一起读：
-- `P_NEW` / `ReadBufferExtended()` / `ReadBuffer_common()` 是“读一个 block 或兼容式扩展一个 block”的入口。
-- `ExtendBufferedRel()` / `ExtendBufferedRelBy()` 是当前更明确的 relation extension API。
-- `BufferAccessStrategy` 是给 bulk read、bulk write、vacuum 这类“不要污染整个 shared buffers”的访问模式用的 backend-private ring。
-读完本节，你应该能回答：
-- 为什么 `P_NEW` 不是一个天然 race-free 的抽象。
-- 为什么现代 heap 插入不再直接依赖 `ReadBuffer(relation, P_NEW)`。
-- relation extension lock 保护的是什么，不保护的又是什么。
-- 扩展 relation 时为什么先找 victim buffer，再拿 extension lock。
-- 新扩展出来的页面为什么先是 all-zero page，随后才由 heap 初始化成有效 heap page。
-- `smgrzeroextend()` 与 `PageInit()` / `MarkBufferDirty()` / WAL 之间的边界在哪里。
-- 大表顺序扫描为什么仍走 shared buffers，却不会把 shared buffers 大面积冲刷掉。
-- `BAS_BULKREAD`、`BAS_BULKWRITE`、`BAS_VACUUM` 的 ring size、dirty page 处理、pin limit 有什么差异。
-- `read_stream.c` 在 bulk read 中怎样结合 access strategy、AIO、IO combining 与预读。
-## 源码基线
-源码仓库：`/home/nail/postgres-lab`
-基线：`master` = `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`
-本节重点阅读：
-- `src/backend/storage/buffer/bufmgr.c`
-- `src/backend/storage/buffer/freelist.c`
-- `src/backend/access/heap/hio.c`
-- `src/backend/access/heap/heapam.c`
-- `src/backend/storage/smgr/smgr.c`
-- `src/backend/storage/smgr/md.c`
-- `src/backend/storage/aio/read_stream.c`
-辅助核对：
-- `src/include/storage/bufmgr.h`
-- `src/backend/storage/lmgr/lmgr.c`
-- `src/backend/storage/buffer/README`
-- `src/backend/commands/vacuum.c`
----
-## 1. 先给结论
+
+一句话运行模型：
+
+```text
+heap/scan 调用者选择 access strategy，ReadBuffer_common() 或 ExtendBufferedRelBy() 进入 buffer manager；relation extension lock 负责推进 EOF，zero page 进入 buffer 后由上层初始化，bulk read/write/vacuum 则通过 backend-private ring 限制 shared buffer footprint。
+```
+
+学完后应能判断：为什么现代 heap 插入更偏向 `ExtendBufferedRelBy()`；extension lock 保护什么、不保护什么；bulk read/write ring 为什么仍然走 shared buffers；`smgrzeroextend()` 与 `PageInit()` / WAL 的边界在哪里。
+
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。
+
+## 1. 本节在总主线中的位置
+
+前面课程主要讲“已有 block 如何进入、停留、写出 shared buffers”。本节补上两个经常和 buffer replacement 纠缠在一起的入口：relation 文件如何增长，以及大规模访问如何避免把普通工作集冲掉。
+
+这两条线都经过 buffer manager，但目标不同。relation extension 关心物理 EOF 的唯一推进；bulk strategy 关心访问模式对 shared buffer pool 的污染边界。
+
+## 2. 核心矛盾与一句话运行模型
+
+`P_NEW` 不是一个天然 race-free 的抽象。只把 buffer tag 设置成“新 block”不等于底层文件已经拥有这个 block；多个 backend 同时扩展时还必须让 `smgrnblocks()` 和文件 EOF 看到一致推进。
+
+另一方面，bulk read、bulk write 和 VACUUM 不应该绕过 shared buffers。它们仍把 page 放进 shared buffers，只是通过 backend-private ring 复用较小集合，降低对普通工作集的冲击。
+
+## 3. 核心文件分工与阅读顺序
+
+| 阅读顺序 | 文件 | 本节读什么 |
+| --- | --- | --- |
+| 1 | `src/backend/storage/buffer/bufmgr.c` | `ReadBufferExtended()`、`ReadBuffer_common()`、`ExtendBufferedRel()`、`ExtendBufferedRelBy()`、扩展和普通读的分支。 |
+| 2 | `src/backend/storage/buffer/freelist.c` | `BufferAccessStrategy` ring、`StrategyGetBuffer()`、BulkRead/BulkWrite/Vacuum 策略。 |
+| 3 | `src/backend/access/heap/hio.c` | `RelationAddBlocks()`、heap 扩展 relation 的现代路径。 |
+| 4 | `src/backend/access/heap/heapam.c` | heap insert / multi insert 如何消耗新 page。 |
+| 5 | `src/backend/storage/smgr/smgr.c`、`src/backend/storage/smgr/md.c` | `smgrzeroextend()` / `mdzeroextend()` 如何推进物理文件。 |
+| 6 | `src/backend/storage/aio/read_stream.c` | 顺序扫描如何结合 access strategy、AIO 和预读。 |
+| 7 | `src/include/storage/bufmgr.h`、`src/backend/storage/lmgr/lmgr.c`、`src/backend/storage/buffer/README` | strategy 类型、extension lock 和 buffer manager 设计说明。 |
+
+## 4. 主流程入口：relation extension 与 access strategy
+
 relation extension 是把一个 relation fork 的物理 EOF 往后推进。
 buffer manager 不能只把一个 buffer tag 设置成“新 block”就算扩展完成。
 它还必须确保底层文件真的拥有这个 block。
@@ -67,8 +77,9 @@ VACUUM 通过 `BAS_VACUUM` ring 限制自己的 buffer footprint。
 这些策略都不是绕开 shared buffers。
 它们仍然把 page 放进 shared buffers。
 区别是它们复用一个小 ring，避免一次大扫描或大写入把正常工作集从 shared buffers 中挤出去。
----
-## 2. 关键名词
+
+## 5. 关键名词
+
 `BlockNumber` 是 relation fork 内的 block 编号。
 `P_NEW` 在 `src/include/storage/bufmgr.h` 中定义为 `InvalidBlockNumber`。
 它不是一个真实 block number。
@@ -88,8 +99,9 @@ VACUUM 通过 `BAS_VACUUM` ring 限制自己的 buffer footprint。
 buffer manager 会先把新 block 的 tag 插入 buffer table，并启动 buffer IO。
 然后才调用 `smgrzeroextend()` 推进文件 EOF。
 这样一旦物理文件已经变大，其他 backend 读到这个新 block 时，会在 buffer table 中看到已有 buffer，并等待 IO 完成，而不是自己再读一份未初始化内容。
----
-## 3. `ReadBufferExtended()`：普通读入口与旧式扩展入口
+
+## 6. `ReadBufferExtended()`：普通读入口与旧式扩展入口
+
 先读 `src/backend/storage/buffer/bufmgr.c:874-940`。
 `ReadBuffer()` 只是 `ReadBufferExtended()` 的简写。
 它固定读取 main fork，mode 是 `RBM_NORMAL`，strategy 是 `NULL`。
@@ -103,15 +115,18 @@ buffer manager 会先把新 block 的 tag 插入 buffer table，并启动 buffer
 如果 `blockNum == P_NEW`，语义就从“读已有 block”变成“扩展 relation 并返回新 block”。
 `ReadBufferExtended()` 本身不实现读取。
 它调用：
+
 ```c
 ReadBuffer_common(reln, RelationGetSmgr(reln), 0,
                   forkNum, blockNum, mode, strategy)
 ```
+
 这里传 `RelationGetSmgr(reln)`，说明真正 I/O 会落到 smgr/md 层。
 `strategy` 会原样传进 buffer allocation。
 因此一个 seq scan、COPY、VACUUM 的调用端，只要把合适的 `BufferAccessStrategy` 传进来，就可以影响 buffer victim 选择和 IO context。
----
-## 4. `ReadBuffer_common()` 的分支
+
+## 7. `ReadBuffer_common()` 的分支
+
 `ReadBuffer_common()` 在 `src/backend/storage/buffer/bufmgr.c:1271-1368`。
 它先做一个 canonical check：
 如果传入的是其他 session 的 temp relation，就报错。
@@ -119,6 +134,7 @@ ReadBuffer_common(reln, RelationGetSmgr(reln), 0,
 其他 backend 看不到拥有者的 local buffers，读出来很可能是错的。
 接下来就是 `P_NEW` 分支。
 本基线中的关键逻辑：
+
 ```c
 if (unlikely(blockNum == P_NEW))
 {
@@ -128,6 +144,7 @@ if (unlikely(blockNum == P_NEW))
     return ExtendBufferedRel(BMR_REL(rel), forkNum, strategy, flags);
 }
 ```
+
 这段代码有两个信息量很高的事实。
 第一，`P_NEW` 已经被重定向到 `ExtendBufferedRel()`。
 第二，它传了 `EB_SKIP_EXTENSION_LOCK`。
@@ -145,8 +162,9 @@ heap 的主路径已经不用这种风格。
 随后调用 `StartReadBuffer()`。
 如果需要等待 IO，则调用 `WaitReadBuffers()`。
 这说明单块 `ReadBufferExtended()` 在普通路径下仍复用多块 read infrastructure，只是要求同步等待。
----
-## 5. 为什么 `P_NEW` 需要 extension lock
+
+## 8. 为什么 `P_NEW` 需要 extension lock
+
 relation extension 的 race 可以用一个极简时间线说明。
 假设 relation 当前有 100 个 block。
 两个 backend 同时想执行 `P_NEW`。
@@ -165,8 +183,9 @@ buffer tag 是 `(relfilenumber, fork, blockNum)`。
 它专门用于 interlock addition of pages to relations。
 `RelationExtensionLockWaiterCount()` 还能数出正在等待这个 extension lock 的 backend 数量。
 heap 的多块扩展会用这个数量决定是否“帮别人多扩几页”。
----
-## 6. `ExtendBufferedRel()` 与 `ExtendBufferedRelBy()`
+
+## 9. `ExtendBufferedRel()` 与 `ExtendBufferedRelBy()`
+
 `ExtendBufferedRel()` 在 `src/backend/storage/buffer/bufmgr.c:966-982`。
 它只是 `ExtendBufferedRelBy()` 的一页封装。
 `extend_by = 1`。
@@ -189,8 +208,9 @@ heap 插入路径正是这样使用。
 - temp relation 走 `ExtendBufferedRelLocal()`。
 - permanent/unlogged relation 走 `ExtendBufferedRelShared()`。
 本节重点看 shared buffer 路径。
----
-## 7. shared relation extension 的真实流程
+
+## 10. shared relation extension 的真实流程
+
 `ExtendBufferedRelShared()` 在 `src/backend/storage/buffer/bufmgr.c:2790-3060`。
 这段函数是本节最重要的源码。
 把它拆成九步理解。
@@ -257,8 +277,9 @@ PostgreSQL 不能创建编号等于 `InvalidBlockNumber` 的 block。
 最终这些 buffer 是 pinned、valid、zero-filled 的。
 但它们还不是 heap initialized page。
 它们也不是 dirty buffer。
----
-## 8. existing buffer beyond EOF 这个角落
+
+## 11. existing buffer beyond EOF 这个角落
+
 `ExtendBufferedRelShared()` 中最容易跳过的分支是 `BufTableInsert()` 返回 `existing_id >= 0`。
 按常识，扩展 EOF 后的新 block 不应该已经在 buffer table 中。
 源码注释列了几个例外。
@@ -274,8 +295,9 @@ PostgreSQL 不能创建编号等于 `InvalidBlockNumber` 的 block。
 这个分支可以帮助你建立一个边界意识：
 buffer table 中“有 block N 的 buffer”不等于底层 relation 文件真的有 block N。
 relation extension 的正确完成条件必须包含物理 EOF 推进。
----
-## 9. `smgrzeroextend()` 与 `mdzeroextend()`
+
+## 12. `smgrzeroextend()` 与 `mdzeroextend()`
+
 `src/backend/storage/smgr/smgr.c:642-668` 是 storage manager 抽象层。
 `smgrzeroextend()` 的语义是：新增多个 zeroed blocks。
 它调用具体 storage manager 的 `smgr_zeroextend` 方法。
@@ -301,8 +323,9 @@ relation extension 的正确完成条件必须包含物理 EOF 推进。
 这一点很关键。
 物理 zero extend 的持久性责任由 smgr/md 的 dirty segment 机制处理。
 后续 page 内容修改的持久性责任由 buffer dirty + WAL-before-data 协议处理。
----
-## 10. `mdreadv()` 对 beyond EOF 的警示
+
+## 13. `mdreadv()` 对 beyond EOF 的警示
+
 `src/backend/storage/smgr/md.c:856-980` 是 md 层读取。
 正常情况下，上层不应该读不存在的 block。
 如果 `mdreadv()` 在 EOF 遇到 0 bytes，默认会报 `DATA_CORRUPTED`。
@@ -315,8 +338,9 @@ relation extension 也不期望 beyond-EOF buffer 已经存在。
 课程里要记住一句话：
 zero-filled buffer 不是“安全存在的 relation block”的充分条件。
 它必须和物理文件大小一致。
----
-## 11. zero page、initialized page、dirty page、WAL page
+
+## 14. zero page、initialized page、dirty page、WAL page
+
 扩展路径里有四种状态很容易混在一起。
 第一种是 all-zero page。
 `ExtendBufferedRelShared()` 把 victim buffer 的内存 `MemSet(..., 0, BLCKSZ)`。
@@ -339,16 +363,19 @@ heap 在 `hio.c` 中紧接着 `MarkBufferDirty(buffer)`。
 所以不要把“扩展时写了 zero page”理解成“已经完成了 heap page 的 WAL 保护”。
 zero extend 只是让文件空间存在。
 heap page 的逻辑内容仍由 heap WAL record 保护。
----
-## 12. heap insert 如何选择 page
+
+## 15. heap insert 如何选择 page
+
 现在读 heap 调用端。
 `heap_insert()` 在 `src/backend/access/heap/heapam.c:2003-2193`。
 它准备 tuple 后调用：
+
 ```c
 RelationGetBufferForTuple(relation, heaptup->t_len,
                           InvalidBuffer, options, bistate,
                           &vmbuffer, NULL, 0)
 ```
+
 这个函数在 `src/backend/access/heap/hio.c:435-883`。
 它返回一个 pinned 且 exclusive locked 的 buffer。
 这个 buffer 至少有足够空间容纳目标 tuple。
@@ -367,28 +394,34 @@ RelationGetBufferForTuple(relation, heaptup->t_len,
 这说明 heap insert 并不是“每次插入都 append”。
 它会尽量复用有空间的 page。
 只有目标页/FSM/最后一页都失败时才扩展。
----
-## 13. `ReadBufferBI()`：bulk insert 如何传入 `BAS_BULKWRITE`
+
+## 16. `ReadBufferBI()`：bulk insert 如何传入 `BAS_BULKWRITE`
+
 `src/backend/access/heap/hio.c:82-125` 定义了 `ReadBufferBI()`。
 BI 是 bulk insert 的意思。
 如果没有 `bistate`，它等价于：
+
 ```c
 ReadBufferExtended(relation, MAIN_FORKNUM, targetBlock, mode, NULL)
 ```
+
 如果有 `bistate`，它会先检查 `bistate->current_buf` 是否已经 pin 住了目标 block。
 如果是，就增加 refcount 后直接返回，省掉一次 buffer lookup/pin 循环。
 如果不是，就释放旧 current buffer，然后：
+
 ```c
 ReadBufferExtended(relation, MAIN_FORKNUM, targetBlock,
                    mode, bistate->strategy)
 ```
+
 这里 `bistate->strategy` 来自 `GetBulkInsertState()`。
 `GetBulkInsertState()` 在 `src/backend/access/heap/heapam.c:1933-1948`。
 它调用 `GetAccessStrategy(BAS_BULKWRITE)`。
 所以 bulk insert 不仅批量插入 tuple。
 它还会把 heap page read/extend 过程中的 buffer victim 选择切到 bulk write ring。
----
-## 14. existing page 成功路径
+
+## 17. existing page 成功路径
+
 `RelationGetBufferForTuple()` 的主循环从 `targetBlock` 开始。
 它先读 buffer，再处理 visibility map pin，然后给目标 buffer 加 exclusive lock。
 如果 `otherBuffer` 有效，例如 heap update 需要同时锁旧 tuple page 和新 tuple page，它会按 block number 顺序锁两个 buffer。
@@ -403,13 +436,16 @@ ReadBufferExtended(relation, MAIN_FORKNUM, targetBlock,
 调用者拿到的是 pinned、exclusive locked 的 buffer，可以直接插入 tuple。
 如果空间不够，它会释放 lock/pin，更新 FSM，并寻找下一个候选页。
 如果 bulk insert state 里还有 `next_free` 到 `last_free` 的预扩展页面，就优先使用这些页面，而不是重新查 FSM。
----
-## 15. 什么时候进入 relation extension
+
+## 18. 什么时候进入 relation extension
+
 如果循环找不到合适 target block，就执行：
+
 ```c
 buffer = RelationAddBlocks(relation, bistate, num_pages, use_fsm,
                            &unlockedTargetBuffer);
 ```
+
 `RelationAddBlocks()` 在 `src/backend/access/heap/hio.c:211-432`。
 它封装了 heap 对多块扩展的策略。
 注意这个函数名是 heap 层命名。
@@ -418,20 +454,25 @@ buffer = RelationAddBlocks(relation, bistate, num_pages, use_fsm,
 普通 `heap_insert()` 传 0，函数内部转成 1。
 `heap_multi_insert()` 会估算本批 tuple 最坏需要多少 page，并传入 `npages - npages_used`。
 因此 COPY/批量 insert 可以触发 multi-block extend。
----
-## 16. heap 多块扩展的启发式
+
+## 19. heap 多块扩展的启发式
+
 `RelationAddBlocks()` 先计算 `extend_by_pages`。
 如果没有 bulk insert state 且不能使用 FSM，就只能扩展 1 页。
 因为额外扩展的页面没有地方记录给后续使用。
 如果有 bulk insert state 或者可以用 FSM，它会先至少扩展调用者需要的 `num_pages`。
 然后读取 extension lock waiter 数：
+
 ```c
 waitcount = RelationExtensionLockWaiterCount(relation)
 ```
+
 如果有人在等同一个 relation 的 extension lock，就把扩展页数增加为：
+
 ```c
 extend_by_pages += extend_by_pages * waitcount
 ```
+
 这是一种“帮别人也扩一点”的策略。
 它减少后续大家再次排队扩展的概率。
 如果 `bistate` 之前已经扩展过，还会用 `already_extended_by` 做下限。
@@ -440,8 +481,9 @@ extend_by_pages += extend_by_pages * waitcount
 最后，扩展页数被限制到 `MAX_BUFFERS_TO_EXTEND_BY`。
 本基线中这个值是 64。
 限制原因很直接：扩展多少页，就要临时 pin 多少 victim buffer。
----
-## 17. `RelationAddBlocks()` 如何处理 FSM 与 bulk state
+
+## 20. `RelationAddBlocks()` 如何处理 FSM 与 bulk state
+
 多扩出来的页需要被后续找到。
 如果没有 bulk insert state，但允许 FSM，那么除了马上返回的第一页外，额外页面会进入 FSM。
 这样其他 backend 能找到这些空页。
@@ -452,9 +494,11 @@ extend_by_pages += extend_by_pages * waitcount
 源码注释也说明：如果有 `bistate`，只把自己不需要的页面放进 FSM。
 被返回的第一页永远不放进 FSM。
 因为调用者马上要用它。
----
-## 18. heap 调用 `ExtendBufferedRelBy()`
+
+## 21. heap 调用 `ExtendBufferedRelBy()`
+
 `RelationAddBlocks()` 的核心调用在 `src/backend/access/heap/hio.c:339-344`：
+
 ```c
 first_block = ExtendBufferedRelBy(BMR_REL(relation), MAIN_FORKNUM,
                                   bistate ? bistate->strategy : NULL,
@@ -463,6 +507,7 @@ first_block = ExtendBufferedRelBy(BMR_REL(relation), MAIN_FORKNUM,
                                   victim_buffers,
                                   &extend_by_pages);
 ```
+
 有几个点要看清楚。
 第一，strategy 来自 bulk insert state。
 普通 insert 是 `NULL`。
@@ -473,26 +518,31 @@ buffer manager 返回的第一个 buffer 会被 exclusive locked。
 输入表示请求扩展多少页。
 输出表示实际扩展多少页。
 扩展后，heap 立即检查返回的第一页：
+
 ```c
 if (!PageIsNew(page))
     elog(ERROR, ...)
 PageInit(page, BufferGetPageSize(buffer), 0);
 MarkBufferDirty(buffer);
 ```
+
 这个检查很重要。
 扩展出来的新页应该是 zero page。
 如果不是，继续初始化会有覆盖有效数据的风险。
----
-## 19. `heap_multi_insert()` 如何驱动多块扩展
+
+## 22. `heap_multi_insert()` 如何驱动多块扩展
+
 `heap_multi_insert()` 在 `src/backend/access/heap/heapam.c:2320-2555` 附近展示了批量插入路径。
 它先调用 `heap_multi_insert_pages()` 估算剩余 tuple 在最坏情况下需要多少 page。
 然后调用：
+
 ```c
 RelationGetBufferForTuple(relation, heaptuples[ndone]->t_len,
                           InvalidBuffer, options, bistate,
                           &vmbuffer, NULL,
                           npages - npages_used)
 ```
+
 这就是 multi-block extend 的上层来源。
 `RelationGetBufferForTuple()` 不能保证一次就拿到所有 page。
 它保证“至少下一条 tuple 能放下”。
@@ -503,8 +553,9 @@ RelationGetBufferForTuple(relation, heaptuples[ndone]->t_len,
 - bulk insert current buffer 避免重复 pin/unpin。
 - bulk write access strategy 避免污染整个 shared buffers。
 - multi-block extend 减少 relation extension lock contention 和底层文件扩展调用次数。
----
-## 20. access strategy ring 的数据结构
+
+## 23. access strategy ring 的数据结构
+
 `BufferAccessStrategyData` 在 `src/backend/storage/buffer/freelist.c:69-94`。
 它包含：
 - `btype`
@@ -528,8 +579,9 @@ ring 里保存的是 shared buffer 的编号。
 如果 buffer 被 pin，不能复用。
 如果 usage_count 大于 1，说明 ring 之外有人比较频繁地触碰了这个 buffer，也不复用。
 这样 ring 不会强行夺走其他 backend 的热页面。
----
-## 21. `StrategyGetBuffer()` 如何结合 ring 与 clock sweep
+
+## 24. `StrategyGetBuffer()` 如何结合 ring 与 clock sweep
+
 `StrategyGetBuffer()` 在 `src/backend/storage/buffer/freelist.c:169-317`。
 它是 `GetVictimBuffer()` 用来选择 victim 的入口。
 流程是：
@@ -546,8 +598,9 @@ ring 不是凭空获得 buffer。
 注释说明：strategy object 回收的 buffer 不计入这里。
 这正是 ring 的目的。
 它让一次大扫描的 buffer 消耗不被看成普通工作集持续增长。
----
-## 22. 三类内置策略
+
+## 25. 三类内置策略
+
 `BufferAccessStrategyType` 在 `src/include/storage/bufmgr.h:34-41`。
 本基线有四个枚举值：
 - `BAS_NORMAL`
@@ -567,8 +620,9 @@ ring 不是凭空获得 buffer。
 `vacuum_buffer_usage_limit` 或 `VACUUM/ANALYZE BUFFER_USAGE_LIMIT` 可以覆盖这个大小。
 无论哪种策略，`GetAccessStrategyWithSize()` 最后还会把 ring buffer 数限制在 `NBuffers / 8` 以内。
 所以 ring 不会超过 shared buffers 的八分之一。
----
-## 23. BulkRead ring 的 dirty page 处理
+
+## 26. BulkRead ring 的 dirty page 处理
+
 Bulk read 的目标是大规模读一次。
 典型场景是 large sequential scan。
 这种 scan 通常不修改 page。
@@ -586,8 +640,9 @@ Bulk read 的目标是大规模读一次。
 如果一个 ring buffer 因 hint bit 等原因变 dirty，并且现在复用它会逼迫当前 backend 先 flush WAL，那就把它踢出 ring，重新从正常 clock-sweep 里找别的 victim。
 对于 read-only scan，这通常很少发生。
 对于大量修改页面的 scan，README 也说明 ring 会退化得更像正常策略。
----
-## 24. BulkWrite 与 Vacuum ring 的 dirty page 处理
+
+## 27. BulkWrite 与 Vacuum ring 的 dirty page 处理
+
 `BAS_BULKWRITE` 和 `BAS_VACUUM` 不使用 `StrategyRejectBuffer()` 的拒绝逻辑。
 `StrategyRejectBuffer()` 明确写着只有 bulkread 模式才做。
 这意味着 bulk write 或 vacuum 如果复用 ring buffer 时遇到 dirty page，需要按 buffer manager 的普通规则写出。
@@ -604,8 +659,9 @@ README 中说 bulk write 使用 16MB ring。
 更小的 ring 会让 COPY 经常被 WAL flush 阻塞。
 所以三类策略不是只有 ring size 不同。
 它们对 dirty ring member 的态度也不同。
----
-## 25. access strategy 与 IO context
+
+## 28. access strategy 与 IO context
+
 `IOContextForStrategy()` 在 `src/backend/storage/buffer/freelist.c:708-738`。
 它把 strategy 映射成 IO statistics context：
 - `NULL` -> `IOCONTEXT_NORMAL`
@@ -617,8 +673,9 @@ README 中说 bulk write 使用 16MB ring。
 所以 access strategy 不只是 replacement hint。
 它也是 IO 归因的一部分。
 当你做实验时，可以通过 `pg_stat_io` 区分 normal、bulkread、bulkwrite、vacuum。
----
-## 26. access strategy 的 pin limit
+
+## 29. access strategy 的 pin limit
+
 `GetAccessStrategyPinLimit()` 在 `src/backend/storage/buffer/freelist.c:559-599`。
 read stream 和其他 look-ahead 代码会问 strategy：我最多应该同时 pin 多少 ring buffer。
 如果 strategy 是 `NULL`，返回 `NBuffers`。
@@ -628,30 +685,37 @@ read stream 和其他 look-ahead 代码会问 strategy：我最多应该同时 p
 这是在 look-ahead 距离和 WAL/writeback 压力之间做折中。
 如果 bulk write 或 vacuum 一次 pin 太多 ring buffer，就可能迫使自己频繁写出 dirty data 并 flush WAL。
 read stream 在初始化时会把这个 pin limit 纳入 `max_pinned_buffers`。
----
-## 27. 大表顺序扫描何时使用 `BAS_BULKREAD`
+
+## 30. 大表顺序扫描何时使用 `BAS_BULKREAD`
+
 `heapam.c` 的 `initscan()` 片段在 `src/backend/access/heap/heapam.c:360-416`。
 它先确定扫描要看的 block 数 `rs_nblocks`。
 然后判断表是否“大”。
 条件是：
+
 ```c
 !RelationUsesLocalBuffers(scan->rs_base.rs_rd) &&
 scan->rs_nblocks > NBuffers / 4
 ```
+
 如果表大小超过 shared buffers 的四分之一，并且 scan flags 允许 strategy，就创建：
+
 ```c
 scan->rs_strategy = GetAccessStrategy(BAS_BULKREAD)
 ```
+
 同一个阈值也用于 synchronized scan 的启用判断。
 这不是一个精确的成本模型。
 它是一个工程阈值：小表值得让 normal clock-sweep 缓存；大表全扫通常只读一次，不能让它把 shared buffers 中的工作集冲掉。
 本地 temp buffers 不用这个 shared buffer strategy。
 因为 temp relation 使用 local buffers。
----
-## 28. sequential scan 与 read stream
+
+## 31. sequential scan 与 read stream
+
 本基线里，heap scan 不再只是循环 `ReadBuffer()`。
 `heap_beginscan()` 附近在 `src/backend/access/heap/heapam.c:1272-1304` 设置 `scan->rs_read_stream`。
 对于 sequential scan 和 TID range scan，它调用：
+
 ```c
 read_stream_begin_relation(READ_STREAM_SEQUENTIAL |
                            READ_STREAM_USE_BATCHING,
@@ -662,6 +726,7 @@ read_stream_begin_relation(READ_STREAM_SEQUENTIAL |
                            scan,
                            0)
 ```
+
 `scan->rs_strategy` 可能是 `BAS_BULKREAD`，也可能是 `NULL`。
 也就是说 read stream 负责预读和 IO 合并。
 access strategy 负责 buffer replacement footprint。
@@ -675,8 +740,9 @@ access strategy 负责 buffer replacement footprint。
 - 设置 circular queue 和 in-progress IO queue。
 - 把 `strategy` 写入每个 `ReadBuffersOperation`。
 这就是 bulk read ring 和 read stream 连接的地方。
----
-## 29. read stream 的状态机
+
+## 32. read stream 的状态机
+
 `src/backend/storage/aio/read_stream.c:1-64` 顶部注释概括了算法。
 用户提供 callback 生成 block number。
 read stream 尝试把连续 block 合并成较大的 read。
@@ -699,8 +765,9 @@ read stream 尝试把连续 block 合并成较大的 read。
 如果 wait 真的阻塞了，它会增大 readahead distance。
 如果一段时间都是 cache hit，它会逐渐减小 look-ahead。
 这就是自适应预读。
----
-## 30. read stream 的 fast path
+
+## 33. read stream 的 fast path
+
 `read_stream_next_buffer()` 顶部还有一个 fast path。
 如果扫描基本全是 cache hit，且没有 per-buffer data，它可以保持一个 buffer slot。
 每次返回上一次 pin 好的 buffer，同时同步 pin 下一块。
@@ -711,8 +778,9 @@ read stream 尝试把连续 block 合并成较大的 read。
 read stream 会根据 hit/miss 和 wait 情况动态调整。
 全缓存扫描时，预读距离可以保持很小。
 真正需要 IO 时，才逐步扩大合并和预读。
----
-## 31. 顺序扫描如何避免冲刷 shared buffers
+
+## 34. 顺序扫描如何避免冲刷 shared buffers
+
 大表顺序扫描仍然把页面读入 shared buffers。
 它没有绕过 buffer manager。
 它避免冲刷 shared buffers 的手段是使用小 ring。
@@ -730,8 +798,9 @@ README 中对 256KB ring 的解释也很实际。
 它是把 evict/reuse 的范围限制在 ring 的 footprint 内。
 如果扫描过程中大量页面被修改，ring 会承担写出 dirty page 的成本。
 对于 pure read 或只偶尔 hint bit 的扫描，ring 的效果最好。
----
-## 32. BulkWrite：COPY/CTAS 与扩展路径
+
+## 35. BulkWrite：COPY/CTAS 与扩展路径
+
 Bulk write 的典型来源是 COPY IN、CREATE TABLE AS SELECT 这类批量写入。
 在 heap AM 层，它通过 `BulkInsertState` 表达。
 `GetBulkInsertState()` 创建 `BAS_BULKWRITE` strategy。
@@ -745,8 +814,9 @@ ring 太小会让同一小批 buffer 被快速复用，进而频繁写出尚未�
 在 relation extension 中，bulk write strategy 会传给 `ExtendBufferedRelBy()`。
 所以新页扩展时需要 victim buffer，也优先从 bulk write ring 里复用。
 这让批量导入的读/写/扩展 footprint 都围绕同一个策略收敛。
----
-## 33. Vacuum：可配置 ring
+
+## 36. Vacuum：可配置 ring
+
 VACUUM 的 strategy 创建点在 `src/backend/commands/vacuum.c:430-465`。
 普通 VACUUM 或 ANALYZE 会在 cross-transaction memory context 中创建 buffer strategy。
 如果命令指定了 `BUFFER_USAGE_LIMIT`，使用命令参数。
@@ -759,8 +829,9 @@ VACUUM 和 bulk read 的重要差异是 dirty page 不会被踢出 ring。
 这符合 VACUUM 的工作性质。
 VACUUM 本来就可能修改 visibility map、freeze 信息、hint bits 或 heap page。
 它需要一个受控但不极端小的 ring，避免 WAL flush 过度频繁。
----
-## 34. `GetVictimBuffer()` 是策略落地的位置
+
+## 37. `GetVictimBuffer()` 是策略落地的位置
+
 `GetVictimBuffer()` 在 `src/backend/storage/buffer/bufmgr.c:2547-2675`。
 它先通过 `StrategyGetBuffer(strategy, ...)` 得到一个 pinned victim。
 然后检查 victim 是否 dirty。
@@ -776,8 +847,9 @@ VACUUM 本来就可能修改 visibility map、freeze 信息、hint bits 或 heap
 如果删除失败，说明期间又有人 pin 或 dirty 了它，就释放并重试。
 这说明 access strategy 只是 victim 候选来源。
 最终能不能复用，还要通过 buffer manager 的并发协议验证。
----
-## 35. 并发扩展 race：现代路径如何处理
+
+## 38. 并发扩展 race：现代路径如何处理
+
 现代 `ExtendBufferedRelShared()` 的并发控制有几个层次。
 第一层是 relation extension lock。
 它保护“决定 EOF 并推进 EOF”的临界区。
@@ -803,9 +875,11 @@ A 只是在 B 后面继续扩。
 这就是 `src/backend/storage/buffer/bufmgr.c:1115-1126` 的逻辑。
 并发下，“我准备扩展”不保证“我实际扩展”。
 调用者必须按返回值和 `extended_by` 处理。
----
-## 36. `P_NEW` 旧路径与新路径的对照
+
+## 39. `P_NEW` 旧路径与新路径的对照
+
 旧风格：
+
 ```c
 LockRelationForExtension(rel, ExclusiveLock);
 buf = ReadBuffer(rel, P_NEW);
@@ -813,25 +887,31 @@ LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 ... initialize page ...
 UnlockRelationForExtension(rel, ExclusiveLock);
 ```
+
 这种风格的问题是扩展锁可能覆盖过多工作。
 比如找 victim buffer、写出 dirty victim、清零 buffer，都可能发生在锁内或围绕锁的复杂区域。
 新风格：
+
 ```c
 buf = ExtendBufferedRel(BMR_REL(rel), fork, strategy, EB_LOCK_FIRST);
 ... initialize page ...
 ```
+
 或者批量：
+
 ```c
 first = ExtendBufferedRelBy(..., EB_LOCK_FIRST,
                             extend_by, buffers, &extended_by);
 ```
+
 `ExtendBufferedRelShared()` 会先找 victim 和清零，再拿 extension lock。
 锁内只做必须串行化的 EOF 决策、buffer tag 安装、physical zero extend。
 这就是 `ReadBuffer_common()` 注释里说“在 `ExtendBufferedRel()` 内部获取 extension lock scales a lot better”的原因。
 如果你在新代码中需要扩展 relation，优先找 `ExtendBufferedRel*()`。
 只有维护旧 AM 或特殊调用点时，才应该继续走 `P_NEW`，而且必须审核锁。
----
-## 37. zero page 与 WAL 边界的常见误区
+
+## 40. zero page 与 WAL 边界的常见误区
+
 误解一：`smgrzeroextend()` 已经把 page 写到磁盘，所以后续 `PageInit()` 不需要 dirty。
 错误。
 `smgrzeroextend()` 写的是全零页。
@@ -855,11 +935,13 @@ page LSN 也由调用者在拿到 `XLogInsert()` 返回值后设置。
 错误。
 VACUUM dirty ring buffer 复用时仍可能 flush WAL。
 ring 的作用是把缓冲区占用和 flush 频率控制在合理范围，而不是取消 WAL-before-data。
----
-## 38. 可执行实验一：观察大表顺扫的 bulkread IO context
-前提：使用 `/home/nail/postgres-lab` 构建出的 PostgreSQL，能连接到一个测试库。
+
+## 41. 可执行实验一：观察大表顺扫的 bulkread IO context
+
+前提：使用 `/home/highgo/postgres` 构建出的 PostgreSQL，能连接到一个测试库。
 如果你的实例没有开启 `track_io_timing`，也能看计数；开启后能看时间。
 准备：
+
 ```sql
 DROP TABLE IF EXISTS course_bulkread;
 CREATE TABLE course_bulkread AS
@@ -869,7 +951,9 @@ VACUUM ANALYZE course_bulkread;
 CHECKPOINT;
 SELECT pg_stat_reset_shared('io');
 ```
+
 执行顺序扫描：
+
 ```sql
 SET enable_indexscan = off;
 SET enable_bitmapscan = off;
@@ -877,7 +961,9 @@ SET enable_seqscan = on;
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT count(*) FROM course_bulkread;
 ```
+
 观察 IO context：
+
 ```sql
 SELECT backend_type, object, context,
        reads, writes, extends, hits, evictions, reuses
@@ -885,11 +971,13 @@ FROM pg_stat_io
 WHERE context IN ('bulkread', 'normal')
 ORDER BY backend_type, object, context;
 ```
+
 预期现象：
 - 如果表足够大，heap scan 会使用 `BAS_BULKREAD`。
 - `pg_stat_io` 中应能看到 `bulkread` context 的读或 hit/reuse/evict 变化。
 - `EXPLAIN (BUFFERS)` 会显示 shared read/hit，但不会告诉你 access strategy，需要结合 `pg_stat_io`。
 可选观察 shared buffers 中保留了多少该表页面：
+
 ```sql
 CREATE EXTENSION IF NOT EXISTS pg_buffercache;
 SELECT count(*) AS cached_pages,
@@ -900,25 +988,32 @@ FROM pg_buffercache b
 WHERE b.relfilenode = pg_relation_filenode('course_bulkread'::regclass)
   AND b.reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database());
 ```
+
 注意：
 - `pg_buffercache` 显示的是某个瞬间。
 - bulkread 不是不缓存，而是 ring footprint 小。
 - 如果其他 session 同时访问该表，缓存页面数量会被干扰。
----
-## 39. 可执行实验二：观察 bulk write 与 relation extend
+
+## 42. 可执行实验二：观察 bulk write 与 relation extend
+
 准备：
+
 ```sql
 DROP TABLE IF EXISTS course_bulkwrite;
 SELECT pg_stat_reset_shared('io');
 CHECKPOINT;
 ```
+
 执行 CTAS：
+
 ```sql
 CREATE TABLE course_bulkwrite AS
 SELECT g AS id, repeat(md5(g::text), 8) AS payload
 FROM generate_series(1, 1000000) AS g;
 ```
+
 观察：
+
 ```sql
 SELECT backend_type, object, context,
        reads, writes, extends, evictions, reuses
@@ -926,16 +1021,20 @@ FROM pg_stat_io
 WHERE context IN ('bulkwrite', 'normal')
 ORDER BY backend_type, object, context;
 ```
+
 再看 relation 大小：
+
 ```sql
 SELECT pg_relation_size('course_bulkwrite') AS bytes,
        pg_relation_size('course_bulkwrite') / current_setting('block_size')::int AS blocks;
 ```
+
 预期现象：
 - CTAS/COPY 类路径通常会使用 bulk insert state。
 - bulk insert state 使用 `BAS_BULKWRITE`。
 - relation 文件增长会反映在 `extends` 或 write 相关统计中，具体计数受版本、IO method、缓存命中状态影响。
 如果要更贴近 COPY：
+
 ```sql
 DROP TABLE IF EXISTS course_copy;
 CREATE TABLE course_copy(id int, payload text);
@@ -950,28 +1049,37 @@ FROM pg_stat_io
 WHERE context = 'bulkwrite'
 ORDER BY backend_type, object;
 ```
+
 如果系统禁用了 `COPY FROM PROGRAM`，可以在 shell 里生成文件后使用 `COPY FROM '/path'`。
----
-## 40. 可执行实验三：观察 extension lock 等待
+
+## 43. 可执行实验三：观察 extension lock 等待
+
 这个实验需要两个或多个 shell。
 它依赖并发插入制造 relation extension contention。
 准备表：
+
 ```sql
 DROP TABLE IF EXISTS course_ext_lock;
 CREATE TABLE course_ext_lock(id bigint, payload text) WITH (fillfactor = 100);
 ```
+
 创建一个 pgbench 脚本，例如 `/tmp/course_ext_insert.sql`：
+
 ```sql
 INSERT INTO course_ext_lock
 SELECT :client_id * 1000000000 + g,
        repeat(md5((:client_id * 1000000000 + g)::text), 8)
 FROM generate_series(1, 50) AS g;
 ```
+
 在 shell 1 运行：
+
 ```bash
 pgbench -n -c 16 -j 16 -t 2000 -f /tmp/course_ext_insert.sql your_database
 ```
+
 在 shell 2 反复观察 locks：
+
 ```sql
 SELECT locktype, relation::regclass, mode, granted, count(*)
 FROM pg_locks
@@ -979,13 +1087,16 @@ WHERE locktype = 'extend'
 GROUP BY locktype, relation, mode, granted
 ORDER BY relation::regclass::text, granted;
 ```
+
 也可以观察等待事件：
+
 ```sql
 SELECT pid, wait_event_type, wait_event, query
 FROM pg_stat_activity
 WHERE wait_event_type = 'Lock'
   AND query LIKE 'INSERT INTO course_ext_lock%';
 ```
+
 预期现象：
 - 是否能观察到等待取决于机器速度、表大小、tuple 宽度和并发度。
 - 如果没有看到，增加 `-c`、增加每次 insert 的行数、或者把 payload 做宽一些。
@@ -993,8 +1104,9 @@ WHERE wait_event_type = 'Lock'
 源码对应：
 - heap 的 `RelationAddBlocks()` 会用 `RelationExtensionLockWaiterCount()` 读取等待者数量。
 - 有等待者时，它会多扩展一些页，减少后续竞争。
----
-## 41. 讨论题
+
+## 44. 讨论题
+
 1. 为什么 `P_NEW` 是兼容入口，而不是新代码应优先使用的 relation extension API？
 2. `ExtendBufferedRelShared()` 为什么先拿 victim buffer，再进入 relation extension lock？
 3. 为什么必须在 `smgrzeroextend()` 前把新 block 的 buffer tag 和 I/O in progress 状态放进 buffer table？
@@ -1004,7 +1116,9 @@ WHERE wait_event_type = 'Lock'
 7. 大表顺序扫描仍经过 shared buffers，为什么通常不会把正常工作集全部冲掉？
 8. `pg_stat_io` 能看到 bulkread/bulkwrite context，但看不到哪些 relation extension 内部状态？
 9. 如果写一个新 access method，需要如何证明新增 page 的 extension lock、dirty、WAL、page LSN 和 free-space 可发现性都成立？
-## 42. 本节小结
+
+## 45. 本节小结
+
 `P_NEW` 是一个历史兼容入口，不是推荐的新扩展 API。
 它在 `ReadBuffer_common()` 中会转到 `ExtendBufferedRel()`，并跳过内部 extension lock。
 所以使用 `P_NEW` 的调用者必须自己证明并发安全。

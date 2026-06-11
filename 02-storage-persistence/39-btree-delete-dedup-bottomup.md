@@ -1,6 +1,7 @@
 # PostgreSQL B-tree deletion、deduplication 与 bottom-up cleanup
+
 ## 课程定位
-本节主题：B-tree deletion、deduplication 与 bottom-up cleanup。
+
 上一组课程已经讲过 heap tuple version、HOT、heap delete 和 page pruning。
 现在把视角移动到 nbtree leaf page。
 前置知识：
@@ -37,40 +38,34 @@ nbtree 的折中是：
 - 为什么 WAL 里区分 `XLOG_BTREE_DELETE`、`XLOG_BTREE_VACUUM` 和 `XLOG_BTREE_DEDUP`。
 - 为什么 `BTP_HAS_GARBAGE` 和 `LP_DEAD` 都不能被当成持久、完整的因果证据。
 - 哪些现象能用 `pageinspect`、`VACUUM VERBOSE`、`pg_stat_*` 和 WAL 观察，哪些只能推断。
-## 源码基线
-源码仓库：
-```text
-/home/nail/postgres-lab
-```
-基线：
-```text
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
-```
-行号来自：
-```text
-nl -ba <source-file>
-```
-本节重点阅读：
-```text
-src/backend/access/nbtree/README
-src/backend/access/nbtree/nbtinsert.c
-src/backend/access/nbtree/nbtdedup.c
-src/backend/access/nbtree/nbtpage.c
-src/backend/access/nbtree/nbtree.c
-src/backend/access/nbtree/nbtxlog.c
-```
-辅助阅读：
-```text
-src/include/access/nbtree.h
-src/include/access/tableam.h
-src/backend/access/heap/heapam.c
-src/backend/access/nbtree/nbtutils.c
-src/backend/access/nbtree/nbtsearch.c
-```
-辅助文件不是本节主角。
-它们只用于解释 `LP_DEAD` 的产生、table AM 的删除裁决，以及 heap visibility horizon 的边界。
-## 1. 先给结论
+
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。行号来自 `nl -ba <source-file>`；重点源码和辅助阅读统一放在第 3 节的阅读顺序里。
+
+## 1. 本节在总主线中的位置
+
+第 35 到 38 节已经建立了 nbtree 的 page、高并发搜索、unique insert 和 split 修复模型。
+本节把主线从“结构变化如何保持可搜索”推进到“leaf page 空间压力如何在 split 前被局部化解”。
+它仍然在 B-tree leaf page 内部，但关注点换成 dead index tuple、posting list 和 version churn 对长期 bloat 的影响。
+
+本节不完整展开 Lehman-Yao B-tree 查找和 split 算法。
+只在 page split 作为 fallback 时提到它。
+本节不完整展开 page deletion 的 half-dead subtree 算法。
+只讲 leaf tuple cleanup 与 empty page deletion 的接口。
+本节不完整展开 heap pruning 和 freeze。
+只讲 index AM 通过 table AM 问“这个 heap TID 是否 vacuumable”的边界。
+本节不完整展开 unique check 的所有 wait/retry 逻辑。
+只讲它怎样产生 `LP_DEAD`，以及怎样触发 unique index 的 bottom-up/dedup。
+本节的主角是 leaf page 上的 index tuple。
+对象生命周期是：
+一个 index tuple 被插入。
+之后它可能被 index scan 标成 `LP_DEAD`。
+在页面空间紧张或 VACUUM 时被物理删除。
+如果它属于 posting list，删除可能表现为重写 posting list。
+如果 deletion 暂时做不到，dedup 可能把多个 duplicate 合并起来。
+如果这些机制都不足，leaf page split 让临时 version churn 变成长期结构成本。
+
+## 2. 核心矛盾与一句话运行模型
+
 B-tree leaf page 即将放不下新 index tuple 时，当前源码不是马上 split。
 `nbtinsert.c:913-920` 在 heapkeyspace index 中检测页面空间不足。
 如果不足，调用 `_bt_delete_or_dedup_one_page()`。
@@ -103,30 +98,17 @@ posting list 是 heap TID array。
 它也不让 live tuple 变 dead。
 它只是把同一 key 的多个 TID 放进一个 physical index tuple。
 本节一句话运行模型：
+
 ```text
 insert path 发现 leaf page 将满 -> simple deletion 先删 LP_DEAD -> bottom-up deletion 猜测 version churn 并让 table AM 裁决 -> dedup 把 duplicate TID 压成 posting list -> 都失败才 page split。
 ```
+
 这条链路解释了为什么 nbtree 能在许多 version churn workload 下保持 index size 稳定。
 它也解释了为什么这个稳定性不是保证。
 old snapshot、replication slot、long transaction、heap page 访问成本、dedup eligibility、operator class equalimage 语义和 page layout 都会影响最终结果。
-## 2. 这节课不讲什么
-本节不完整展开 Lehman-Yao B-tree 查找和 split 算法。
-只在 page split 作为 fallback 时提到它。
-本节不完整展开 page deletion 的 half-dead subtree 算法。
-只讲 leaf tuple cleanup 与 empty page deletion 的接口。
-本节不完整展开 heap pruning 和 freeze。
-只讲 index AM 通过 table AM 问“这个 heap TID 是否 vacuumable”的边界。
-本节不完整展开 unique check 的所有 wait/retry 逻辑。
-只讲它怎样产生 `LP_DEAD`，以及怎样触发 unique index 的 bottom-up/dedup。
-本节的主角是 leaf page 上的 index tuple。
-对象生命周期是：
-一个 index tuple 被插入。
-之后它可能被 index scan 标成 `LP_DEAD`。
-在页面空间紧张或 VACUUM 时被物理删除。
-如果它属于 posting list，删除可能表现为重写 posting list。
-如果 deletion 暂时做不到，dedup 可能把多个 duplicate 合并起来。
-如果这些机制都不足，leaf page split 让临时 version churn 变成长期结构成本。
+
 ## 3. 核心文件分工与阅读顺序
+
 建议先读 `nbtree/README`。
 它解释了为什么 index tuple deletion 不能只看 B-tree search correctness。
 `README:166-193` 说明 VACUUM 删除 leaf item 前要 full cleanup lock。
@@ -138,6 +120,7 @@ old snapshot、replication slot、long transaction、heap page 访问成本、de
 第二读 `nbtinsert.c`。
 这是前台插入路径。
 关键入口：
+
 ```text
 _bt_doinsert()                 nbtinsert.c:104
 _bt_findinsertloc()            nbtinsert.c:828
@@ -145,9 +128,11 @@ _bt_delete_or_dedup_one_page() nbtinsert.c:2730
 _bt_simpledel_pass()           nbtinsert.c:2859
 _bt_deadblocks()               nbtinsert.c:2984
 ```
+
 第三读 `nbtdedup.c`。
 它同时实现 dedup pass 和 bottom-up deletion candidate collection。
 关键入口：
+
 ```text
 _bt_dedup_pass()               nbtdedup.c:58
 _bt_bottomupdel_pass()         nbtdedup.c:308
@@ -158,9 +143,11 @@ _bt_dedup_finish_pending()     nbtdedup.c:556
 _bt_form_posting()             nbtdedup.c:863
 _bt_update_posting()           nbtdedup.c:923
 ```
+
 第四读 `nbtpage.c`。
 它完成真正的 page mutation 和 WAL。
 关键入口：
+
 ```text
 _bt_upgradelockbufcleanup()    nbtpage.c:1136
 _bt_delitems_vacuum()          nbtpage.c:1181
@@ -168,9 +155,11 @@ _bt_delitems_delete()          nbtpage.c:1312
 _bt_delitems_update()          nbtpage.c:1434
 _bt_delitems_delete_check()    nbtpage.c:1542
 ```
+
 第五读 `nbtree.c`。
 它连接 access method callback、index scan kill hint 和 VACUUM。
 关键入口：
+
 ```text
 bthandler()                    nbtree.c:117
 btgettuple()                   nbtree.c:229
@@ -182,23 +171,28 @@ btvacuumscan()                 nbtree.c:1239
 btvacuumpage()                 nbtree.c:1414
 btreevacuumposting()           nbtree.c:1752
 ```
+
 第六读 `nbtxlog.c`。
 它说明 crash recovery 看到的不是你的 C 调用栈。
 它只看到 WAL record。
 关键入口：
+
 ```text
 btree_xlog_vacuum()            nbtxlog.c:586
 btree_xlog_delete()            nbtxlog.c:640
 btree_xlog_dedup()             nbtxlog.c:480 附近
 btree_mask()                   nbtxlog.c:1080
 ```
+
 最后读 `tableam.h` 和 `heapam.c` 的接口。
 `tableam.h:177-277` 定义 `TM_IndexDeleteOp`。
 `tableam.h:1397-1415` 定义 `table_index_delete_tuples()` 的语义。
 `heapam.c:8098-8401` 是 heap AM 的实现。
 这段代码回答：
 nbtree 为什么只提供候选 TID 和 hint，而不直接决定删除。
+
 ## 4. 状态和不变量
+
 第一个状态是 leaf page line pointer 的 `LP_DEAD`。
 这是 `ItemId` 的 flag。
 它表示 index AM 已经知道对应 index tuple 指向的 heap TID 对所有相关观察者 dead。
@@ -257,7 +251,9 @@ VACUUM 依赖初始 heap table scan 侧 WAL 记录间接处理 conflict horizon�
 `btvacuumpage()` 会在必要时 backtrack。
 前台 `_bt_delitems_delete()` 不能清 `btpo_cycleid`。
 `nbtpage.c:1355-1358` 明确说只有 VACUUM command 控制 vacuum cycle ID。
+
 ## 5. 主流程一：index tuple 从 live 到 LP_DEAD
+
 dead index tuple cleanup 的第一阶段通常不是物理删除。
 它是普通 index scan 或 unique check 设置 `LP_DEAD`。
 `btgettuple()` 在 `nbtree.c:229-285`。
@@ -287,7 +283,9 @@ unique check 也能产生 `LP_DEAD`。
 它不是决定 heap tuple 是否 dead 的唯一信息源。
 它不是 WAL 持久语义。
 它也不是同步屏障。
+
 ## 6. 主流程二：插入即将 split 时先 simple deletion
+
 `_bt_doinsert()` 在 `nbtinsert.c:104-279`。
 它先构造 scan key。
 如果需要 unique check，就先 `_bt_check_unique()`。
@@ -330,7 +328,9 @@ incoming tuple 所在 heap block 几乎肯定已经在 cache 中。
 这里的名字很关键。
 它不是直接删。
 它先让 table AM 裁决。
+
 ## 7. table AM 裁决：index AM 不直接判断 visibility
+
 `_bt_delitems_delete_check()` 在 `nbtpage.c:1542-1709`。
 第一步就是 `table_index_delete_tuples()`。
 `nbtpage.c:1555-1557` 调用 table AM，拿到 `snapshotConflictHorizon` 和 catalog relation 信息。
@@ -363,7 +363,9 @@ index entry 可以被删，不是因为 index tuple 自己 dead。
 `heapam.c:8342-8355` 解释了这一点。
 这也是为什么前台 index deletion 需要 table AM。
 只有 heap AM 能把 HOT chain、line pointer、tuple header 和 conflict horizon 串起来。
+
 ## 8. 主流程三：真正改 leaf page
+
 table AM 返回后，`_bt_delitems_delete_check()` 要把结果重新映射回 leaf page。
 `nbtpage.c:1563-1579` 先按 `id` 恢复 leaf-page-wise order。
 如果 bottom-up caller 最后没有任何可删 entry，`ndeltids == 0`，直接返回。
@@ -396,7 +398,9 @@ VACUUM 的 WAL 是 `XLOG_BTREE_VACUUM`。
 如果 `PageIndexTupleOverwrite()` 失败，代码 `elog(PANIC)`。
 这是因为进入 critical section 后页面已经在被原子修改。
 不能用普通 ERROR 回滚内存栈来修复 page。
+
 ## 9. VACUUM 线：为什么它不是简单的后台版 simple deletion
+
 `bthandler()` 在 `nbtree.c:117-160` 注册 access method callbacks。
 `ambulkdelete = btbulkdelete`。
 `amvacuumcleanup = btvacuumcleanup`。
@@ -435,7 +439,9 @@ page deletion 把空 leaf page 从 B-tree 结构中删除。
 page recycling 又要等到安全放入 FSM。
 `README:383-435` 说明 deleted page 必须先作为 tombstone 留一段时间。
 不能马上复用为 unrelated page。
+
 ## 10. Bottom-up deletion 的触发条件
+
 bottom-up deletion 不是周期任务。
 它发生在 insert path。
 它被 page space pressure 触发。
@@ -465,7 +471,9 @@ bottom-up deletion 的目标不是“尽量删多”。
 有时即使没有释放足够空间，也会返回 true，让 caller 跳过 dedup 直接 split。
 这体现了成本控制：
 如果当前 page 根本没有 duplicate interval，dedup 也没意义。
+
 ## 11. Bottom-up deletion 如何选择候选 TID
+
 `_bt_bottomupdel_pass()` 在 `nbtdedup.c:308-423`。
 它借用了 dedup 的 equality grouping 逻辑。
 但它不真的形成 posting list。
@@ -503,7 +511,9 @@ posting list tuple 的规则更保守。
 这一段最能体现 bottom-up deletion 的本质：
 index AM 只识别“形状像 version churn 的 index page 区域”。
 table AM 再决定哪些 heap TID 真正 vacuumable。
+
 ## 12. Heap AM 如何给 bottom-up 控成本
+
 bottom-up deletion 如果检查 leaf page 上所有 TID，可能会很贵。
 一页 index 可以对应很多 heap block。
 盲目访问会把 insert path 变成随机 heap I/O 放大器。
@@ -533,7 +543,9 @@ bottom-up deletion 如果检查 leaf page 上所有 TID，可能会很贵。
 最后 `heapam.c:8392-8401` 会把 `ndeltids` 缩小到最终需要 index AM 处理的范围。
 bottom-up caller 可以收到 `ndeltids == 0`。
 这就是“没找到可删 tuple”的正常结果。
+
 ## 13. Deduplication 的运行模型
+
 deduplication 的目标不是 visibility cleanup。
 它不问 heap tuple 是否 dead。
 它只把 equal key 的 non-pivot tuples 合并成 posting list。
@@ -568,7 +580,9 @@ posting list 只保存多个 heap TID。
 dedup pass 本身不保证避免 split。
 `nbtdedup.c:274-275` 的 assert 只是确认如果 saving 足够，则 page free space 能满足目标。
 如果 saving 不够，caller 仍会 split。
+
 ## 14. Posting list 的删除和更新
+
 posting list 让 cleanup 变复杂。
 一个 line pointer 可能代表多个 heap TID。
 如果所有 TID 都 dead，可以删除整个 posting tuple。
@@ -600,7 +614,9 @@ WAL 不需要存整条 replacement posting tuple。
 它存删除哪些 posting list ordinal。
 redo 根据旧 page image 上的 original posting tuple 重新构造。
 因此 posting list 的 TID 顺序、ordinal 和 tuple layout 必须稳定。
+
 ## 15. 为什么 dedup 需要 allequalimage
+
 dedup 会把多个 index tuples 合并。
 它要求 operator class 的 equality 语义足够安全。
 `_bt_delete_or_dedup_one_page()` 在 `nbtinsert.c:2825-2828` 检查：
@@ -622,14 +638,18 @@ dedup 会改变物理表示。
 某个 index 明明有很多 duplicate key，仍可能不 dedup。
 原因可能不是没有 version churn。
 而是 dedup reloption 关闭，或者 operator class 没有给出安全 equalimage 语义。
+
 ## 16. Version churn 下如何避免 bloat
+
 考虑一个有两个索引的表。
 `id` 是 primary key。
 `v` 上还有普通索引。
 如果不断执行：
+
 ```sql
 UPDATE t SET v = v + 1 WHERE id = 42;
 ```
+
 对 primary key index 来说，`id` 没变。
 但这次 UPDATE 不是 HOT，因为 `v` 的索引必须维护。
 executor 仍要给 primary key index 插入新 entry，指向新 heap TID。
@@ -655,7 +675,9 @@ dedup 不解决 dead tuple。
 bottom-up deletion 是 preferred way。
 dedup 可以 augment bottom-up deletion。
 当 deletion 因 old snapshot 失败时，dedup 提供额外容量。
+
 ## 17. WAL 和 redo 视角
+
 本节涉及三类主要 WAL record。
 第一类是 `XLOG_BTREE_DELETE`。
 它来自前台 simple deletion 或 bottom-up deletion 最终的 `_bt_delitems_delete()`。
@@ -697,7 +719,9 @@ redo 逻辑在 `nbtxlog.c:480-539` 附近。
 `nbtxlog.c:1103-1108` 会 mask 掉它。
 所以观察到 standby 或 crash 后状态不同，不一定是 bug。
 只要后续 physical deletion WAL 和 heap WAL 保证正确性即可。
+
 ## 18. 错误路径、异常路径和 fallback
+
 第一类 fallback：unique check wait 后重试。
 `nbtinsert.c:201-235` 如果要等其他事务，释放锁，等待，然后 `goto search`。
 等待期间 leaf page 可以 split、delete、dedup。
@@ -739,7 +763,9 @@ caller 会继续 split。
 第九类 cleanup 边界：VACUUM shared state。
 `btbulkdelete()` 用 `PG_ENSURE_ERROR_CLEANUP()` 保证 `_bt_end_vacuum()` 相关清理发生。
 如果这里漏清，后续 VACUUM cycle ID 和 shared vacuum state 可能污染下一次操作。
+
 ## 19. 正确性机制层次
+
 MVCC visibility 决定 heap tuple 是否 vacuumable。
 它不由 nbtree 判断。
 nbtree 只把候选 TID 交给 table AM。
@@ -768,7 +794,9 @@ hint bits 和 unlogged flags 只是优化。
 page split fallback 保证 forward progress。
 如果 deletion 和 dedup 都做不了，insert 仍然必须成功或按普通错误路径失败。
 不能为了避免 bloat 阻塞正确插入。
+
 ## 20. 成本模型
+
 simple deletion 的成本主要是 leaf page line pointer scan。
 在 page 即将 split 时，这个成本很低。
 因为 split 本来就会读写该 page，并且比线性扫描 page 更贵。
@@ -792,7 +820,9 @@ page split 的成本是长期成本。
 它会增加 page 数、改变树结构、写更多 WAL、让未来 scan 访问更多 leaf page。
 在 version churn workload 下，split 的问题不是当前一次写放大。
 问题是短命旧版本造成了长期结构膨胀。
+
 ## 21. 跨模块传播
+
 executor 向 index AM 传 `indexUnchanged` hint。
 这个 hint 是 bottom-up deletion 的关键触发信号。
 它不保证可删。
@@ -815,7 +845,9 @@ leaf tuple deletion 增加 page 内 free space。
 page deletion 才产生可回收 index page。
 deleted page 放入 FSM 又有额外安全 horizon。
 这些是三个不同层次。
+
 ## 22. 观测入口
+
 第一类可直接观察：index page 上的 dead flag、posting list 和 TID。
 `pageinspect` 的 `bt_page_items()` 可以看到 leaf page item。
 现代版本通常能看到 `dead`、`htid` 和 `tids` 列。
@@ -837,8 +869,11 @@ deleted page 放入 FSM 又有额外安全 horizon。
 第六类几乎不可见：table AM 在 bottom-up pass 中放弃的具体原因。
 例如 old snapshot、某个 heap block 没有可删 tuple、target decay 提前停止。
 这些需要源码断点或临时 instrumentation。
+
 ## 23. 实验一：观察 version churn 与 primary key index 稳定性
+
 准备环境：
+
 ```sql
 CREATE EXTENSION IF NOT EXISTS pageinspect;
 CREATE EXTENSION IF NOT EXISTS pgstattuple;
@@ -859,7 +894,9 @@ FROM generate_series(1, 20000) AS g;
 
 VACUUM (ANALYZE) btree_churn_lab;
 ```
+
 制造非 HOT update：
+
 ```sql
 UPDATE btree_churn_lab
 SET churn = churn + 1
@@ -873,11 +910,13 @@ UPDATE btree_churn_lab
 SET churn = churn + 1
 WHERE id BETWEEN 1 AND 5000;
 ```
+
 这里 `churn` 索引列变化，HOT 不成立。
 primary key index 的 `id` 没变。
 但 primary key index 仍要为新 heap TID 插入 entry。
 这会给 primary key leaf pages 制造 physical duplicates。
 观察 index 大小：
+
 ```sql
 SELECT
     pg_size_pretty(pg_relation_size('btree_churn_lab_pkey')) AS pkey_size,
@@ -885,23 +924,31 @@ SELECT
 
 SELECT * FROM pgstatindex('btree_churn_lab_pkey');
 ```
+
 再执行：
+
 ```sql
 VACUUM (VERBOSE, ANALYZE) btree_churn_lab;
 ```
+
 对照 VACUUM 前后 index size 和 `pgstatindex()`。
 如果 workload、page layout 和 horizon 允许，primary key index 不会随 update 次数线性膨胀。
 这不证明每次都触发 bottom-up deletion。
 它只说明 cleanup/dedup/VACUUM 组合阻止了最坏情况。
 要进一步确认，需要断点 `_bt_delete_or_dedup_one_page()` 和 `_bt_bottomupdel_pass()`。
+
 ## 24. 实验二：用 old snapshot 阻止 deletion，再观察 dedup 的作用
+
 会话 A：
+
 ```sql
 BEGIN;
 SELECT count(*) FROM btree_churn_lab;
 ```
+
 保持事务不提交。
 会话 B：
+
 ```sql
 UPDATE btree_churn_lab
 SET churn = churn + 1
@@ -911,16 +958,20 @@ UPDATE btree_churn_lab
 SET churn = churn + 1
 WHERE id BETWEEN 1 AND 5000;
 ```
+
 会话 A 的 snapshot 可能让旧 versions 不能 vacuumable。
 这时 bottom-up deletion 即使触发，也可能被 heap AM 拒绝。
 如果 dedup eligibility 满足，dedup 可能仍把 duplicate entries 合并成 posting list。
 观察某些 leaf page：
+
 ```sql
 SELECT blkno, type, live_items, dead_items, free_size
 FROM bt_page_stats('btree_churn_lab_pkey', 1);
 ```
+
 实际 leaf block 要先通过 `bt_metap()`、`bt_page_stats()` 或扫描 `generate_series()` 找到。
 示例：
+
 ```sql
 SELECT g.blkno, s.live_items, s.dead_items, s.free_size
 FROM generate_series(1, 50) AS g(blkno)
@@ -929,12 +980,15 @@ WHERE type = 'l'
 ORDER BY free_size
 LIMIT 10;
 ```
+
 查看某个 leaf block 的 posting list：
+
 ```sql
 SELECT itemoffset, ctid, dead, htid, tids
 FROM bt_page_items('btree_churn_lab_pkey', 10)
 LIMIT 20;
 ```
+
 如果 `tids` 非空，说明该 item 是 posting list tuple。
 如果 old snapshot 释放后再 `VACUUM`，posting list 中的一部分 TID 可能被删除。
 这对应 `_bt_update_posting()` 路径。
@@ -942,9 +996,12 @@ LIMIT 20;
 是否出现 posting list 取决于数据分布、页空间、dedup eligibility 和版本。
 没有看到 posting list 不等于 dedup 代码没工作。
 可能只是 page pressure 不在你观察的 block 上。
+
 ## 25. 实验三：源码断点看主链路
+
 用 debug build 启动 PostgreSQL。
 在一个 backend 上设置断点：
+
 ```text
 break _bt_delete_or_dedup_one_page
 break _bt_simpledel_pass
@@ -954,6 +1011,7 @@ break heap_index_delete_tuples
 break _bt_dedup_pass
 break _bt_delitems_delete
 ```
+
 执行制造非 HOT version churn 的 UPDATE。
 每次命中 `_bt_delete_or_dedup_one_page()` 时记录：
 `simpleonly`。
@@ -988,7 +1046,9 @@ heap visibility decision。
 page mutation。
 WAL record。
 split fallback。
+
 ## 26. 常见误区
+
 误区一：`LP_DEAD` 等于 index tuple 已删除。
 不对。
 `LP_DEAD` 只是 line pointer flag。
@@ -1024,7 +1084,9 @@ physical index page mutation 必须 crash safe。
 不对。
 nbtree 限制 posting list size。
 过大的 posting list 会破坏 split point 选择、page accounting 和 partial deletion 成本。
+
 ## 27. 诊断策略
+
 第一步，确认 workload 是否是 version churn。
 看 UPDATE 是否频繁。
 看是否非 HOT。
@@ -1052,7 +1114,9 @@ page item 形态更接近机制。
 append-only key growth 的 split 是正常增长。
 random insert 的 split 是 key distribution。
 version churn-driven split 才是本节机制主要针对的对象。
+
 ## 28. 讨论题
+
 1. 为什么 `LP_DEAD` 可以用较轻的方式设置，但物理删除 index tuple 需要更强的锁和 WAL？
 2. 为什么 VACUUM 删除 leaf tuple 前要 full cleanup lock，而前台 bottom-up deletion 通常只需要 exclusive buffer lock？
 3. 如果 bottom-up deletion 已经收集了 leaf page 上所有 TID，为什么 table AM 仍然可以只检查其中一部分？
@@ -1061,7 +1125,9 @@ version churn-driven split 才是本节机制主要针对的对象。
 6. 为什么 dedup 在 old snapshot 阻止 deletion 时仍可能有用？
 7. 为什么 `XLOG_BTREE_DELETE` 需要 `snapshotConflictHorizon`，而 `XLOG_BTREE_VACUUM` 不需要同样的字段？
 8. 如果你看到 index size 没有下降，如何区分是 page 内空间可复用、empty page 不能回收，还是根本没有发生 deletion？
+
 ## 29. 本节小结
+
 本节的核心链路是 insert-time split avoidance。
 leaf page 放不下新 tuple 时，nbtree 先删除 `LP_DEAD` tuple。
 如果仍不够，并且页面形态像 version churn，就尝试 bottom-up deletion。

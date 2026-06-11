@@ -1,6 +1,7 @@
 # PostgreSQL Index vacuum 与 dead TID callback
+
 ## 课程定位
-本节主题：Index vacuum 与 dead TID callback。
+
 上一组课程已经讲过 heap pruning、`LP_DEAD`、FSM/VM、B-Tree page split、dedup 和 bottom-up deletion。
 现在把视角放到普通 VACUUM 的 index vacuum 阶段。
 前置知识：
@@ -35,27 +36,19 @@ index AM 全索引扫描自己的物理结构。
 - 为什么 `INDEX_CLEANUP AUTO/OFF/ON`、bypass optimization 和 failsafe 会改变可见现象。
 - 为什么 final heap cleanup 必须在 index vacuum 之后。
 本节一句话运行模型：
+
 ```text
 heap scan/prune 产生 LP_DEAD TID -> TidStore 保存这批 TID -> 每个 index AM 全索引扫描并用 callback 查询 membership -> 所有 index entry 删除完成 -> heap 第二阶段把同一批 LP_DEAD 释放为 LP_UNUSED -> cleanup 更新 index/table stats。
 ```
-## 源码基线
-源码仓库：
-```text
-/home/nail/postgres-lab
-```
-源码基线：
-```text
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
-```
-本节行号来自：
-```text
-nl -ba <source-file>
-```
+
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。行号来自 `nl -ba <source-file>`；源码文件分工统一放在第 3 节的阅读顺序里。
+
 课程只依赖当前基线的真实源码。
 函数名和状态边界是长期有用的知识。
 行号只是定位辅助。
+
 ## 1. 本节在总主线中的位置
+
 第 31 节和第 32 节解释了 heap delete 与 pruning。
 那里已经看到，旧 tuple version 被剪掉后，line pointer 可能保留为 `LP_DEAD`。
 `LP_DEAD` 的核心意义不是“这里还有 tuple bytes”。
@@ -77,11 +70,15 @@ heap VACUUM 负责发现 dead TID。
 具体 index AM 负责删除自己的物理 index entry。
 B-Tree 是本节主要 index AM 样例，但 dead TID callback 本身不是 B-Tree 私有机制。
 本节不展开所有 AM，只用 B-Tree 展示一个真实复杂实现。
+
 ## 2. 核心矛盾与一句话运行模型
+
 核心矛盾可以压缩为一行：
+
 ```text
 heap 才知道 TID 是否 dead，index AM 才知道 index tuple 在哪里，但 heap TID 复用必须等所有 index AM 都完成删除。
 ```
+
 这不是简单的分层问题。
 它同时是 correctness、cost 和 ownership 问题。
 correctness 上，index AM 不能拿一个 heap TID 自己随意判断可删。
@@ -93,19 +90,23 @@ ownership 上，heap page 的 `LP_DEAD` 不能由 index AM 直接释放。
 index AM 删除的是 index page 上的 tuple。
 heap VACUUM 最后释放 heap line pointer。
 所以本节的运行模型是：
+
 ```text
 phase I: heap VACUUM 扫 heap，prune/freeze，收集 LP_DEAD TID 到 TidStore。
 phase II: heap VACUUM 对每个 index 调 ambulkdelete，callback 查询 TidStore membership。
 phase III: heap VACUUM 只访问 TidStore 中的 heap pages，把对应 LP_DEAD 改成 LP_UNUSED。
 final cleanup: 调每个 index 的 amvacuumcleanup，更新统计，可能做 index AM 自己的后处理。
 ```
+
 这个模型的关键不是“三阶段”这个名字。
 关键是 ownership 传递：
 heap 发现 dead。
 index 删除引用。
 heap 释放 line pointer。
 任何顺序反过来都可能让旧 index TID 指到新 tuple。
+
 ## 3. 核心文件分工与阅读顺序
+
 建议阅读顺序不要按文件名排序。
 先读状态，再读入口，再读 AM 实现。
 第一组读 heap VACUUM 状态机：
@@ -127,14 +128,18 @@ heap 释放 line pointer。
 第五组读观测和配置：
 `src/include/commands/progress.h`、`src/backend/catalog/system_views.sql`、`doc/src/sgml/ref/vacuum.sgml`、`doc/src/sgml/config.sgml`。
 重点字段是 `phase`、`heap_blks_*`、`index_vacuum_count`、`dead_tuple_bytes`、`num_dead_item_ids`、`indexes_total`、`indexes_processed` 和 `mode`。
+
 ## 4. 关键数据结构与状态
+
 ### 4.1 `LVRelState`
+
 `vacuumlazy.c:252-413` 定义 `LVRelState`。
 它是单个 heap relation 的 VACUUM 本地状态。
 它不是 shared memory 结构。
 普通串行 VACUUM 中，它只属于当前 backend。
 parallel vacuum 时，`LVRelState` 仍在 leader backend，本节相关 shared state 放在 `ParallelVacuumState` 和 shared `TidStore` 中。
 本节最重要的字段组合：
+
 ```text
 rel / indrels / nindexes
 do_index_vacuuming / do_index_cleanup / do_rel_truncate
@@ -146,6 +151,7 @@ bstrategy / pvs
 vistest / cutoffs
 phase / blkno / offnum / indname
 ```
+
 `rel` 是目标 heap relation。
 `indrels` 是已打开的 index relation 数组。
 `nindexes` 决定是否需要两阶段策略。
@@ -161,10 +167,12 @@ failsafe 会把二者都关掉。
 它只保存本轮还需要 index AM 删除的 heap TID。
 这些 TID 指向 heap page 上的 `LP_DEAD` line pointer。
 `dead_items_info` 保存两项补充信息：
+
 ```text
 max_bytes
 num_items
 ```
+
 `max_bytes` 来自 `maintenance_work_mem` 或 `autovacuum_work_mem`。
 但 `TidStoreCreateLocal(max_bytes, ...)` 不强制硬限制。
 调用者要用 `TidStoreMemoryUsage()` 观察是否超过，然后触发一轮处理。
@@ -184,13 +192,16 @@ num_items
 它们服务 `vacuum_error_callback()`。
 这说明课程里的“状态”不只服务正常路径。
 错误路径也需要明确的生命周期。
+
 ### 4.2 `TidStore` 与 `VacDeadItemsInfo`
+
 `tidstore.c:6-12` 说明 `TidStore` 是内存里的 TID 存储结构。
 内部用 radix tree。
 key 是 `BlockNumber`。
 value 是该 block 的 offset bitmap 或小 offset array。
 `tidstore.h` 只暴露 opaque API。
 本节主要 API：
+
 ```text
 TidStoreCreateLocal()
 TidStoreCreateShared()
@@ -204,6 +215,7 @@ TidStoreGetBlockOffsets()
 TidStoreEndIterate()
 TidStoreMemoryUsage()
 ```
+
 `TidStoreSetBlockOffsets()` 要求 offsets 递增。
 `lazy_scan_prune()` 因此会先对 `presult.deadoffsets` 排序。
 `lazy_scan_noprune()` 从 line pointer 顺序扫描，所以天然递增。
@@ -221,10 +233,13 @@ leader 和 worker 都持有 backend-local `TidStore *` wrapper。
 `TidStoreLock*()` 只有 shared case 才实际加锁。
 本节主路径中，leader 在 heap scan 阶段填充 set。
 index vacuum 阶段 worker 读取 set。
+
 ### 4.3 `IndexVacuumInfo`
+
 `genam.h:52-62` 定义 `IndexVacuumInfo`。
 它是传给 `ambulkdelete` 和 `amvacuumcleanup` 的输入参数。
 核心字段：
+
 ```text
 index
 heaprel
@@ -235,6 +250,7 @@ message_level
 num_heap_tuples
 strategy
 ```
+
 `index` 是当前 index relation。
 `heaprel` 是它所属的 heap relation。
 `num_heap_tuples` 在 `ambulkdelete` 中总是估算值。
@@ -246,10 +262,13 @@ dead TID set 通过 callback state 传入。
 这是一个很重要的边界。
 AM API 不规定 callback state 的具体类型。
 当前 heap VACUUM 传的是 `TidStore *`。
+
 ### 4.4 `IndexBulkDeleteResult`
+
 `genam.h:83-92` 定义 `IndexBulkDeleteResult`。
 它是 AM 返回给 VACUUM 的 stats。
 核心字段：
+
 ```text
 num_pages
 estimated_count
@@ -259,6 +278,7 @@ pages_newly_deleted
 pages_deleted
 pages_free
 ```
+
 这个结构通常由第一次 `ambulkdelete()` 分配。
 后续同一个 VACUUM 中同一个 index 的 `ambulkdelete()` 会复用它。
 `amvacuumcleanup()` 也会收到它。
@@ -268,11 +288,15 @@ pages_free
 这给 AM 在 bulkdelete 与 cleanup 之间传递私有状态留下扩展空间。
 本节不要把它当只用于 `VACUUM VERBOSE` 的输出对象。
 它也是 AM 跨阶段状态传递的一部分。
+
 ### 4.5 `IndexBulkDeleteCallback`
+
 `genam.h:95` 定义：
+
 ```text
 typedef bool (*IndexBulkDeleteCallback) (ItemPointer itemptr, void *state);
 ```
+
 callback 输入是 heap TID。
 输出是 bool。
 true 表示这个 index entry 引用的 heap TID 属于本轮要删除的 dead TID set。
@@ -281,10 +305,13 @@ false 表示 AM 不能因本轮 VACUUM 删除它。
 visibility verdict 已经在 heap phase I 中形成。
 callback 是 membership test。
 这条边界可以防止 index AM 重新发明 MVCC。
+
 ### 4.6 B-Tree `BTVacState`
+
 `nbtree.h:331-347` 定义 `BTVacState`。
 它是一次 B-Tree vacuum scan 的本地状态。
 核心字段：
+
 ```text
 info
 stats
@@ -294,6 +321,7 @@ cycleid
 pagedelcontext
 pendingpages / npendingpages / maxbufsize
 ```
+
 `callback` 和 `callback_state` 直接来自 `btbulkdelete()`。
 cleanup-only scan 中 callback 为 NULL。
 `cycleid` 用于处理并发 page split。
@@ -303,8 +331,11 @@ cleanup-only scan 中 callback 为 NULL。
 它们要等 `safexid` 对所有可能观察者都不再需要。
 `BTVacState` 是 B-Tree 私有状态。
 heap VACUUM 不应该依赖它的字段。
+
 ## 5. 主流程源码 walkthrough
+
 ### 5.1 入口：`heap_vacuum_rel()`
+
 `heap_vacuum_rel()` 是 heap AM 的 VACUUM 主入口。
 调用者已经建立事务并打开、锁住 relation。
 本节关注它对 index vacuum 的准备。
@@ -315,11 +346,13 @@ index 用 `RowExclusiveLock` 打开。
 它是 relation-level 维护操作所需的锁。
 `vacuumlazy.c:724-748` 初始化 index cleanup 相关开关。
 默认：
+
 ```text
 do_index_vacuuming = true
 do_index_cleanup = true
 consider_bypass_optimization = true
 ```
+
 `INDEX_CLEANUP OFF` 会同时关闭 index vacuuming 和 cleanup。
 `INDEX_CLEANUP ON` 会禁止 bypass optimization。
 但 failsafe 仍然可以覆盖它。
@@ -330,18 +363,22 @@ consider_bypass_optimization = true
 `dead_items_alloc()` 根据是否能 parallel vacuum 决定 local `TidStore` 或 shared `TidStore`。
 `vacuumlazy.c:881` 调 `lazy_scan_heap()`。
 从这里开始进入三阶段状态机。
+
 ### 5.2 phase I：heap scan 收集 dead TID
+
 `lazy_scan_heap()` 的注释在 `vacuumlazy.c:1243-1277`。
 这段注释给出本节最重要的不变量：
 只要 relation 有 index，heap VACUUM 不能提前把 `LP_DEAD` 改成 `LP_UNUSED`。
 因为所有 index AM 都依赖这个不变量：
 没有 extant index tuple 能指向 heap 上已经 `LP_UNUSED` 的 line pointer。
 `lazy_scan_heap()` 先设置 progress：
+
 ```text
 phase = scanning heap
 heap_blks_total = rel_pages
 max_dead_tuple_bytes = dead_items_info->max_bytes
 ```
+
 然后按 heap block 读取。
 每个 page 尝试拿 cleanup lock。
 如果拿到，走 `lazy_scan_prune()`。
@@ -354,6 +391,7 @@ aggressive VACUUM 如果发现必须 freeze，可能必须等待 cleanup lock。
 这就是有无 index 的关键分叉。
 `heap_page_prune_and_freeze()` 返回 `PruneFreezeResult`。
 本节关心：
+
 ```text
 lpdead_items
 deadoffsets[]
@@ -363,6 +401,7 @@ recently_dead_tuples
 newly_all_visible
 newly_all_frozen
 ```
+
 `presult.lpdead_items` 是 pruning 后页面上仍为 `LP_DEAD` 的 item 数。
 它包含本次 newly dead 和之前已经存在的 `LP_DEAD`。
 如果它大于 0，`lazy_scan_prune()` 会：
@@ -372,10 +411,12 @@ newly_all_frozen
 最后累计 `lpdead_items`。
 `dead_items_add()` 调 `TidStoreSetBlockOffsets()`。
 它也更新 progress：
+
 ```text
 num_dead_item_ids = dead_items_info->num_items
 dead_tuple_bytes = TidStoreMemoryUsage(dead_items)
 ```
+
 注意名字里的 `dead_tuple_bytes` 是系统视图列名。
 当前源码语义更准确地说是 dead item/TID storage bytes。
 如果拿不到 cleanup lock，`lazy_scan_noprune()` 不做 pruning/freeze。
@@ -385,7 +426,9 @@ dead_tuple_bytes = TidStoreMemoryUsage(dead_items)
 这解释了 VACUUM 日志里可能出现 missed dead tuples。
 它不是 index callback 漏删。
 它是 heap page 没拿到 cleanup lock，无法把某些 heap tuple 推进到 `LP_DEAD`。
+
 ### 5.3 内存边界：何时中途做一轮 index vacuum
+
 `lazy_scan_heap()` 在读取下一页前检查 `TidStoreMemoryUsage()`。
 如果 `dead_items_info->num_items > 0` 且 memory usage 超过 `max_bytes`，就暂停 heap scan。
 它先释放 VM buffer pin。
@@ -396,6 +439,7 @@ dead_tuple_bytes = TidStoreMemoryUsage(dead_items)
 因为这时 VACUUM 很可能不止一轮 index scan。
 中途 `lazy_vacuum()` 完成后，VACUUM 会 vacuum FSM range，然后回到 heap scan。
 所以一个 relation 的 VACUUM 可能是：
+
 ```text
 heap scan prefix
   -> all indexes bulkdelete
@@ -410,16 +454,21 @@ heap scan suffix
   -> heap cleanup
 final index cleanup
 ```
+
 成本上这很重要。
 每次 `TidStore` 满，都要全索引扫描一遍。
 dead TID storage 过小会把 index vacuum 成本放大成多轮。
+
 ### 5.4 phase II：`lazy_vacuum()` 调所有 index AM
+
 `lazy_vacuum()` 是 phase II 和 phase III 的协调函数。
 入口断言：
+
 ```text
 nindexes > 0
 lpdead_item_pages > 0
 ```
+
 如果 `do_index_vacuuming` 已经是 false，它只 reset `dead_items` 后返回。
 这对应 `INDEX_CLEANUP OFF` 或 failsafe/bypass 后的路径。
 正常路径先考虑 bypass optimization。
@@ -434,20 +483,25 @@ lpdead_item_pages > 0
 如果不 bypass，`lazy_vacuum()` 调 `lazy_vacuum_all_indexes()`。
 `lazy_vacuum_all_indexes()` 先做 failsafe precheck。
 然后设置 progress：
+
 ```text
 phase = vacuuming indexes
 indexes_total = nindexes
 indexes_processed = 0..nindexes
 ```
+
 串行路径逐个 index 调 `lazy_vacuum_one_index()`。
 parallel 路径调用 `parallel_vacuum_bulkdel_all_indexes()`。
 每处理一个 index 后，会再次检查 failsafe。
 如果 failsafe 触发，当前 round 被标为未完整完成。
 函数仍会增加 `num_index_scans`。
 这使日志能显示 failsafe 是第几轮之后触发的。
+
 ### 5.5 `lazy_vacuum_one_index()` 到 `vac_tid_reaped()`
+
 `lazy_vacuum_one_index()` 构造 `IndexVacuumInfo`。
 关键设置：
+
 ```text
 ivinfo.index = indrel
 ivinfo.heaprel = vacrel->rel
@@ -456,37 +510,51 @@ ivinfo.estimated_count = true
 ivinfo.num_heap_tuples = old_live_tuples
 ivinfo.strategy = vacrel->bstrategy
 ```
+
 然后设置 error context：
+
 ```text
 phase = VACUUM_ERRCB_PHASE_VACUUM_INDEX
 indname = current index name
 ```
+
 接着调用：
+
 ```text
 vac_bulkdel_one_index(&ivinfo, istat, vacrel->dead_items, vacrel->dead_items_info)
 ```
+
 `vac_bulkdel_one_index()` 是命令层包装。
 它调用：
+
 ```text
 index_bulk_delete(ivinfo, istat, vac_tid_reaped, dead_items)
 ```
+
 `index_bulk_delete()` 在 `indexam.c` 里只做通用检查，然后 dispatch 到：
+
 ```text
 indexRelation->rd_indam->ambulkdelete(...)
 ```
+
 真正的 callback 是 `vac_tid_reaped()`。
 它只有一行语义：
+
 ```text
 return TidStoreIsMember(dead_items, itemptr);
 ```
+
 这就是 dead TID callback 的最小核心。
 AM 传入任意 index entry 的 heap TID。
 callback 回答它是不是本轮 heap VACUUM 已收集的 dead TID。
 callback 不知道 index AM。
 index AM 不知道 `TidStore` 内部结构。
 双方只共享 `ItemPointer` 和 bool。
+
 ### 5.6 B-Tree：`btbulkdelete()` 建立 vacuum cycle
+
 B-Tree handler 在 `nbtree.c:120-153` 设置：
+
 ```text
 ambulkdelete = btbulkdelete
 amvacuumcleanup = btvacuumcleanup
@@ -494,20 +562,25 @@ amparallelvacuumoptions =
   VACUUM_OPTION_PARALLEL_BULKDEL |
   VACUUM_OPTION_PARALLEL_COND_CLEANUP
 ```
+
 这说明 B-Tree 支持 parallel bulkdelete。
 cleanup 只有在没有 bulkdelete 时才适合并行条件 cleanup。
 `btbulkdelete()` 如果 stats 为 NULL，就分配 `IndexBulkDeleteResult`。
 然后用 `PG_ENSURE_ERROR_CLEANUP()` 包住 vacuum cycle。
 它调用 `_bt_start_vacuum()` 获得 `cycleid`。
 再调用：
+
 ```text
 btvacuumscan(info, stats, callback, callback_state, cycleid)
 ```
+
 最后 `_bt_end_vacuum()`。
 `PG_ENSURE_ERROR_CLEANUP()` 的意义是：
 如果中间 ERROR，仍要清理 B-Tree vacuum cycle shared/local 状态。
 这不是 memory context 能自动替代的。
+
 ### 5.7 B-Tree：`btvacuumscan()` 全索引扫描
+
 `btvacuumscan()` 做三件事。
 第一，重置当前 index-wide stats。
 它不重置 `tuples_removed` 和 `pages_newly_deleted`。
@@ -526,7 +599,9 @@ btvacuumscan(info, stats, callback, callback_state, cycleid)
 删除临时 context。
 再调用 `_bt_pendingfsm_finalize()`。
 如果有 reusable pages，调用 `IndexFreeSpaceMapVacuum()`。
+
 ### 5.8 B-Tree：`btvacuumpage()` 应用 callback
+
 `btvacuumpage()` 是 B-Tree index vacuum 的核心页级函数。
 它先拿 read lock，检查 page 类型。
 如果 page 可回收，记录 FSM。
@@ -547,9 +622,11 @@ cleanup lock 会等待其他 backend 的 pin 释放。
 `btpo_cycleid` 和 backtracking 机制用来发现并补扫这种情况。
 对每个 leaf item：
 如果不是 posting tuple，直接调用：
+
 ```text
 callback(&itup->t_tid, callback_state)
 ```
+
 返回 true，加入 `deletable[]`。
 返回 false，计入 live TID。
 如果是 posting list tuple，调用 `btreevacuumposting()`。
@@ -572,7 +649,9 @@ cleanup-only scan 中 callback 为 NULL。
 这时 B-Tree 不逐个展开 posting list 计数。
 它直接按 index tuple 数估算。
 因此 stats 会被标记为 estimated。
+
 ### 5.9 B-Tree：`_bt_delitems_vacuum()` 的页修改
+
 `_bt_delitems_vacuum()` 位于 `nbtpage.c:1163-1292`。
 调用者必须已经持有 full cleanup lock。
 `deletable` 和 `updatable` offset 数组必须递增。
@@ -593,7 +672,9 @@ VACUUM 依赖初始 heap table scan 的 WAL 间接处理这个问题。
 第二，`btpo_cycleid` 由 VACUUM 控制。
 普通 single-page cleanup 不能清它。
 这保证并发 split/backtracking 的语义只归 VACUUM 管。
+
 ### 5.10 B-Tree empty page deletion 与 FSM
+
 如果 leaf page 删除 index tuples 后变空，B-Tree 可能调用 `_bt_pagedel()`。
 B-Tree page deletion 是两阶段。
 先把 leaf 标 half-dead 并从 parent downlink 移除。
@@ -612,7 +693,9 @@ deleted page 不能马上复用。
 这说明 index vacuum 删除 index tuple 与 index page recycle 是两个层次。
 前者由 dead TID callback 驱动。
 后者由 B-Tree physical structure 和 snapshot horizon 驱动。
+
 ### 5.11 phase III：回到 heap 释放 `LP_DEAD`
+
 当 `lazy_vacuum_all_indexes()` 成功处理所有 indexes 后，`lazy_vacuum()` 调 `lazy_vacuum_heap_rel()`。
 这是 heap 的第二阶段。
 它不是全 heap scan。
@@ -641,26 +724,32 @@ reason 是 `PRUNE_VACUUM_CLEANUP`。
 它能发生的前提是：
 本轮所有 indexes 的 bulkdelete 成功完成。
 如果 failsafe 中途触发，phase III 不会发生。
+
 ### 5.12 final cleanup：`amvacuumcleanup()`
+
 heap scan 结束后，如果 `dead_items_info->num_items > 0`，`lazy_scan_heap()` 会再调用一次 `lazy_vacuum()`。
 之后 vacuum FSM。
 再把 `heap_blks_vacuumed` progress 更新到 rel_pages。
 最后，如果有 indexes 且 `do_index_cleanup` 为 true，调用 `lazy_cleanup_all_indexes()`。
 `lazy_cleanup_all_indexes()` 设置 progress：
+
 ```text
 phase = cleaning up indexes
 indexes_total = nindexes
 indexes_processed = 0..nindexes
 ```
+
 串行路径逐个调用 `lazy_cleanup_one_index()`。
 它构造 `IndexVacuumInfo`。
 这次 `estimated_count` 取决于 heap 是否完整扫描。
 然后调用：
+
 ```text
 vac_cleanup_one_index()
   -> index_vacuum_cleanup()
      -> indexRelation->rd_indam->amvacuumcleanup()
 ```
+
 B-Tree 的 `btvacuumcleanup()` 有两个分支。
 如果 `info->analyze_only`，直接 no-op。
 如果 stats 为 NULL，说明没有发生 `btbulkdelete()`。
@@ -674,8 +763,11 @@ B-Tree 通常不再扫描 index。
 然后在可能准确的情况下，把 `num_index_tuples` capped 到 heap tuple count。
 这解释了为什么 `amvacuumcleanup()` 不是简单的“最后打印 stats”。
 它也是 AM 自己决定是否需要额外 cleanup scan 的入口。
+
 ## 6. 生命周期 / ownership / cleanup
+
 ### 6.1 谁创建
+
 `LVRelState` 由 `heap_vacuum_rel()` 在当前 memory context 中 `palloc0`。
 index relation 数组由 `vac_open_indexes()` 打开并返回。
 `indstats` 数组由 `heap_vacuum_rel()` 分配。
@@ -687,7 +779,9 @@ parallel vacuum 创建 shared `TidStore` 并放进 `ParallelVacuumState`。
 B-Tree 在 `btbulkdelete()` 中分配。
 `BTVacState` 是 `btvacuumscan()` 的栈上对象。
 `pagedelcontext` 是 B-Tree 每次 vacuum scan 的临时 MemoryContext。
+
 ### 6.2 谁持有
+
 heap VACUUM leader 持有 `LVRelState`。
 `dead_items` 的逻辑 owner 是 heap VACUUM。
 index AM 只在 `ambulkdelete()` 调用期间通过 callback state 借用它。
@@ -699,7 +793,9 @@ final cleanup 后，heap VACUUM 用它更新 pg_class index stats。
 最后 `heap_vacuum_rel()` 释放这些 stats。
 parallel vacuum 中，每个 index 的 stats 先在 DSM 的 `PVIndStats` 中保存。
 `parallel_vacuum_end()` 把 DSM stats 拷回 leader 本地 `indstats`。
+
 ### 6.3 谁释放
+
 串行 local `TidStore` 没有在 `dead_items_cleanup()` 显式 destroy。
 源码注释写的是“不 bother with pfree here”。
 它依赖 VACUUM 所在 memory context 的生命周期。
@@ -708,7 +804,9 @@ parallel case 必须显式清理。
 `parallel_vacuum_end()` 会 `TidStoreDestroy(pvs->dead_items)`、销毁 ParallelContext，并 `ExitParallelMode()`。
 B-Tree 的 `pagedelcontext` 在 `btvacuumscan()` 末尾 `MemoryContextDelete()`。
 posting list update 临时内存在 `_bt_delitems_vacuum()` 和 `btvacuumpage()` 中释放。
+
 ### 6.4 ERROR / abort 时谁兜底
+
 普通 palloc 内存由 MemoryContext reset 兜底。
 buffer pin、buffer lock、relation lock 等外部资源由 ResourceOwner 和错误展开路径释放。
 B-Tree vacuum cycle 不能只靠 MemoryContext。
@@ -723,7 +821,9 @@ index cleanup name。
 truncate target。
 这对定位很有用。
 资源清理仍由 MemoryContext、ResourceOwner、AM 自己的 cleanup callback 和 parallel context 负责。
+
 ### 6.5 长期状态如何失效
+
 `dead_items` 只在一轮 index vacuum 和 heap cleanup 之间有效。
 `dead_items_reset()` 后，旧 set 语义消失。
 `IndexBulkDeleteResult` 只在一个 VACUUM 命令内有效。
@@ -733,8 +833,11 @@ B-Tree deleted page 的 `safexid` 是持久 page 状态的一部分。
 它要跨 VACUUM 存活，直到未来 horizon 允许 page 进入 FSM。
 `btm_last_cleanup_num_delpages` 位于 B-Tree metapage。
 它影响下次 `btvacuumcleanup()` 是否需要 cleanup-only scan。
+
 ## 7. 正确性机制层次
+
 ### 7.1 MVCC visibility 层
+
 heap VACUUM 在 phase I 使用 `VacuumCutoffs` 和 `GlobalVisState`。
 `lazy_scan_prune()` 通过 `heap_page_prune_and_freeze()` 判断 tuple 是否可以变成 `LP_DEAD`。
 `lazy_scan_noprune()` 用 `HeapTupleSatisfiesVacuum()` 统计 live、recently dead、missed dead。
@@ -743,7 +846,9 @@ heap VACUUM 在 phase I 使用 `VacuumCutoffs` 和 `GlobalVisState`。
 这层回答：
 哪些 heap tuple version 可以被认为对所有相关 snapshot 不再需要。
 index AM 不参与这个判断。
+
 ### 7.2 dead TID membership 层
+
 callback 层只回答 membership：
 这个 heap TID 是否在本轮 VACUUM 的 `TidStore` 中？
 这层不重新看 clog。
@@ -751,13 +856,17 @@ callback 层只回答 membership：
 不判断 commit/abort。
 它的正确性依赖 phase I 收集 set 时已经做完 visibility 裁决。
 这让 index AM 可以保持物理结构 owner 的边界。
+
 ### 7.3 heap TID recycling 层
+
 heap `LP_DEAD -> LP_UNUSED` 只能在所有 index AM 对本轮 dead set 完成删除后发生。
 `lazy_vacuum_all_indexes()` 成功后才调用 `lazy_vacuum_heap_rel()`。
 源码断言也表达了这个顺序。
 如果 failsafe 使所有 index 没有完整处理，heap cleanup 不会发生。
 这层保证旧 index entry 不会指向可复用 line pointer。
+
 ### 7.4 lock / pin 层
+
 heap phase I pruning 需要 buffer cleanup lock。
 拿不到时，非 aggressive VACUUM 可以降级走 `lazy_scan_noprune()`。
 heap phase III 只需要 exclusive lock 来把已知 `LP_DEAD` 设为 `LP_UNUSED`。
@@ -765,7 +874,9 @@ B-Tree bulkdelete 对每个 leaf page 升级为 cleanup lock。
 这让它等待仍持有 page pin 的 index scans。
 这个 interlock 不是为了 B-Tree search 不迷路。
 而是为了避免 index scan 从 leaf page 读到 TID 后，heap slot 被 VACUUM 复用。
+
 ### 7.5 WAL / critical section 层
+
 heap pruning/freeze 和 heap vacuum cleanup 都通过 `log_heap_prune_and_freeze()` 记录 WAL。
 VM set 要和 heap page 修改在同一 critical section 中协调。
 B-Tree `_bt_delitems_vacuum()` 在 critical section 中修改 page、写 `XLOG_BTREE_VACUUM`、设置 page LSN。
@@ -773,7 +884,9 @@ B-Tree page deletion 写 half-dead/unlink WAL。
 每一步都遵守 WAL-before-data。
 错误不能在 critical section 中发生。
 所以可分配内存、可做 IO 的检查要在进入 critical section 前完成。
+
 ### 7.6 并发 split / page deletion 层
+
 B-Tree VACUUM 按物理 block order 扫描。
 并发 split 可能把尚未扫过 page 的 tuple 移到已经扫过的低 block page。
 vacuum cycle id 和 backtracking 处理这个问题。
@@ -781,14 +894,19 @@ empty page deletion 又有 half-dead、deleted、safexid、pending FSM 这些状
 这些是 B-Tree AM 内部正确性。
 heap VACUUM 不需要知道细节。
 但它要允许 AM 在 `ambulkdelete()` 内部做这些工作。
+
 ## 8. 错误路径 / 异常路径 / fallback
+
 ### 8.1 `INDEX_CLEANUP OFF`
+
 用户或 reloption 可以关闭 index cleanup。
 `heap_vacuum_rel()` 会设置：
+
 ```text
 do_index_vacuuming = false
 do_index_cleanup = false
 ```
+
 之后如果 phase I 收集到 dead items，`lazy_vacuum()` 会 reset `dead_items` 并返回。
 不会调用 index AM。
 也不会 phase III 回 heap 释放 `LP_DEAD`。
@@ -797,7 +915,9 @@ heap 和 index 中的 dead state 会保留到未来 VACUUM。
 这可以让紧急 VACUUM 更快完成。
 代价是 index bloat 和 heap dead line pointer 累积。
 文档也提醒，如果不定期做 index cleanup，性能会下降。
+
 ### 8.2 bypass optimization
+
 默认 `INDEX_CLEANUP AUTO` 允许 bypass。
 当 dead TID 很少，并且预计本次 VACUUM 只有一轮 index scan 时，`lazy_vacuum()` 可以跳过 index vacuum 和 heap vacuum。
 条件包括：
@@ -808,7 +928,9 @@ heap 和 index 中的 dead state 会保留到未来 VACUUM。
 代价是少量 `LP_DEAD` 留在 heap 和 index 中。
 这不是 correctness 问题。
 它是延后清理。
+
 ### 8.3 wraparound failsafe
+
 failsafe 是最后防线。
 `vacuum_xid_failsafe_check()` 根据 `relfrozenxid/relminmxid` 与 failsafe age 判断。
 触发后，`lazy_check_wraparound_failsafe()` 会：
@@ -826,7 +948,9 @@ index vacuum 是非必要维护。
 如果 failsafe 在 index round 中途触发，`lazy_vacuum_all_indexes()` 返回 false。
 `lazy_vacuum()` 不会调用 `lazy_vacuum_heap_rel()`。
 这避免释放 heap `LP_DEAD`，因为不是所有 index 都完成了删除。
+
 ### 8.4 cleanup lock contention
+
 heap phase I 拿不到 cleanup lock 时，普通 VACUUM 可以走 `lazy_scan_noprune()`。
 它仍能收集已有 `LP_DEAD`。
 但不能产生新的 `LP_DEAD`。
@@ -836,7 +960,9 @@ aggressive VACUUM 如果需要 freeze，则不能简单跳过。
 B-Tree bulkdelete 必须拿 leaf cleanup lock。
 如果有 index scan 持有 leaf page pin，VACUUM 会等。
 这可能在 `pg_stat_activity.wait_event` 中表现为 buffer pin 等待。
+
 ### 8.5 `amvacuumcleanup()` cleanup-only skip
+
 如果没有 dead TID，`ambulkdelete()` 不会被调用。
 但 final cleanup 仍会调用 `amvacuumcleanup()`。
 B-Tree 这时先调用 `_bt_vacuum_needs_cleanup()`。
@@ -844,7 +970,9 @@ B-Tree 这时先调用 `_bt_vacuum_needs_cleanup()`。
 如果需要，它会做 cleanup-only `btvacuumscan()`。
 这时 callback 为 NULL。
 它不删除 leaf TID，只统计和回收 old deleted pages。
+
 ### 8.6 pending FSM optimization 失败
+
 B-Tree newly deleted page 可能在当前 vacuum scan 末尾就能进入 FSM。
 `_bt_pendingfsm_finalize()` 尝试根据 `safexid` 和 global visibility 判断。
 如果 horizon 还不允许，停止。
@@ -852,28 +980,37 @@ B-Tree newly deleted page 可能在当前 vacuum scan 末尾就能进入 FSM。
 这不破坏 correctness。
 它只放弃“本轮提前放入 FSM”的优化。
 未来 VACUUM 扫到 deleted page 时仍可回收。
+
 ### 8.7 中断和 crash
+
 B-Tree page deletion 可能留下 half-dead page。
 下一次 VACUUM 会继续删除。
 WAL redo 能重放每一步。
 heap phase III 如果 crash，在 redo 后保持一致。
 如果 index 已删除但 heap `LP_DEAD` 还没变 `LP_UNUSED`，只是空间回收延后。
 反过来会让 index entry 指向可复用 heap slot。
+
 ## 9. 成本、资源与跨模块传播
+
 ### 9.1 成本主模型
+
 index vacuum 成本近似为：
+
 ```text
 heap phase I scanned pages
 + num_index_scans * sum(index pages scanned by AM)
 + phase III touched heap pages from TidStore
 + final cleanup AM cost
 ```
+
 `num_index_scans` 是放大器。
 它由 dead TID storage 是否足够决定。
 `maintenance_work_mem` 或 `autovacuum_work_mem` 太小，会让同一个 heap relation 做多轮全索引扫描。
 多一个 index，就多一次每轮 AM scan。
 多一个 round，就把所有 index 的 bulkdelete 成本再乘一遍。
+
 ### 9.2 callback CPU 成本
+
 B-Tree 对每个 leaf TID 调 callback。
 普通 index tuple 是一次 callback。
 posting list tuple 是 posting list 中每个 TID 一次 callback。
@@ -881,7 +1018,9 @@ callback 本身是 `TidStoreIsMember()`。
 它通常是 radix tree lookup 加 offset bitmap check。
 这比访问 heap tuple header 便宜得多。
 但对很大的 index，次数仍然等于 index AM 扫到的 heap TID 数。
+
 ### 9.3 IO 与 WAL 成本
+
 heap phase I 读 heap pages，可能写 heap page 和 VM。
 index phase 读 index pages，删除 leaf items 会写 index page WAL。
 B-Tree posting list update 也写 WAL。
@@ -890,13 +1029,17 @@ heap phase III 写 heap page，把 `LP_DEAD` 改 `LP_UNUSED`，可能同时设�
 `VACUUM VERBOSE` 的 WAL usage 可以看到总量。
 但它不能按 phase 拆分每条 WAL 来源。
 需要 `pg_waldump`、断点或 perf 才能更细。
+
 ### 9.4 buffer pin / cleanup lock contention
+
 heap cleanup lock contention 会减少 pruning 产出，增加 missed dead。
 B-Tree cleanup lock 等待会拖慢 index vacuum。
 长时间 index-only scan 或 cursor 可能持有 leaf page pin。
 B-Tree README 说明 index-only scan 不能提前丢 pin，因为它不能可靠容忍 referenced TID 被复用。
 这会把查询模式传播到 VACUUM latency。
+
 ### 9.5 parallel vacuum 的资源传播
+
 parallel vacuum 并行的是 index bulkdelete/cleanup。
 heap scan 和 dead TID 收集仍在 leader。
 shared `TidStore` 位于 DSM/DSA。
@@ -907,7 +1050,9 @@ leader 在 `parallel_vacuum_end()` 拷回本地。
 `dead_items_alloc()` 注释也说明当前只有至少两个 indexes 才考虑 parallel vacuum。
 temporary table 不能 parallel vacuum。
 parallel worker 对 VACUUM delay 的处理通过 shared cost balance 协调。
+
 ### 9.6 后台进程和相邻模块
+
 autovacuum worker 可以触发同一条链路。
 它使用 `autovacuum_work_mem`，如果该值为 -1 则回退 `maintenance_work_mem`。
 checkpointer 和 walwriter 不推进 dead TID 状态，但它们承接 VACUUM 产生的 dirty buffers 和 WAL flush 压力。
@@ -916,10 +1061,14 @@ standby query 通过 horizon 和 conflict 影响哪些 XID 仍被认为需要保
 logical replication slot、long transaction 和 old snapshot 会影响 global visibility horizon。
 这些因素不是 index callback 的字段。
 但它们会改变 phase I 收集多少 dead TID，以及 B-Tree deleted pages 何时可进入 FSM。
+
 ## 10. 观测与诊断入口
+
 ### 10.1 `pg_stat_progress_vacuum`
+
 当前基线的 progress view 在 `system_views.sql:1320-1340`。
 关键查询：
+
 ```sql
 SELECT pid,
        phase,
@@ -935,6 +1084,7 @@ SELECT pid,
        mode
 FROM pg_stat_progress_vacuum;
 ```
+
 `phase = scanning heap` 时，`num_dead_item_ids` 会随着 `dead_items_add()` 增长。
 如果 `dead_tuple_bytes` 接近或超过 `max_dead_tuple_bytes`，源码会触发一轮 `lazy_vacuum()`。
 `phase = vacuuming indexes` 时，`indexes_processed` 推进。
@@ -944,7 +1094,9 @@ FROM pg_stat_progress_vacuum;
 注意列名 `max_dead_tuple_bytes/dead_tuple_bytes`。
 在当前源码里，它们对应 dead item/TID storage。
 不要按“heap tuple bytes”理解。
+
 ### 10.2 `VACUUM VERBOSE` 和 autovacuum log
+
 `heap_vacuum_rel()` 的 verbose/log 输出会包括：
 index scans 数。
 pages scanned。
@@ -965,14 +1117,18 @@ system usage。
 这区分 bypass optimization 和真实 bulkdelete。
 第三，`tuples missed` 是否明显。
 这指向 heap cleanup lock contention。
+
 ### 10.3 `pg_stat_all_tables` 与 `pg_stat_all_indexes`
+
 `pg_stat_all_tables.n_dead_tup` 是统计估算。
 它不是 `TidStore` 当前大小。
 它也不是 heap page 上 `LP_DEAD` 的精确数量。
 `pg_stat_all_indexes` 不能告诉你某个 index 里还有多少 dead index entry。
 index bloat 需要结合 size、workload、VACUUM 日志、pageinspect、amcheck 或离线工具判断。
 不要把 stats view 当成 callback 内部状态。
+
 ### 10.4 pageinspect / amcheck / pg_visibility
+
 `pageinspect` 可以看 B-Tree page items、posting list 和 page metadata。
 它适合实验中观察 duplicate key、posting list 和 page 状态。
 heap `LP_DEAD/LP_UNUSED` 也可以通过 pageinspect 函数观察。
@@ -980,12 +1136,15 @@ heap `LP_DEAD/LP_UNUSED` 也可以通过 pageinspect 函数观察。
 它不能告诉你 callback 判定过程。
 `amcheck` 可以验证 B-Tree 结构一致性。
 它不是 dead TID 计数器。
+
 ### 10.5 wait event 和 profiling
+
 VACUUM cost delay 可见为 `VacuumDelay`。
 cleanup lock 等待可能表现为 buffer pin 相关等待。
 IO 压力可通过 `pg_stat_io`、`pg_stat_wal`、系统 IO 工具观察。
 callback CPU 成本通常需要 perf、flamegraph 或 gdb。
 可打断点：
+
 ```text
 vac_tid_reaped
 TidStoreIsMember
@@ -995,11 +1154,14 @@ btreevacuumposting
 _bt_delitems_vacuum
 lazy_vacuum_heap_page
 ```
+
 断点观察要注意：
 `vac_tid_reaped()` 调用次数可能非常大。
 对大 index 直接断每次调用会严重改变时序。
 更好的方式是加计数器或条件断点。
+
 ## 11. 常见误区
+
 误区一：
 `LP_DEAD` 就等于 heap space 已经回收。
 不对。
@@ -1041,11 +1203,15 @@ B-Tree page 进入 FSM 是 index tuple 删除的直接结果。
 不对。
 empty leaf page 删除后还要等 `safexid` 对所有相关 snapshot 安全。
 pending FSM 只是优化。
+
 ## 12. 课堂实验
+
 ### 实验 1：观察 dead TID storage 触发多轮 index vacuum
+
 目标：
 把 runtime 现象和 `TidStoreMemoryUsage() > max_bytes -> lazy_vacuum()` 对上。
 步骤：
+
 ```sql
 CREATE TABLE vac_cb_t (id bigserial PRIMARY KEY, k int, v text);
 CREATE INDEX vac_cb_t_k_idx ON vac_cb_t(k);
@@ -1062,7 +1228,9 @@ WHERE id % 2 = 0;
 SET maintenance_work_mem = '1MB';
 VACUUM (VERBOSE, INDEX_CLEANUP ON) vac_cb_t;
 ```
+
 另一个 session 观察：
+
 ```sql
 SELECT phase,
        heap_blks_scanned,
@@ -1076,6 +1244,7 @@ SELECT phase,
 FROM pg_stat_progress_vacuum
 WHERE relid = 'vac_cb_t'::regclass;
 ```
+
 预期观察：
 `index_vacuum_count` 可能大于 1。
 `VACUUM VERBOSE` 的 `index scans` 可能大于 1。
@@ -1083,10 +1252,13 @@ dead item storage memory usage 会显示 reset 次数。
 源码回扣：
 `lazy_scan_heap()` 超过 `max_bytes` 后调用 `lazy_vacuum()`。
 每轮 `lazy_vacuum_all_indexes()` 都处理所有 indexes。
+
 ### 实验 2：比较 `INDEX_CLEANUP AUTO` 与 `ON`
+
 目标：
 观察 bypass optimization。
 步骤：
+
 ```sql
 CREATE TABLE vac_bypass_t (id bigserial PRIMARY KEY, k int, pad text);
 CREATE INDEX vac_bypass_t_k_idx ON vac_bypass_t(k);
@@ -1103,6 +1275,7 @@ DELETE FROM vac_bypass_t WHERE id BETWEEN 11 AND 20;
 
 VACUUM (VERBOSE, INDEX_CLEANUP ON) vac_bypass_t;
 ```
+
 预期观察：
 AUTO 路径可能显示 index scan bypassed。
 ON 路径会强制 index vacuum，只要有 dead TID 且 failsafe 未触发。
@@ -1111,13 +1284,16 @@ ON 路径会强制 index vacuum，只要有 dead TID 且 failsafe 未触发。
 源码回扣：
 `lazy_vacuum()` 用 `BYPASS_THRESHOLD_PAGES` 和 32MB dead item storage 条件判断。
 `INDEX_CLEANUP ON` 会让 `consider_bypass_optimization = false`。
+
 ### 实验 3：gdb 观察 callback ownership
+
 目标：
 证明 index AM 调的是 membership callback，而不是 heap visibility 判断。
 步骤：
 在测试环境启动 PostgreSQL。
 对执行 `VACUUM` 的 backend 附加 gdb。
 设置断点：
+
 ```text
 break vac_tid_reaped
 break TidStoreIsMember
@@ -1125,10 +1301,13 @@ break btvacuumpage
 break _bt_delitems_vacuum
 break lazy_vacuum_heap_page
 ```
+
 执行能产生 dead index entry 的 UPDATE/DELETE 后：
+
 ```sql
 VACUUM (VERBOSE, INDEX_CLEANUP ON) target_table;
 ```
+
 观察顺序：
 先进入 `btvacuumpage()`。
 再多次进入 `vac_tid_reaped()` 和 `TidStoreIsMember()`。
@@ -1138,7 +1317,9 @@ VACUUM (VERBOSE, INDEX_CLEANUP ON) target_table;
 这条断点顺序就是本节核心 ownership：
 index 删除引用在前。
 heap 释放 line pointer 在后。
+
 ## 13. 讨论题
+
 1. 为什么 callback 的输入是 heap TID，而不是 index tuple pointer？
 2. 如果 `TidStore` 内存不足导致三轮 index vacuum，`IndexBulkDeleteResult` 的哪些字段应该跨轮累计，哪些字段应该每轮重算？
 3. 为什么 B-Tree VACUUM 要在没有 deletable tuple 的 leaf page 上也拿 cleanup lock？
@@ -1147,10 +1328,13 @@ heap 释放 line pointer 在后。
 6. `pg_stat_progress_vacuum.dead_tuple_bytes` 能说明什么，不能说明什么？
 7. 如果 failsafe 在处理第三个 index 前触发，为什么 heap phase III 不能释放本轮 `LP_DEAD`？
 8. B-Tree newly deleted page 为什么还要等 `GlobalVisCheckRemovableFullXid()` 才能进入 FSM？
+
 ## 14. 本节小结
+
 本节唯一主问题是：
 heap 已经知道 dead TID，如何让各 index AM 删除对应 index entry，并在所有 index 删除完成前阻止 heap TID 复用。
 核心链路是：
+
 ```text
 lazy_scan_heap()
   -> lazy_scan_prune()/lazy_scan_noprune()
@@ -1165,6 +1349,7 @@ lazy_scan_heap()
   -> lazy_vacuum_heap_page()
   -> lazy_cleanup_all_indexes()
 ```
+
 核心状态是：
 `LVRelState.dead_items` 保存本轮 dead TID set。
 `VacDeadItemsInfo` 保存 set 的内存上限和当前 item 数。

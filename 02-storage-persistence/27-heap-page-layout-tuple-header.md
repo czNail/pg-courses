@@ -1,9 +1,11 @@
 # PostgreSQL Heap page layout、line pointer 与 tuple header
+
 ## 课程定位
-本节主题：heap page layout、line pointer 与 tuple header。
+
 上一组课程把 buffer、WAL、relation fork、checkpoint 和 crash restart 的持久化边界讲到 page 级别。
 从这一节开始，视角进入 heap access method。
 前置知识：已理解 buffer pin/content lock、WAL-before-data、page LSN、relation fork block addressing 和 MVCC snapshot 的基本含义。
+
 本节唯一主问题：
 heap page 如何同时支持定位、MVCC 可见性、空间复用和后续 pruning？
 本节围绕的核心矛盾：
@@ -23,40 +25,14 @@ PostgreSQL 用 slotted page、line pointer、tuple header、infomask 和 `t_ctid
 - `t_hoff` 的边界为什么决定 user data 从哪里开始，而不是决定 tuple 是否可见。
 - heap scan、index fetch、insert、update、delete、pruning 分别读写哪一层状态。
 - 哪些 page 状态可以通过 `pageinspect` 看见，哪些只能通过源码断点推断。
-## 源码基线
-源码仓库：
-```text
-/home/nail/postgres-lab
-```
-基线：
-```text
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
-```
-本节重点阅读：
-```text
-src/include/storage/bufpage.h
-src/backend/storage/page/bufpage.c
-src/include/access/htup_details.h
-src/include/access/htup.h
-src/backend/access/heap/heapam.c
-src/backend/access/heap/heapam_visibility.c
-src/backend/access/heap/pruneheap.c
-```
-为讲清 line pointer 和插入落点，本节辅助核对：
-```text
-src/include/storage/itemid.h
-src/backend/access/heap/hio.c
-contrib/pageinspect/pageinspect--1.5.sql
-contrib/pageinspect/heapfuncs.c
-```
-行号来自：
-```text
-nl -ba <source-file>
-```
-## 1. 先给结论
+
+源码基线：本课使用当前实际源码路径 `/home/highgo/postgres`，branch `master`，commit `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`；核心源码分工见第 3 节。
+
+## 1. 本节在总主线中的位置
+
 heap page 是一个 slotted page。
 `bufpage.h:24-78` 的注释给出基本布局：
+
 ```text
 PageHeaderData
 line pointer array
@@ -64,11 +40,13 @@ free space
 tuple bytes growing backward
 special space
 ```
+
 heap page 通常没有 access-method special space。
 但 page 通用格式仍然保留 `pd_special`。
 这让 heap、btree、hash、GIN 等 AM 共享同一套 page header 和 line pointer 机制。
 `PageHeaderData` 记录 page 级物理状态。
 最关键的是：
+
 ```text
 pd_lower   line pointer array 的末端
 pd_upper   tuple bytes 区域的起点
@@ -77,6 +55,7 @@ pd_prune_xid 可能值得 pruning 的最老 XID hint
 pd_flags   free line、page full、all visible 等 page hint/flag
 pd_lsn     最后修改该 page 的 WAL 位置
 ```
+
 `pd_lower` 向高地址增长。
 `pd_upper` 向低地址增长。
 两者之间才是可连续分配的 free space。
@@ -89,18 +68,22 @@ page 是否还能插入 tuple，不是看 page 里有没有洞。
 它们指向 line pointer 编号，而不是 tuple 在 page 里的字节偏移。
 这就是 page 内可以 compact tuple bytes 而不改 index TID 的原因。
 `ItemIdData` 有三个物理字段：
+
 ```text
 lp_off    15 bits
 lp_flags  2 bits
 lp_len    15 bits
 ```
+
 `lp_flags` 的四个状态定义在 `itemid.h:35-41`：
+
 ```text
 LP_UNUSED
 LP_NORMAL
 LP_REDIRECT
 LP_DEAD
 ```
+
 这四个状态是本节最重要的不变量之一。
 `LP_NORMAL` 有 tuple storage。
 `LP_REDIRECT` 没有 tuple storage，但 `lp_off` 存的是另一个 offset number。
@@ -109,6 +92,7 @@ LP_DEAD
 `HeapTupleHeaderData` 是 tuple bytes 的开头。
 它记录 MVCC 和 tuple data 边界。
 最关键的是：
+
 ```text
 t_choice.t_heap.t_xmin
 t_choice.t_heap.t_xmax
@@ -119,6 +103,7 @@ t_infomask
 t_hoff
 t_bits[]
 ```
+
 `xmin` 是插入事务。
 `xmax` 是删除、更新或锁定相关状态。
 但 `xmax` 的语义必须和 `t_infomask`、`t_infomask2`、MultiXact、lock-only bit、snapshot 一起解释。
@@ -137,10 +122,13 @@ tuple deforming 从 `t_data + t_hoff` 开始读用户列。
 `t_hoff` 不参与事务可见性判断。
 但它决定 pageinspect 和 executor 能否正确解释后续 bytes。
 完整运行模型可以压缩成一句话：
+
 ```text
 TID 定位到 line pointer，line pointer 定位 tuple bytes，tuple header 决定版本语义，pruning 改 line pointer 状态和压缩 bytes 但尽量保留仍可能被 index 引用的 TID 入口。
 ```
-## 2. 本节主问题的四个子约束
+
+## 2. 核心矛盾与一句话运行模型
+
 为了回答唯一主问题，要把 heap page 同时承担的四件事分开看。
 第一件事是定位。
 executor、index AM、system column `ctid` 和 HOT chain 都需要稳定 TID。
@@ -159,6 +147,7 @@ pruning 要在不破坏 index TID 的情况下剪掉不可见旧版本。
 这正是 `LP_REDIRECT` 和 `LP_DEAD` 存在的原因。
 这四件事不能靠一个字段同时完成。
 PostgreSQL 的设计是拆层：
+
 ```text
 PageHeaderData     page 级空间边界和 pruning hint
 ItemIdData         stable offset number 到 tuple storage 的间接层
@@ -166,12 +155,16 @@ HeapTupleHeader    tuple version 的事务语义和 data 起点
 Snapshot/CLOG/MXID tuple header 之外的可见性事实
 PruneState/WAL     延迟执行空间回收并能恢复
 ```
+
 读源码时要不断问：
 当前代码是在处理定位、可见性、空间、还是 pruning？
 如果把这几层混起来，最容易得出错误结论。
-## 3. 源码阅读顺序
+
+## 3. 核心文件分工与阅读顺序
+
 不要从 `heapam.c` 顶部顺序读。
 本节推荐按状态边界读。
+
 | 顺序 | 文件 | 读什么 | 为什么先读 |
 | --- | --- | --- | --- |
 | 1 | `src/include/storage/bufpage.h` | page layout、`PageHeaderData`、`PageGetItem()`、`PageSetPrunable()` | 先建立 page 级物理边界 |
@@ -183,6 +176,7 @@ PruneState/WAL     延迟执行空间回收并能恢复
 | 7 | `src/backend/access/heap/heapam.c` | scan/fetch/insert/update/delete | 看主流程如何读写这些状态 |
 | 8 | `src/backend/access/heap/heapam_visibility.c` | MVCC 和 vacuum visibility | 看 header 如何被解释成语义 |
 | 9 | `src/backend/access/heap/pruneheap.c` | prune planning 和 execute | 看空间如何安全回收 |
+
 本节刻意不展开：
 - FSM 如何选择目标 page。
 - VM all-visible/all-frozen 的完整协议。
@@ -191,11 +185,14 @@ PruneState/WAL     延迟执行空间回收并能恢复
 - VACUUM lazy scan 的完整两阶段行为。
 这些内容分别属于后续 `28`、`30`、`32`、`33` 节。
 本节只讲它们和 page layout 的接口边界。
+
 ## 4. `PageHeaderData` 的边界
+
 `PageHeaderData` 定义在 `bufpage.h:184-197`。
 它是所有 page-organized block 的通用头。
 heap page、index page 和其它 AM page 都从这里开始。
 本节只关心这些字段：
+
 ```text
 pd_lsn
 pd_flags
@@ -205,6 +202,7 @@ pd_special
 pd_prune_xid
 pd_linp[]
 ```
+
 `pd_lsn` 是 WAL-before-data 的边界。
 heap insert、update、delete 和 prune 在写 WAL 后调用 `PageSetLSN()`。
 buffer manager 写脏页前必须确保 WAL 至少 flush 到 page LSN。
@@ -212,9 +210,11 @@ buffer manager 写脏页前必须确保 WAL 至少 flush 到 page LSN。
 `pd_lower` 是 line pointer array 的末尾。
 `PageGetMaxOffsetNumber()` 用它计算当前最大 offset number。
 源码在 `bufpage.h:396-405`：
+
 ```text
 maxoff = (pd_lower - SizeOfPageHeaderData) / sizeof(ItemIdData)
 ```
+
 这说明 offset number 的数量来自 line pointer array 长度。
 不是来自 live tuple 数量。
 `LP_DEAD`、`LP_REDIRECT`、`LP_UNUSED` 都可能仍占据 offset number。
@@ -248,37 +248,45 @@ insert 在 `heapam.c:2062-2068` 做这个动作。
 update 在 `heapam.c:4062-4076` 做这个动作。
 delete 在 `heapam.c:2997-3002` 做这个动作。
 `PageInit()` 在 `bufpage.c:42-60` 建立初始 page：
+
 ```text
 pd_lower = SizeOfPageHeaderData
 pd_upper = pageSize - specialSize
 pd_special = pageSize - specialSize
 pd_prune_xid = 0
 ```
+
 这时 line pointer array 为空。
 tuple storage 为空。
 free space 是 `pd_lower` 到 `pd_upper` 之间的整段连续空间。
+
 ## 5. `ItemIdData` 和 line pointer 状态
+
 `ItemIdData` 定义在 `itemid.h:25-30`。
 它只有 32 bits。
 其中 `lp_off` 和 `lp_len` 都是 15 bits。
 这也是 page size 上限和 tuple item length 表达能力的一个历史边界。
 `bufpage.h:180-181` 提到 page 最大只能支持到 32KB，原因就是 `lp_off/lp_len` 只有 15 bits。
 line pointer 的四个状态是：
+
 | 状态 | 是否有 storage | 是否可直接作为 tuple | 是否可立即复用 | 主要用途 |
 | --- | --- | --- | --- | --- |
 | `LP_UNUSED` | no | no | yes | 空 slot |
 | `LP_NORMAL` | yes | yes | no | 普通 heap tuple |
 | `LP_REDIRECT` | no | no | no | HOT root redirect |
 | `LP_DEAD` | usually no | no | no | index 可能仍引用的 dead root |
+
 `ItemIdHasStorage()` 只看 `lp_len != 0`。
 所以“是否 in use”和“是否有 storage”不是同一个问题。
 `LP_REDIRECT` 是 in use，但没有 storage。
 `LP_DEAD` 是 in use，但通常没有 storage。
 `LP_UNUSED` 既不是 in use，也没有 storage。
 `LP_REDIRECT` 的特殊点在 `itemid.h:75-79`：
+
 ```text
 lp_off stores redirect target offset number
 ```
+
 也就是说，`LP_REDIRECT.lp_off` 不再是字节偏移。
 它是另一个 line pointer 编号。
 读 line pointer 时必须先看 `lp_flags`。
@@ -315,15 +323,19 @@ heap page 还要遵守 `MaxHeapTuplesPerPage`。
 如果 offset 5 仍然是 `LP_NORMAL`，外部 TID `(block, 5)` 仍能通过 line pointer 找到它。
 tuple bytes 的物理地址可以变。
 TID 不能变。
+
 ## 6. `HeapTupleData` 不是磁盘 header
+
 `HeapTupleData` 定义在 `htup.h:62-69`。
 它是内存中的指针壳：
+
 ```text
 t_len
 t_self
 t_tableOid
 t_data
 ```
+
 `htup.h:31-60` 的注释列出几种使用方式。
 最重要的是：当它指向 buffer 中的 tuple 时，`t_data` 直接指向 shared buffer 的 page bytes。
 代码必须持有相应 buffer pin。
@@ -333,11 +345,13 @@ t_data
 它可能只是指向 page 的临时视图。
 释放 buffer 后继续读 `t_data` 就可能变成 use-after-release。
 heap scan 在 `heapam.c:1014-1017` 填充这个壳：
+
 ```text
 t_data = PageGetItem(page, lpp)
 t_len = ItemIdGetLength(lpp)
 t_self = (block, lineoff)
 ```
+
 `heap_fetch()` 在 `heapam.c:1740-1747` 也做类似事情。
 成功返回时，调用者必须释放 `userbuf`。
 `heap_fetch()` 的注释在 `heapam.c:1657-1659` 明确说明这个 ownership。
@@ -346,10 +360,13 @@ t_self = (block, lineoff)
 - `HeapTupleHeaderData.t_ctid`：存储在 tuple header 里的版本链或特殊 token。
 新手经常把这两个字段混起来。
 它们都叫 TID 相关字段，但语义不同。
+
 ## 7. `HeapTupleHeaderData` 的物理布局
+
 `HeapTupleHeaderData` 定义在 `htup_details.h:153-181`。
 它是 tuple bytes 的固定开头。
 `htup_details.h:65-71` 给出 tuple 总体结构：
+
 ```text
 fixed fields
 nulls bitmap
@@ -357,7 +374,9 @@ alignment padding
 old OID field if any
 user data fields
 ```
+
 固定 header 中本节最重要的字段是：
+
 ```text
 t_choice.t_heap.t_xmin
 t_choice.t_heap.t_xmax
@@ -368,6 +387,7 @@ t_infomask
 t_hoff
 t_bits[]
 ```
+
 `t_choice` 是 union。
 同一段物理空间在 heap tuple 和 composite datum 场景下有不同解释。
 插入 heap relation 前，`heap_prepare_insert()` 会写入事务字段。
@@ -380,6 +400,7 @@ t_bits[]
 `t_infomask` 存储事务状态、lock mode、tuple physical 属性等 flag。
 `htup_details.h:190-219` 定义它。
 本节要记住这些：
+
 ```text
 HEAP_HASNULL
 HEAP_HASVARWIDTH
@@ -397,14 +418,17 @@ HEAP_UPDATED
 HEAP_MOVED_OFF
 HEAP_MOVED_IN
 ```
+
 `t_infomask2` 存储列数和 HOT 相关 flag。
 `htup_details.h:291-296` 定义：
+
 ```text
 HEAP_NATTS_MASK
 HEAP_KEYS_UPDATED
 HEAP_HOT_UPDATED
 HEAP_ONLY_TUPLE
 ```
+
 `HEAP_HOT_UPDATED` 在旧版本上。
 它表示这条 tuple 被 HOT 更新过，`t_ctid` 可以指向同 page 的 heap-only successor。
 `HEAP_ONLY_TUPLE` 在新版本上。
@@ -424,7 +448,9 @@ heap-only tuple 不能被 index 直接引用。
 `t_bits[]` 只有当 `HEAP_HASNULL` 置位时才有意义。
 没有 null 时，不应想当然读取 null bitmap。
 pageinspect 中 `t_bits` 可能为空。
+
 ## 8. `xmin`、`xmax` 和 infomask 的组合语义
+
 `xmin` 是插入事务 XID。
 但 `HeapTupleHeaderGetXmin()` 在 `htup_details.h:328-333` 会把 frozen tuple 返回成 `FrozenTransactionId`。
 `HeapTupleHeaderGetRawXmin()` 才是原始 header 值。
@@ -459,10 +485,13 @@ hint bit 可以留给更晚的访问者设置。
 设置 committed hint bit 前，必须确认 commit record 已经 flush，或者 page LSN 已经提供 interlock。
 否则可能把“看似 committed”的 page 先写盘，crash 后找不到对应 commit WAL。
 所以可见性不是这个公式：
+
 ```text
 xmin committed && xmax invalid
 ```
+
 真实判断更接近：
+
 ```text
 tuple header bits
 + raw xmin/xmax
@@ -473,11 +502,13 @@ tuple header bits
 + hint bit safety
 = visibility result
 ```
+
 `HeapTupleSatisfiesVacuum()` 是另一个语义。
 它在 `heapam_visibility.c:1113-1132`。
 它要回答的不是“当前 snapshot 能不能看见”。
 它要回答“是否可能被任何运行事务看见，能不能移除”。
 `HeapTupleSatisfiesVacuumHorizon()` 在 `heapam_visibility.c:1147-1328` 返回：
+
 ```text
 HEAPTUPLE_DEAD
 HEAPTUPLE_LIVE
@@ -485,13 +516,16 @@ HEAPTUPLE_RECENTLY_DEAD
 HEAPTUPLE_INSERT_IN_PROGRESS
 HEAPTUPLE_DELETE_IN_PROGRESS
 ```
+
 `HEAPTUPLE_RECENTLY_DEAD` 是 pruning/vacuum 的关键状态。
 它说明删除或更新已经提交，但可能仍被旧 snapshot 看见。
 是否能变成 `HEAPTUPLE_DEAD` 还要和 horizon 比较。
 这就是本节主问题里的 MVCC 和空间复用冲突：
 executor 已经看不见的 tuple，不一定能被 pruning 立刻移除。
 必须确认全局可见性边界允许。
+
 ## 9. `t_ctid` 的边界
+
 `htup_details.h:86-112` 是读 `t_ctid` 必看的注释。
 它给出几个不变量。
 新 tuple 存到磁盘时，`t_ctid` 初始化为自己的 TID。
@@ -501,9 +535,11 @@ executor 已经看不见的 tuple，不一定能被 pruning 立刻移除。
 最后把 page 中实际 tuple header 的 `t_ctid` 也设成这个 `t_self`。
 如果 tuple 被 UPDATE，旧 tuple 的 `t_ctid` 会改指新版本。
 `heap_update()` 在 `heapam.c:4059-4060` 做这件事：
+
 ```text
 old.t_ctid = new.t_self
 ```
+
 如果 tuple 是最新版本，通常 `t_ctid` 指向自己。
 如果 `xmax` valid 但 `t_ctid` 仍指向自己，这个 tuple 可能被锁定或被删除。
 不能只凭 `t_ctid == self` 判断可见。
@@ -517,7 +553,9 @@ old.t_ctid = new.t_self
 如果 offset 无效、line pointer 不 normal、`xmin` 不匹配，就停止。
 这说明 `t_ctid` 是候选链路，不是不可怀疑的指针。
 它必须和 line pointer 状态、`xmin/xmax`、snapshot 一起验证。
+
 ## 10. 主流程一：insert 如何建立定位和可见性状态
+
 主入口是 `heap_insert()`，见 `heapam.c:2004-2193`。
 第一步是生成事务状态。
 `heap_insert()` 取 `GetCurrentTransactionId()`。
@@ -539,10 +577,12 @@ old.t_ctid = new.t_self
 本节只关心结果：返回一个已经 pin 且适合插入的 buffer。
 第三步是进入 critical section。
 `heapam.c:2056-2057` 明确写着：
+
 ```text
 NO EREPORT(ERROR) from here till changes are logged
 START_CRIT_SECTION()
 ```
+
 原因是之后会修改 shared buffer page。
 如果修改 page 后、写 WAL 前抛 ERROR，内存页和持久化恢复协议会失配。
 第四步是 `RelationPutHeapTuple()`。
@@ -569,15 +609,19 @@ START_CRIT_SECTION()
 - `PageSetLSN(page, recptr)`。
 第七步是退出 critical section，释放 buffer。
 插入完成后，外部看到的定位关系是：
+
 ```text
 index TID or heap scan TID -> (block, offnum)
 (block, offnum) -> ItemIdData
 ItemIdData -> tuple bytes
 tuple header xmin=current xid, xmax invalid, t_ctid=self
 ```
+
 但 MVCC 可见性仍取决于事务是否提交和读取者 snapshot。
 插入落到 page 不等于对所有人可见。
+
 ## 11. 主流程二：scan/fetch 如何从 TID 到可见 tuple
+
 顺序 heap scan 的核心在 `heapgettup()`。
 关键片段是 `heapam.c:963-1030`。
 扫描一个 page 时，它做的是：
@@ -610,7 +654,9 @@ index heap fetch 在 `heapam_indexscan.c:260-274` 会先尝试 `heap_page_prune_
 本节不展开 `heap_hot_search_buffer()` 的完整实现，只保留边界：
 index entry 指向 root line pointer。
 heap 内部负责从 root 找到对 snapshot 可见的版本。
+
 ## 12. 主流程三：delete 为什么只改 header
+
 `heap_delete()` 在 `heapam.c:2717-3142`。
 它不是把 tuple bytes 从 page 上删掉。
 它先定位 tuple：
@@ -645,7 +691,9 @@ tuple bytes 仍在 page 上。
 index entry 也可能仍指向这个 TID。
 所以 delete 只推进版本语义。
 空间回收留给 pruning/vacuum。
+
 ## 13. 主流程四：update 如何形成版本链
+
 `heap_update()` 在 `heapam.c:3201-4150`。
 它比 delete 更能体现本节主问题。
 update 先定位旧 tuple 并做 DML visibility/conflict 检查。
@@ -692,7 +740,9 @@ heap page 内部用 `t_ctid` 和 `HEAP_HOT_UPDATED/HEAP_ONLY_TUPLE` 找到新版
 如果不是 HOT update：
 索引会为新版本生成新的 index entry。
 旧版本最终可以变成 `LP_DEAD` 或 `LP_UNUSED`，但要遵守 index cleanup 和 visibility horizon。
+
 ## 14. 主流程五：pruning 如何回收空间但保留必要入口
+
 on-access pruning 的入口是 `heap_page_prune_opt()`。
 它在 `pruneheap.c:271-360`。
 调用者必须持有 buffer pin，但不能已经持有 buffer lock。
@@ -718,10 +768,12 @@ bitmap heap scan 和 index scan 也有类似入口。
 insert in progress 也可能在第二次检查时已经 abort。
 如果边看边改，pruning 决策会不稳定。
 所以 pruning 分两阶段：
+
 ```text
 plan: 读取 page，计算 htsv，收集 redirect/dead/unused/freeze 计划
 execute: 进入 critical section，批量应用 line pointer 和 tuple 修改
 ```
+
 `heap_prune_chain()` 在 `pruneheap.c:1451-1682` 处理 HOT chain。
 它从 root offset 开始。
 如果 root 是 `LP_REDIRECT`，先跳到 redirect target。
@@ -754,7 +806,9 @@ chain 的处理结果有三类：
 line pointer 让 TID 稳定。
 tuple header 让旧版本延迟可见。
 pruning 用 line pointer 状态表达“入口还在、storage 可移除、index 后续再清”的中间态。
+
 ## 15. 生命周期、ownership 与 cleanup
+
 heap page 的持久状态在 relation main fork 的 block 中。
 它通过 buffer manager 映射到 shared buffer。
 backend 访问 page 时必须持有 buffer pin。
@@ -787,7 +841,9 @@ line pointer 的 cleanup 是分阶段的。
 `LP_DEAD` 等待 index vacuum 语义。
 `LP_UNUSED` 才能被 `PageAddItemExtended()` 复用。
 尾部连续 `LP_UNUSED` 可以让 `PageRepairFragmentation()` 或 `PageTruncateLinePointerArray()` 缩短 line pointer array。
+
 ## 16. 异常路径和 fallback
+
 第一类异常是 page header 损坏。
 `PageAddItemExtended()` 在 `bufpage.c:220-227` 检查 `pd_lower/pd_upper/pd_special`。
 如果 page pointer 不 sane，报 `PANIC`。
@@ -822,7 +878,9 @@ recovery 不能产生新的 pruning WAL。
 `SetHintBitsExt()` 发现 commit LSN 尚未 flush 且 page LSN 不能提供 interlock，就暂时不设置 committed hint。
 tuple 语义不受影响。
 代价是下次可见性判断还要再查事务状态。
+
 ## 17. 成本、资源与跨模块传播
+
 heap page layout 的 hot path 成本主要有四类。
 第一是 line pointer 扫描成本。
 顺序 scan 遍历 offset number，而不是 live tuple 数。
@@ -859,10 +917,13 @@ HOT chain 和 dead line pointer 增加 page 内部碎片。
 - FSM 是否还认为 page 有可用空间。
 - autovacuum 是否及时执行第二阶段 index cleanup。
 - workload 是否频繁更新 indexed columns。
+
 ## 18. 观测与诊断入口
+
 最直接的观测工具是 `pageinspect`。
 `pageinspect--1.5.sql:22-32` 定义 `page_header()`。
 它能看到：
+
 ```text
 lsn
 checksum
@@ -874,8 +935,10 @@ pagesize
 version
 prune_xid
 ```
+
 `pageinspect--1.5.sql:38-54` 定义 `heap_page_items()`。
 它能看到：
+
 ```text
 lp
 lp_off
@@ -891,6 +954,7 @@ t_hoff
 t_bits
 t_data
 ```
+
 这些字段是 raw observation。
 不要把它们直接当语义。
 例如：
@@ -914,6 +978,7 @@ SQL 层看不见或只能间接推断：
 - page pruning 是否因为 cleanup lock 失败而跳过。
 - hint bit 未设置是因为事务仍在 snapshot 中，还是 commit LSN safety 不满足。
 源码断点推荐：
+
 ```gdb
 break RelationPutHeapTuple
 break HeapTupleSatisfiesMVCC
@@ -923,7 +988,9 @@ break heap_prune_chain
 break heap_page_prune_execute
 break PageRepairFragmentation
 ```
+
 观察变量：
+
 ```gdb
 p ((PageHeader) page)->pd_lower
 p ((PageHeader) page)->pd_upper
@@ -934,7 +1001,9 @@ p tuple->t_infomask
 p tuple->t_infomask2
 p tuple->t_ctid
 ```
+
 如果只做 SQL 诊断，建议形成这个闭环：
+
 ```text
 pageinspect 看到 lp/t_xmin/t_xmax/t_ctid/infomask
 -> 结合当前事务和 snapshot 解释可见性
@@ -942,9 +1011,12 @@ pageinspect 看到 lp/t_xmin/t_xmax/t_ctid/infomask
 -> VACUUM 或访问触发 pruning
 -> 再看 lp_flags/lower/upper/prune_xid 是否变化
 ```
+
 ## 19. 课堂实验一：看 insert 后的 page/header/line pointer
+
 目标：确认 insert 建立的是 line pointer 和 tuple header，而不是“直接把行放进一个数组”。
 准备：
+
 ```sql
 CREATE EXTENSION IF NOT EXISTS pageinspect;
 DROP TABLE IF EXISTS heap_layout_demo;
@@ -956,12 +1028,16 @@ CREATE TABLE heap_layout_demo (
 INSERT INTO heap_layout_demo VALUES (1, 10, repeat('a', 80));
 CHECKPOINT;
 ```
+
 观察 page header：
+
 ```sql
 SELECT *
 FROM page_header(get_raw_page('heap_layout_demo', 0));
 ```
+
 观察 line pointer 和 tuple header：
+
 ```sql
 SELECT h.lp,
        h.lp_off,
@@ -980,6 +1056,7 @@ LEFT JOIN LATERAL heap_tuple_infomask_flags(h.t_infomask, h.t_infomask2) AS f
 ON h.lp_flags = 1
 ORDER BY h.lp;
 ```
+
 回到源码解释：
 - `lp = 1` 对应 `PageAddItemExtended()` 返回的 offset number。
 - `lp_flags = 1` 对应 `LP_NORMAL`。
@@ -988,24 +1065,31 @@ ORDER BY h.lp;
 - `t_xmax` 通常为 0，且 `HEAP_XMAX_INVALID` 才是语义。
 - `t_hoff` 是 user data 起点。
 继续执行：
+
 ```sql
 SELECT ctid, xmin, xmax, *
 FROM heap_layout_demo;
 ```
+
 比较 SQL system columns 和 pageinspect 的 header 字段。
 注意 SQL 的 `ctid` 来自 tuple self TID。
 pageinspect 的 `t_ctid` 是 header 内字段。
 新插入最新版本时二者相同。
 UPDATE 后它们可能不同。
+
 ## 20. 课堂实验二：看 HOT update 和 `t_ctid`
+
 目标：确认 UPDATE 生成新 tuple version，旧版本用 `t_ctid` 指向新版本。
 执行：
+
 ```sql
 UPDATE heap_layout_demo SET v = 11 WHERE id = 1;
 UPDATE heap_layout_demo SET v = 12 WHERE id = 1;
 UPDATE heap_layout_demo SET v = 13 WHERE id = 1;
 ```
+
 观察：
+
 ```sql
 SELECT h.lp,
        h.lp_flags,
@@ -1023,6 +1107,7 @@ LEFT JOIN LATERAL heap_tuple_infomask_flags(h.t_infomask, h.t_infomask2) AS f
 ON h.lp_flags = 1
 ORDER BY h.lp;
 ```
+
 预期现象：
 - 会出现多个 `LP_NORMAL`。
 - 较老版本的 `t_ctid` 指向后续 offset。
@@ -1039,18 +1124,25 @@ ORDER BY h.lp;
 - 检查新版本是否仍能放在同一 page。
 - 检查 table fillfactor 和 tuple size。
 - 检查是否有其它 index 阻止 HOT。
+
 ## 21. 课堂实验三：看 pruning 改 line pointer
+
 目标：确认空间回收先改变 line pointer 状态，再通过 page repair 压缩 tuple bytes。
 先观察更新后的 header：
+
 ```sql
 SELECT lower, upper, special, flags, prune_xid
 FROM page_header(get_raw_page('heap_layout_demo', 0));
 ```
+
 执行 VACUUM：
+
 ```sql
 VACUUM heap_layout_demo;
 ```
+
 再次观察：
+
 ```sql
 SELECT lower, upper, special, flags, prune_xid
 FROM page_header(get_raw_page('heap_layout_demo', 0));
@@ -1066,6 +1158,7 @@ SELECT lp,
 FROM heap_page_items(get_raw_page('heap_layout_demo', 0))
 ORDER BY lp;
 ```
+
 你可能看到：
 - 部分旧版本变成 `LP_UNUSED`。
 - HOT root 可能变成 `LP_REDIRECT`。
@@ -1080,6 +1173,7 @@ ORDER BY lp;
 - `heap_page_prune_execute()` 应用 line pointer 修改。
 - `PageRepairFragmentation()` 压缩 storage。
 长事务边界实验：
+
 ```sql
 -- session A
 BEGIN;
@@ -1092,10 +1186,13 @@ COMMIT;
 -- session B
 VACUUM heap_layout_demo;
 ```
+
 比较 session A commit 前后的 pageinspect 输出。
 如果旧 snapshot 拖住 horizon，某些 recently dead tuple 不能变成 removable。
 这能把 MVCC 可见性和空间复用的冲突直接观察出来。
+
 ## 22. 常见误区
+
 误区一：把 `xmax` 有值理解成 tuple 已删除。
 正确说法：`xmax` 可能是 locker、updater、deleter、MultiXact 或 aborted transaction。
 必须结合 infomask、snapshot 和事务状态。
@@ -1116,7 +1213,9 @@ pruning 依赖 horizon、cleanup lock、page fullness/free space heuristic 和 W
 page 内可能有 dead tuple storage，需要 pruning/repair 后才变成连续空间。
 误区七：认为 hint bit 只是性能优化，不涉及正确性边界。
 正确说法：hint bit 本身优化可见性判断，但 committed hint bit 的设置要遵守 WAL flush/page LSN interlock。
+
 ## 23. 讨论题
+
 1. 为什么 index TID 指向 line pointer 编号，而不是 tuple bytes 的 byte offset？
 2. 为什么 `LP_REDIRECT` 要把 `lp_off` 解释成 offset number，而不是保留旧 tuple 的 storage？
 3. 为什么 `LP_DEAD` 不能总是直接变成 `LP_UNUSED`？
@@ -1127,7 +1226,9 @@ page 内可能有 dead tuple storage，需要 pruning/repair 后才变成连续�
 8. `t_hoff` 损坏会影响哪些路径？它会不会直接改变 MVCC 可见性？
 9. 长事务如何把 DELETE 的可见性结果和空间回收结果分开？
 10. pageinspect 能看到哪些 raw field？哪些结论必须回到源码或 snapshot 才能判断？
+
 ## 24. 本节小结
+
 heap page 的核心不是“page 里放了一堆 tuple”。
 它是一个分层协议。
 `PageHeaderData` 管 page 级空间边界、LSN、all-visible 和 pruning hint。
@@ -1136,6 +1237,7 @@ heap page 的核心不是“page 里放了一堆 tuple”。
 `Snapshot`、transaction status、MultiXact 和 hint bits 把 raw header 转成可见性结果。
 `pruneheap.c` 再把“所有相关 snapshot 都不需要的版本”转成 line pointer 状态变化和 page 内空间压缩。
 本节主链路是：
+
 ```text
 insert 建立 LP_NORMAL 和 xmin/t_ctid=self
 scan 通过 line pointer 找 tuple，再用 snapshot 解释 header
@@ -1143,6 +1245,7 @@ update 插入新 version，并让旧 version 的 xmax/t_ctid 指向新语义
 delete 只写 xmax，不立即移除 storage
 pruning 在 horizon 允许后把 HOT chain 前缀变成 redirect/dead/unused 并 repair fragmentation
 ```
+
 本节最重要的不变量：
 - TID 稳定性来自 line pointer，不来自 tuple bytes 固定位置。
 - MVCC 可见性来自 header bits 加 snapshot，不来自单个字段。

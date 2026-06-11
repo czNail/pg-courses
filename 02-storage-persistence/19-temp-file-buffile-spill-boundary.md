@@ -1,7 +1,7 @@
 # PostgreSQL 临时文件、BufFile 与 spill I/O 边界
 
 ## 课程定位
-本节主题：PostgreSQL 执行器在排序、Hash Join、Materialize 等节点超过内存预算时，如何把中间状态 spill 到临时文件。
+
 上一组课程已经看过 relation fork、md segment 和 VFD cache。
 这一节继续留在 `storage/file` 和执行器之间。
 重点不是“临时文件放在哪个目录”这么单点的问题。
@@ -17,11 +17,31 @@
 一是 `BufFile` / fd.c 如何管理分段、tablespace、VFD、ResourceOwner 和 cleanup。
 二是 `FileSet` / `SharedFileSet` 如何让并行执行共享临时文件。
 三是 sort、Hash Join、tuplestore 如何 spill，以及为什么这些 I/O 不进入 WAL redo。
-本节主流程：executor 节点超过内存预算 -> 创建 `BufFile` 或 FileSet-backed 文件 -> 通过 fd.c `File` 分段读写 -> ResourceOwner/FileSet/SharedFileSet 持有 cleanup 责任 -> 正常结束、ERROR、DSM detach 或 crash cleanup 删除临时状态。
 
-## 源码基线
-源码仓库：`/home/nail/postgres-lab`
+源码基线：本课使用当前实际源码路径 `/home/highgo/postgres`，branch `master`，commit `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`；核心源码分工见第 3 节。
+
+## 1. 本节在总主线中的位置
+
+上一节讲的是 fd.c 如何管理大量逻辑文件。本节把这个能力接到执行器：sort、Hash Join、Materialize 等节点超过内存预算后，会把中间状态写成真实磁盘文件，但这些文件不属于 relation storage，也不进入 WAL 恢复合同。
+
+## 2. 核心矛盾与一句话运行模型
+
+一句话运行模型：
+
+```text
+执行器节点超过内存预算后创建 BufFile 或 FileSet-backed 文件，经 fd.c 的 File 分段读写临时文件；ResourceOwner、FileSet、SharedFileSet 和进程退出清理负责删除这些运行时中间状态，crash 后则由启动清理丢弃残留。
+```
+
+核心矛盾是：当前查询必须可靠读回 spill 数据，但 crash 后不应恢复这些中间状态；临时文件路径解决的是运行时容量、fd、共享和 cleanup，不是 WAL/redo 持久化。
+
+## 3. 核心文件分工与阅读顺序
+
+本节把源码基线、重点入口和辅助核对路径集中放在这里，避免课程定位之后再漂一个未编号大节。
+
+源码仓库：`/home/highgo/postgres`
+
 基线：`master` = `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`
+
 本节重点阅读：
 - `src/backend/storage/file/buffile.c`
 - `src/backend/storage/file/fd.c`
@@ -43,9 +63,8 @@
 辅助核对路径：
 `src/backend/commands/tablespace.c`、`src/backend/postmaster/postmaster.c`、`src/include/common/file_utils.h`、`src/include/utils/tuplesort.h`、`src/include/utils/tuplestore.h`、`src/include/utils/sharedtuplestore.h`、`src/include/executor/hashjoin.h`。
 
----
+## 4. 运行模型：临时但真实的 spill I/O
 
-## 1. 先给结论
 PostgreSQL 的执行器 spill 文件是“临时但真实的磁盘 I/O”。
 它不是 shared buffer page，不是 relation fork，也不经过 storage manager 的 md read/write 语义。
 它只是一段为了完成当前查询或并行查询而写出的中间状态。
@@ -100,9 +119,8 @@ sort 从 `nodeSort.c` 进入 `tuplesort.c`，再用 `logtape.c` 的一个 `BufFi
 Materialize 通过 `tuplestore.c` 从内存数组切到 `BufFile`。
 所以本节的主线是：spill 文件是执行器中间状态的临时磁盘表达，由 `BufFile` 和 fd.c 管理空间、fd、错误和 cleanup；它可以跨 segment、跨临时 tablespace、跨并行进程共享，但不进入 WAL 持久化和 redo 合约。
 
----
+## 5. fd.c：临时文件先是一个 virtual File
 
-## 2. fd.c：临时文件先是一个 virtual File
 先看 `src/backend/storage/file/fd.c` 文件头。
 fd.c 的目标是管理 virtual file descriptor。
 PostgreSQL 进程可能同时接触很多文件：
@@ -211,9 +229,8 @@ fd.c 还有一组命名临时文件接口。
 所以临时文件大小统计和 limit 不是单纯按写入字节累加。
 它追踪文件当前逻辑大小。
 
----
+## 6. temp_tablespaces：从 GUC 到路径
 
-## 3. temp_tablespaces：从 GUC 到路径
 临时 tablespace 的入口在 `src/backend/commands/tablespace.c`。
 GUC 名字是 `temp_tablespaces`。
 它的 check hook 是 `check_temp_tablespaces()`。
@@ -259,9 +276,8 @@ fd.c 的 `SetTempTablespaces()` 保存数组和数量。
 leader 和 worker 不能各自按本地轮转状态猜路径。
 它们必须从同一个 fileset metadata 和同一个 name 得到同一个路径。
 
----
+## 7. BufFile 的结构：一个逻辑文件，多段物理文件
 
-## 4. BufFile 的结构：一个逻辑文件，多段物理文件
 `src/backend/storage/file/buffile.c` 文件头给出三层定位。
 第一，`BufFile` 是 fd.c virtual `File` 之上的缓冲 I/O。
 第二，`BufFile` 会自动清理底层临时文件。
@@ -384,9 +400,8 @@ source 和 target 的 `resowner` 必须一致，否则 `ERROR`。
 这不是普通匿名 BufFile 的接口。
 它存在是因为 FileSet 文件有名字，并且某些上层需要主动截断或删除共享临时数据。
 
----
+## 8. FileSet：命名临时文件的 namespace
 
-## 5. FileSet：命名临时文件的 namespace
 `src/backend/storage/file/fileset.c` 解决的问题是命名。
 普通 `OpenTemporaryFile()` 返回一个 `File`。
 别的 backend 不知道它的名字。
@@ -434,9 +449,8 @@ FileSet 强调“按名字稳定定位”。
 如果忘了，启动或崩溃 cleanup 也会清理 `pgsql_tmp` 目录里符合临时前缀的内容。
 但正常路径不应该依赖重启清理。
 
----
+## 9. SharedFileSet：让最后一个并行参与者清理
 
-## 6. SharedFileSet：让最后一个并行参与者清理
 `src/backend/storage/file/sharedfileset.c` 在 `FileSet` 上加了一层共享 ownership。
 它的头文件结构是：
 - `FileSet fs`
@@ -474,9 +488,8 @@ worker 通过 `SharedFileSetAttach()` 进入。
 - 文件是否只读。
 `BufFileCreateFileSet()`、`BufFileExportFileSet()`、`BufFileOpenFileSet()` 就是上层配套。
 
----
+## 10. BufFile + FileSet：共享不是随便读写
 
-## 7. BufFile + FileSet：共享不是随便读写
 `BufFileCreateFileSet(FileSet *fileset, const char *name)` 创建一个 fileset-based BufFile。
 它不会调用 `OpenTemporaryFile()`。
 它调用 `MakeNewFileSetSegment(file, 0)`。
@@ -520,9 +533,8 @@ writer 必须在 reader 打开前让文件内容稳定。
 如果不确定文件存在或是否已关闭，应传 `missing_ok=true`。
 这说明 shared temp deletion 的并发协议交给调用者。
 
----
+## 11. sort spill：nodeSort 到 tuplesort 到 logtape 到 BufFile
 
-## 8. sort spill：nodeSort 到 tuplesort 到 logtape 到 BufFile
 排序执行节点入口在 `src/backend/executor/nodeSort.c`。
 `ExecSort()` 第一次被调用时，会把 outer plan 全部读完。
 它根据 plan 形状选择 datum sort 或 heap tuple sort。
@@ -650,9 +662,8 @@ WAL 不参与。
 serial sort 的匿名临时文件因此被删除。
 parallel leader import 的 fileset files close 后不会自动 unlink，但 SharedFileSet detach 最终会删除目录。
 
----
+## 12. Hash Join spill：私有 batch 文件
 
-## 9. Hash Join spill：私有 batch 文件
 Hash Join 的构建端在 `src/backend/executor/nodeHash.c`。
 probe 和切换 batch 的逻辑在 `src/backend/executor/nodeHashjoin.c`。
 这两个文件必须一起读。
@@ -766,9 +777,8 @@ Hash Join 的错误边界也很清楚。
 但不会触发 WAL redo。
 因为这些 batch 文件只是该查询的执行中间状态。
 
----
+## 13. Parallel Hash：SharedTuplestore 也是 SharedFileSet 的使用者
 
-## 10. Parallel Hash：SharedTuplestore 也是 SharedFileSet 的使用者
 本基线的 Parallel Hash 不使用私有 `innerBatchFile` / `outerBatchFile` 数组。
 `ExecHashTableCreate()` 注释直接说 parallel case uses shared tuplestores instead of raw files。
 实际共享批数据走：
@@ -839,9 +849,8 @@ worker 初始化时调用：
 - `SharedFileSetDeleteAll(&pstate->fileset)`
 DSM detach callback 仍然是兜底。
 
----
+## 14. Materialize 与 tuplestore：顺序缓存的 spill
 
-## 11. Materialize 与 tuplestore：顺序缓存的 spill
 Materialize 节点入口在 `src/backend/executor/nodeMaterial.c`。
 `ExecMaterial()` 第一次需要缓存时创建 tuplestore：
 - `tuplestore_begin_heap(true, false, work_mem)`
@@ -918,9 +927,8 @@ heap tuple 的具体写法在 `writetup_heap()`：
 一旦 `usedDisk` 变 true，即使后续 `tuplestore_clear()` 又回到内存，它也不会变回 false。
 这让 EXPLAIN 或 instrumentation 能报告曾经使用过 Disk。
 
----
+## 15. WAL 不恢复边界
 
-## 12. WAL 不恢复边界
 把临时 spill 写到磁盘，容易让人误以为它也需要 WAL。
 但 PostgreSQL 的持久化边界不是“只要写磁盘就 WAL”。
 WAL 保护的是数据库持久状态的改变。
@@ -995,9 +1003,8 @@ ResourceOwner 要兜底删除。
 临时 tablespace 权限要检查。
 只是 crash 后，系统选择 abort 当前执行并删除中间状态，而不是恢复它。
 
----
+## 16. ResourceOwner 和 cleanup 边界
 
-## 13. ResourceOwner 和 cleanup 边界
 spill 文件 cleanup 的核心不是 C 内存释放。
 `BufFile` 自身用 `palloc()`。
 内存 context reset 可以回收 `BufFile` struct。
@@ -1043,9 +1050,8 @@ fileset-based named files不会 close 即删。
 这就是为什么 parallel sort leader close imported BufFile 不等于删除每个 worker 文件。
 最终目录删除由 SharedFileSet lifetime 处理。
 
----
+## 17. 错误与删除边界
 
-## 14. 错误与删除边界
 临时文件错误处理分成两类。
 第一类是当前查询不能继续的 I/O 错误。
 第二类是 cleanup 阶段的删除失败。
@@ -1095,21 +1101,22 @@ fd.c 的 `FileWriteV()` 如果发现会超过 `temp_file_limit`，直接 `erepor
 这都是因为 crash residue 不具有语义价值。
 遇到残留，优先让新执行建立干净临时状态。
 
----
+## 18. 成本、资源与跨模块传播
 
-## 15. 成本、资源与跨模块传播
 spill 的成本来自三类放大。第一是数据量：行数、行宽、sort run 数、hash batch 数和 tuplestore rewind 次数会决定临时文件读写量。第二是资源预算：`work_mem`、`hash_mem_multiplier`、`temp_file_limit`、临时 tablespace 空间和 fd budget 决定何时从内存切到磁盘，以及能否继续写。第三是并行共享：parallel sort、Parallel Hash 和 SharedTuplestore 会把 FileSet/SharedFileSet 目录、DSM detach、worker/leader 协议和临时文件 cleanup 纳入同一条链路。
 
 资源压力的传播路径是：executor 节点超过内存预算后创建 `BufFile`；`BufFile` 增长后创建更多 fd.c `File` segment；fd.c 受 VFD LRU、临时 tablespace 和 temp file limit 约束；临时 I/O 和 relation/checkpoint I/O 共享底层磁盘队列。提高 `work_mem` 可能减少 spill，但会增加 backend-local 内存峰值；扩大临时 tablespace 只能缓解空间和 I/O 分布，不能修正错误的 cardinality、行宽或 join strategy。
 
-## 16. 观测与诊断入口
+## 19. 观测与诊断入口
+
 spill 的 runtime truth 是：当前查询已经把中间状态从内存搬到临时文件，并且这些文件会在执行结束、ERROR、进程退出或 crash cleanup 中被丢弃。
 
 能直接观察的是 `EXPLAIN (ANALYZE, BUFFERS)` 里的 external sort、Hash 节点的 Batches、Materialize/tuplestore instrumentation、`log_temp_files` 日志、`temp_file_limit` ERROR 和 wait event `BUFFILE_READ`/`BUFFILE_WRITE`。能间接推断的是 `BufFile` segment 数、FileSet 目录 ownership、SharedFileSet 最后一个 detach 的 cleanup。几乎不可见的是当前 `BufFile.curFile`、`curOffset`、`resowner`、`files[]` 与 VFD LRU 状态，需要断点。
 
 诊断顺序：先确认是 sort/hash/tuplestore 哪条路径 spill；再看 `work_mem`、`hash_mem_multiplier`、行宽、行数和并行度；再看 `temp_tablespaces`、磁盘空间、fd pressure 和 `temp_file_limit`；最后回到 `BufFileCreateTemp()`、`BufFileDumpBuffer()`、`FileWriteV()`、`BufFileClose()` 或 FileSet/SharedFileSet cleanup 验证。
 
-## 17. 常见误区
+## 20. 常见误区
+
 - `work_mem` 不是临时文件大小上限；spill 文件可以远大于单个内存预算。
 - `BufFile` segment 不是 relation segment；本基线固定 1GB，且不使用 `RELSEG_SIZE`。
 - anonymous temp file close 时自动 unlink；FileSet 文件 close 后不自动 unlink。
@@ -1117,7 +1124,8 @@ spill 的 runtime truth 是：当前查询已经把中间状态从内存搬到�
 - 并行查询不是多个进程随便写同一个临时文件；parallel sort worker 各写自己的 fileset BufFile，shared tuplestore 也按参与者和 chunk 协议共享。
 - 临时文件不写 WAL，不表示运行时错误可以忽略；读写、seek、batch protocol 错误必须 abort 当前 query。
 
-## 18. 课堂实验
+## 21. 课堂实验
+
 实验 1：观察 sort spill。
 
 ```sql
@@ -1158,7 +1166,8 @@ SELECT * FROM generate_series(1, 5000000) AS g ORDER BY md5(g::text);
 
 预期报 `temporary file size exceeds "temp_file_limit"`。回到 `BufFileDumpBuffer()`、`FileWrite()`、`FileWriteV()`，确认限制在 fd.c 写路径统一拦截。
 
-## 19. 讨论题
+## 22. 讨论题
+
 1. 为什么 spill 文件是真实磁盘 I/O，却不进入 WAL redo contract？
 2. `BufFile` 为什么不用 relation `RELSEG_SIZE`，而是固定按 1GB 分段？
 3. `OpenTemporaryFile(false)` 为什么要先让 ResourceOwner 有登记空间，再创建外部文件资源？
@@ -1168,7 +1177,8 @@ SELECT * FROM generate_series(1, 5000000) AS g ORDER BY md5(g::text);
 7. 删除临时残留失败为什么通常 LOG，而读写临时文件失败必须 ERROR？
 8. `log_temp_files` 能解释哪些问题，哪些仍需要 EXPLAIN 或断点？
 
-## 20. 本节小结
+## 23. 本节小结
+
 本节核心链路是：执行器发现内存预算不足后，通过 sort、Hash Join 或 tuplestore 状态机创建 `BufFile`；`BufFile` 把逻辑临时文件映射到多个 fd.c `File`；fd.c 负责 VFD、temp tablespace、temp file limit 和 ResourceOwner cleanup。
 
 核心状态边界是：anonymous temp file 属于当前查询/事务，带 `FD_DELETE_AT_CLOSE`；FileSet/SharedFileSet 文件有名字，靠 namespace owner 或 DSM detach 清理；postmaster crash cleanup 负责丢弃 `pgsql_tmp` 残留。

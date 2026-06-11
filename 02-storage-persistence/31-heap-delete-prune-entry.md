@@ -1,6 +1,7 @@
 # PostgreSQL Heap delete、tuple lock 与 page pruning 入口
+
 ## 课程定位
-本节主题：Heap delete、tuple lock 与 page pruning 入口。
+
 上一节已经把 heap page layout、line pointer、tuple header、`xmin`、`xmax`、`infomask` 和 `t_ctid` 的基本边界建立起来。
 本节把这些字段放进一个真实运行链路：
 一条 SQL `DELETE` 到底在 heap page 上改了什么，为什么它不立即释放 tuple 空间，以及后续 page pruning 从哪里进入。
@@ -30,56 +31,11 @@ pruning 在 visibility horizon 允许时，才改 line pointer 状态并修复 p
 - on-access pruning、VACUUM pruning 和 recovery replay 的边界有什么不同。
 - visibility horizon 如何决定 `HEAPTUPLE_RECENTLY_DEAD` 何时变成 `HEAPTUPLE_DEAD`。
 - 哪些状态能通过 `pageinspect`、`pg_locks`、`pg_stat_activity` 和 VACUUM 日志看到，哪些只能推断。
-## 源码基线
-源码仓库：
-```text
-/home/nail/postgres-lab
-```
-基线：
-```text
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
-```
-本节重点阅读：
-```text
-src/backend/access/heap/heapam.c
-src/backend/access/heap/heapam_visibility.c
-src/backend/access/heap/pruneheap.c
-src/backend/access/heap/README.tuplock
-src/include/access/htup_details.h
-```
-辅助定位：
-```text
-src/include/storage/bufpage.h
-src/backend/access/heap/heapam_handler.c
-src/backend/access/heap/heapam_indexscan.c
-src/backend/storage/ipc/procarray.c
-```
-行号来自：
-```text
-nl -ba <source-file>
-```
-本节使用的主要源码入口：
-| 入口 | 文件 | 角色 |
-| --- | --- | --- |
-| `heap_delete()` | `heapam.c:2716` | DELETE 的 heap AM 主入口，写 `xmax`、`infomask`、WAL 和 pruning hint |
-| `heap_lock_tuple()` | `heapam.c:4538` | `SELECT FOR UPDATE/SHARE` 等 tuple lock 的主入口 |
-| `compute_new_xmax_infomask()` | `heapam.c:5289` | 把旧 `xmax` 状态、新锁/更新请求合并成新的 `xmax` 与 infomask |
-| `HeapTupleSatisfiesUpdate()` | `heapam_visibility.c:510` | UPDATE/DELETE/lock 前判断 tuple 是否可修改 |
-| `HeapTupleSatisfiesVacuumHorizon()` | `heapam_visibility.c:1147` | 判断 tuple 对 pruning/VACUUM 是否 dead、recently dead 或 live |
-| `heap_page_prune_opt()` | `pruneheap.c:270` | 普通访问路径上的 opportunistic pruning 入口 |
-| `heap_page_prune_and_freeze()` | `pruneheap.c:1090` | 规划并执行 pruning、freeze、VM 更新的核心函数 |
-| `heap_prune_chain()` | `pruneheap.c:1482` | 判断 HOT chain 中哪些 line pointer redirect、dead、unused |
-| `heap_page_prune_execute()` | `pruneheap.c:2064` | 真正改 line pointer 并 repair fragmentation |
-| `PageSetPrunable()` | `bufpage.h:479` | 设置 `pd_prune_xid` hint |
-本节不展开：
-- lazy VACUUM 的完整 heap 扫描和 index cleanup。
-- HOT update 的所有索引维护条件。
-- freeze 的全部 relfrozenxid 和 relminmxid 推进规则。
-- logical decoding 如何解析 delete WAL。
-- standby snapshot conflict 的完整处理。
-这些内容都与本节相邻，但本节只取它们和 `DELETE -> pruning` 主链路的接口边界。
-## 1. 先给结论
+
+源码基线：本课使用当前实际源码路径 `/home/highgo/postgres`，branch `master`，commit `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`；核心源码分工见第 3 节。
+
+## 1. 本节在总主线中的位置
+
 `DELETE` 不是“从 heap page 删除一段 bytes”。
 `DELETE` 首先是一次 tuple header 状态变更。
 在最简单的场景下，`heap_delete()` 把当前事务 XID 写入 tuple 的 `t_xmax`。
@@ -112,9 +68,11 @@ standby 可能需要用 WAL 里的 conflict horizon 处理查询冲突。
 tuple bytes 仍在 page 上。
 它只是带着新的 `xmax` 和 infomask，等待某个访问路径或 VACUUM 在 horizon 允许后 prune。
 完整运行模型可以压缩成一句话：
+
 ```text
 DELETE 写 tuple header 和 WAL, tuple lock/MultiXact 解决并发等待和锁语义, pruning 之后才在 visibility horizon 允许时改 line pointer 并回收 page 内空间。
 ```
+
 这个模型有三个层次。
 第一层是 tuple header：
 `xmin`、`xmax`、`infomask`、`infomask2`、`cmax`、`t_ctid`。
@@ -129,9 +87,12 @@ DELETE 写 tuple header 和 WAL, tuple lock/MultiXact 解决并发等待和锁�
 只理解第二层，会把 `LP_DEAD` 误读成 tuple header 删除。
 只理解第三层，会把 pruning 误读成 VACUUM 的独占职责。
 本节要把三层串起来。
-## 2. `xmax` 不是一个语义，`xmax + flags + horizon` 才是语义
+
+## 2. 核心矛盾与一句话运行模型
+
 `HeapTupleHeaderData` 定义在 `htup_details.h:153-181`。
 本节关注这些字段：
+
 ```text
 t_choice.t_heap.t_xmin
 t_choice.t_heap.t_xmax
@@ -141,6 +102,7 @@ t_infomask2
 t_infomask
 t_hoff
 ```
+
 `t_xmax` 的注释是 deleting or locking xact ID。
 这句话本身就说明它不是“删除事务 ID”。
 它可能表示删除者。
@@ -148,6 +110,7 @@ t_hoff
 它可能表示 tuple locker。
 它还可能表示 MultiXactId，而不是 TransactionId。
 `htup_details.h:194-210` 定义了和 `xmax` 相关的关键 bit：
+
 ```text
 HEAP_XMAX_KEYSHR_LOCK
 HEAP_XMAX_EXCL_LOCK
@@ -157,6 +120,7 @@ HEAP_XMAX_INVALID
 HEAP_XMAX_IS_MULTI
 HEAP_UPDATED
 ```
+
 `htup_details.h:293-296` 又把 `HEAP_KEYS_UPDATED`、`HEAP_HOT_UPDATED`、`HEAP_ONLY_TUPLE` 放在 `t_infomask2`。
 因此判断一个 tuple 是否被 DELETE 删除，至少要问：
 - `xmax` 是有效 XID 还是 MultiXactId？
@@ -193,7 +157,74 @@ DELETE 没有后继版本。
 `t_ctid != t_self` 返回 `TM_Updated`。
 否则返回 `TM_Deleted`。
 这就是字段组合形成语义的例子。
-## 3. tuple lock 的两级机制
+
+## 3. 核心文件分工与阅读顺序
+
+本节把源码基线、重点入口和辅助核对路径集中放在这里，避免课程定位之后再漂一个未编号大节。
+
+源码仓库：
+
+```text
+/home/highgo/postgres
+```
+
+基线：
+
+```text
+branch: master
+commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
+```
+
+本节重点阅读：
+
+```text
+src/backend/access/heap/heapam.c
+src/backend/access/heap/heapam_visibility.c
+src/backend/access/heap/pruneheap.c
+src/backend/access/heap/README.tuplock
+src/include/access/htup_details.h
+```
+
+辅助定位：
+
+```text
+src/include/storage/bufpage.h
+src/backend/access/heap/heapam_handler.c
+src/backend/access/heap/heapam_indexscan.c
+src/backend/storage/ipc/procarray.c
+```
+
+行号来自：
+
+```text
+nl -ba <source-file>
+```
+
+本节使用的主要源码入口：
+
+| 入口 | 文件 | 角色 |
+| --- | --- | --- |
+| `heap_delete()` | `heapam.c:2716` | DELETE 的 heap AM 主入口，写 `xmax`、`infomask`、WAL 和 pruning hint |
+| `heap_lock_tuple()` | `heapam.c:4538` | `SELECT FOR UPDATE/SHARE` 等 tuple lock 的主入口 |
+| `compute_new_xmax_infomask()` | `heapam.c:5289` | 把旧 `xmax` 状态、新锁/更新请求合并成新的 `xmax` 与 infomask |
+| `HeapTupleSatisfiesUpdate()` | `heapam_visibility.c:510` | UPDATE/DELETE/lock 前判断 tuple 是否可修改 |
+| `HeapTupleSatisfiesVacuumHorizon()` | `heapam_visibility.c:1147` | 判断 tuple 对 pruning/VACUUM 是否 dead、recently dead 或 live |
+| `heap_page_prune_opt()` | `pruneheap.c:270` | 普通访问路径上的 opportunistic pruning 入口 |
+| `heap_page_prune_and_freeze()` | `pruneheap.c:1090` | 规划并执行 pruning、freeze、VM 更新的核心函数 |
+| `heap_prune_chain()` | `pruneheap.c:1482` | 判断 HOT chain 中哪些 line pointer redirect、dead、unused |
+| `heap_page_prune_execute()` | `pruneheap.c:2064` | 真正改 line pointer 并 repair fragmentation |
+| `PageSetPrunable()` | `bufpage.h:479` | 设置 `pd_prune_xid` hint |
+
+本节不展开：
+- lazy VACUUM 的完整 heap 扫描和 index cleanup。
+- HOT update 的所有索引维护条件。
+- freeze 的全部 relfrozenxid 和 relminmxid 推进规则。
+- logical decoding 如何解析 delete WAL。
+- standby snapshot conflict 的完整处理。
+这些内容都与本节相邻，但本节只取它们和 `DELETE -> pruning` 主链路的接口边界。
+
+## 4. tuple lock 的两级机制
+
 `README.tuplock` 是理解 DELETE 的必要阅读材料。
 它开头说，tuple locking 不能像表锁那样简单。
 原因是一个事务可能锁住大量 tuple。
@@ -206,12 +237,14 @@ PostgreSQL 使用两级机制。
 第二级是 standard lock manager 的 tuple lock。
 它只在需要等待时提供排队和公平性。
 `README.tuplock:24-29` 把等待协议写成：
+
 ```text
 LockTuple()
 XactLockTableWait()
 mark tuple as locked by me
 UnlockTuple()
 ```
+
 这不是说锁语义只在 lock table 中。
 真正长期可见的行锁状态仍在 tuple header。
 lock manager 负责“谁排在下一位”。
@@ -222,12 +255,14 @@ lock manager 负责“谁排在下一位”。
 一个持续到来的 shared locker 流可能让 exclusive locker 长期饥饿。
 因此 tuple lock 的 lock table 部分主要是排队语义，不是行锁状态的主存储。
 PostgreSQL 提供四种 tuple lock strength：
+
 ```text
 LockTupleExclusive       SELECT FOR UPDATE, DELETE, key-changing UPDATE
 LockTupleNoKeyExclusive  UPDATE without key change
 LockTupleShare           SELECT FOR SHARE
 LockTupleKeyShare        SELECT FOR KEY SHARE, RI check
 ```
+
 DELETE 使用 `LockTupleExclusive` 语义。
 这会和所有其它 tuple lock mode 冲突。
 外键检查常用 KeyShare，因为它只需要防止被引用 key 消失。
@@ -256,7 +291,9 @@ VACUUM 负责在 freezing 时移除老 MultiXact。
 如果变化，就 `goto l3` 从头判断。
 这个 retry loop 是 tuple header 并发协议的核心。
 `heap_delete()` 也有类似的 `l1` retry。
-## 4. `heap_delete()` 主流程 walkthrough
+
+## 5. `heap_delete()` 主流程 walkthrough
+
 从 SQL 层看，`DELETE FROM t WHERE id = 1` 似乎只是删除一行。
 从 heap AM 看，它是一次带并发检查、visibility check、WAL、VM 处理、toast cleanup 和 cache invalidation 的状态转换。
 `heap_delete()` 入口在 `heapam.c:2716`。
@@ -277,6 +314,7 @@ VACUUM 负责在 freezing 时移除老 MultiXact。
 这个结果不是普通 MVCC visible boolean。
 它告诉 UPDATE/DELETE/lock 调用者，是否可以继续修改这个 tuple。
 可能结果包括：
+
 ```text
 TM_Invisible
 TM_Ok
@@ -285,6 +323,7 @@ TM_Updated
 TM_Deleted
 TM_BeingModified
 ```
+
 `TM_Invisible` 在 DELETE 中是 ERROR。
 `heapam.c:2794-2800` 报错 attempted to delete invisible tuple。
 这通常表示执行路径试图删除当前 command 不该看到的 tuple。
@@ -335,11 +374,13 @@ DELETE 需要在 tuple header 中记录 `cmax`。
 这条 per-backend 边界用于 MultiXact 截断安全。
 第十一步是计算新 `xmax` 和 infomask。
 `heapam.c:2981-2984` 调用：
+
 ```text
 compute_new_xmax_infomask(old_xmax, old_infomask, old_infomask2,
                           xid, LockTupleExclusive, true,
                           &new_xmax, &new_infomask, &new_infomask2)
 ```
+
 最后一个 `true` 表示这不是纯锁，而是 update/delete 类操作。
 对于 DELETE，mode 是 `LockTupleExclusive`。
 第十二步进入 critical section。
@@ -361,6 +402,7 @@ compute_new_xmax_infomask(old_xmax, old_infomask, old_infomask2,
 第十五步写 tuple header。
 `heapam.c:3005-3014` 是本节核心。
 它做了这些事：
+
 ```text
 clear HEAP_XMAX_BITS and HEAP_MOVED
 clear HEAP_KEYS_UPDATED
@@ -370,6 +412,7 @@ set t_xmax = new_xmax
 set cmax
 set t_ctid = t_self
 ```
+
 这里没有移动 tuple bytes。
 没有把 line pointer 改成 `LP_DEAD`。
 没有压缩 page。
@@ -398,7 +441,9 @@ WAL 记录包含 offnum、new xmax、infobits、是否清 all-visible、是否 p
 这个 walkthrough 的关键点是：
 `heap_delete()` 完成后，page 上留下的是一个新的 tuple header 状态，而不是空洞回收后的 page。
 空间回收属于后续 pruning/VACUUM。
-## 5. `compute_new_xmax_infomask()` 如何合并 DELETE 和已有锁
+
+## 6. `compute_new_xmax_infomask()` 如何合并 DELETE 和已有锁
+
 `compute_new_xmax_infomask()` 是本节最容易被低估的函数。
 它不是简单地返回当前事务 XID。
 它必须把旧 `xmax` 状态、旧 infomask、新请求和 MultiXact 规则合并成一个可写入 tuple header 的状态。
@@ -449,7 +494,9 @@ DELETE 改 `xmax` 不是单字段覆盖。
 如果信息过旧或不确定，保守地重新归约，不破坏可见性。
 这也是为什么写 DELETE 相关 patch 时不能绕过 `compute_new_xmax_infomask()`。
 看起来只是“写当前 xid 到 xmax”的修改，很容易破坏 lock upgrade、MultiXact、pg_upgrade compatibility 或 key-share 语义。
-## 6. 为什么 DELETE 不立即释放空间
+
+## 7. 为什么 DELETE 不立即释放空间
+
 DELETE 之后不立即释放空间，不是实现懒惰。
 这是 MVCC、索引稳定性和 crash safety 的共同结果。
 第一，旧 snapshot 仍可能需要看到旧版本。
@@ -494,7 +541,9 @@ VACUUM 做更完整的 dead item 和 index cleanup。
 - `n_dead_tup` 或 VACUUM VERBOSE 可能显示 dead tuple，但 `pageinspect` 仍能看到 tuple header。
 这些不是 bug。
 它们是延迟回收模型的正常表现。
-## 7. DELETE 后 visibility 如何判断
+
+## 8. DELETE 后 visibility 如何判断
+
 `HeapTupleSatisfiesUpdate()` 是 UPDATE/DELETE/lock 前的判断。
 `HeapTupleSatisfiesMVCC()` 是普通 MVCC scan 判断。
 `HeapTupleSatisfiesVacuumHorizon()` 是 VACUUM/pruning 判断。
@@ -522,6 +571,7 @@ VACUUM/pruning 的问题更强：
 这就是 `HeapTupleSatisfiesVacuumHorizon()` 的职责。
 它在 `heapam_visibility.c:1147`。
 它把 tuple 分成：
+
 ```text
 HEAPTUPLE_LIVE
 HEAPTUPLE_DEAD
@@ -529,6 +579,7 @@ HEAPTUPLE_RECENTLY_DEAD
 HEAPTUPLE_INSERT_IN_PROGRESS
 HEAPTUPLE_DELETE_IN_PROGRESS
 ```
+
 如果 inserting transaction aborted，tuple 从未对其它事务可见，可以是 `HEAPTUPLE_DEAD`。
 如果 inserter committed 且 `xmax` invalid，tuple live。
 如果 `xmax` lock-only，tuple live。
@@ -547,7 +598,9 @@ pruning 使用类似逻辑，但通过 `GlobalVisState`。
 这说明 horizon 不是一个固定全局常量。
 不同 relation kind 可能使用不同 horizon。
 catalog、data、shared、temp relation 的 conservative boundary 不同。
-## 8. visibility horizon 与 `GlobalVisState`
+
+## 9. visibility horizon 与 `GlobalVisState`
+
 `GlobalVisTestFor()` 在 `procarray.c:4106`。
 它根据 relation 选择对应的 global visibility horizon state。
 可能是 shared、catalog、data 或 temp horizon。
@@ -585,7 +638,9 @@ MultiXact 还多一个 horizon。
 本节不展开 MultiXact wraparound，但要记住：
 tuple lock 的可扩展性不是免费午餐。
 它把长期行锁状态从 lock table 转移到了 tuple header 和 pg_multixact。
-## 9. page pruning 的入口
+
+## 10. page pruning 的入口
+
 page pruning 不是只有 VACUUM 会做。
 普通 heap scan、bitmap heap scan 和 index heap fetch 都可能 opportunistically prune。
 `heapam.c:638` 在 heap page mode scan 中调用 `heap_page_prune_opt()`。
@@ -646,11 +701,15 @@ on-access 路径传 `HEAP_PAGE_PRUNE_ALLOW_FAST_PATH`。
 避免把 unrelated UPDATE/INSERT 创建出的 free space 暴露给其它页面选择逻辑。
 这些空间更希望被同 page 的 UPDATE 复用。
 这个入口的 mental model：
+
 ```text
 pd_prune_xid hint -> horizon quick check -> free-space pressure -> cleanup lock -> exact tuple visibility -> line pointer state changes
 ```
+
 前面几步都是为了避免在热 scan 路径上付出过多成本。
-## 10. `heap_page_prune_and_freeze()` 做什么
+
+## 11. `heap_page_prune_and_freeze()` 做什么
+
 `heap_page_prune_and_freeze()` 是 pruning 的核心。
 它不是一进来就改 page。
 它先 plan，再进入 critical section 执行。
@@ -667,9 +726,11 @@ VM bit set 但 page `PD_ALL_VISIBLE` clear。
 注意这里只是准备计划。
 具体要 redirect、dead、unused 的 offset 放进数组。
 `pruneheap.c:1164-1166` 用计划数组判断是否真的要 prune：
+
 ```text
 nredirected > 0 || ndead > 0 || nunused > 0
 ```
+
 `pruneheap.c:1168-1174` 判断是否只需要更新 hint：
 `pd_prune_xid` 是否变化，或者 `PD_PAGE_FULL` 是否需要清。
 这意味着一次 pruning 调用可能不回收任何 tuple，只是清理 stale hint。
@@ -710,7 +771,9 @@ VACUUM 还需要据此清理 index entry。
 `LP_UNUSED` 表示 line pointer 可以被新 tuple 复用。
 on-access pruning 通常不敢把 index-referenced root 直接变 `LP_UNUSED`。
 VACUUM 在确认 index cleanup 边界后，才能进一步处理。
-## 11. DELETE、UPDATE 和 pruning hint 的连接
+
+## 12. DELETE、UPDATE 和 pruning hint 的连接
+
 `PageSetPrunable()` 不只在 DELETE 中出现。
 `heap_insert()` 在 `heapam.c:2072-2085` 也可能设置它。
 注释说，如果插入事务最终 abort，tuple 会变成 DEAD。
@@ -739,7 +802,9 @@ hint 可能来自 aborted insert。
 也可能来自 aborted delete。
 也可能在 horizon 还没过时被看到。
 也可能 exact tuple visibility 检查发现没有可 prune 对象。
-## 12. 错误路径与并发边界
+
+## 13. 错误路径与并发边界
+
 本节的错误路径不是附录。
 DELETE 和 pruning 的正确性很大一部分来自 non-happy path。
 边界一：parallel mode 禁止 DELETE tuple。
@@ -783,7 +848,9 @@ standby 通过 WAL replay 应用 primary 的 prune 结果。
 如果 index 仍可能指向这个 line pointer，不能直接设 `LP_UNUSED`。
 否则旧 index entry 可能指向后来复用这个 offset 的新 tuple。
 这个边界是 line pointer 层面对索引稳定性的保护。
-## 13. 成本、资源与跨模块传播
+
+## 14. 成本、资源与跨模块传播
+
 DELETE 本身的 page 修改很小。
 成本来自它触发和延迟的状态。
 CPU 成本：
@@ -824,6 +891,7 @@ on-access pruning 不主动更新 FSM。
 VACUUM 才会更系统地更新 FSM、VM 和统计。
 所以一个 page 的 DELETE 后状态会通过 VM、FSM、pg_stat、autovacuum threshold 和 planner visibility estimates 间接传播。
 跨模块连接可以这样记：
+
 ```text
 heapam.c          前台 DELETE/UPDATE/lock 写 tuple header
 heapam_visibility 解释 tuple header 和事务状态
@@ -833,12 +901,15 @@ multixact.c       承载多事务 tuple lock/update 成员
 vacuumlazy.c      更完整地 prune、freeze、清 index、更新 FSM/VM
 wal/redo          持久化 DELETE 和 PRUNE 的物理顺序
 ```
-## 14. 观测与诊断入口
+
+## 15. 观测与诊断入口
+
 最直接的观测工具是 `pageinspect`。
 它能读 raw heap page，显示 line pointer、`t_xmin`、`t_xmax`、`t_ctid`、`t_infomask`、`t_infomask2`。
 它看到的是 page 当前物理状态。
 它不等于某个 MVCC snapshot 的可见性结果。
 建议用这种查询看 tuple header：
+
 ```sql
 CREATE EXTENSION IF NOT EXISTS pageinspect;
 
@@ -852,6 +923,7 @@ SELECT lp,
 FROM heap_page_items(get_raw_page('demo_delete', 0))
 ORDER BY lp;
 ```
+
 `lp_flags` 可以看到 line pointer 是否仍是 normal、redirect、dead 或 unused。
 `t_xmax` 可以看到 DELETE 或 lock 写入的 raw value。
 `to_hex(t_infomask)` 和 `to_hex(t_infomask2)` 帮你对照 `htup_details.h`。
@@ -866,6 +938,7 @@ ORDER BY lp;
 `pg_locks` 更多显示等待排队时的 transactionid、tuple 或 relation lock。
 这和 `README.tuplock` 的两级模型一致。
 常用等待诊断：
+
 ```sql
 SELECT pid, wait_event_type, wait_event, state, backend_xmin, query
 FROM pg_stat_activity
@@ -878,15 +951,19 @@ FROM pg_locks
 WHERE NOT granted OR locktype IN ('tuple', 'transactionid')
 ORDER BY pid, locktype;
 ```
+
 `backend_xmin` 是判断长事务压 horizon 的入口。
 如果某个 idle in transaction backend 持有很老 `backend_xmin`，DELETE 后的 tuple 可能长期只能 `RECENTLY_DEAD`。
 replication slot 入口：
+
 ```sql
 SELECT slot_name, slot_type, active, xmin, catalog_xmin, restart_lsn
 FROM pg_replication_slots;
 ```
+
 如果 `xmin` 或 `catalog_xmin` 很老，VACUUM 和 pruning 的 removable horizon 会被压住。
 `pg_stat_all_tables` 可以看近似 dead tuple：
+
 ```sql
 SELECT relname, n_live_tup, n_dead_tup,
        vacuum_count, autovacuum_count,
@@ -894,12 +971,15 @@ SELECT relname, n_live_tup, n_dead_tup,
 FROM pg_stat_all_tables
 WHERE relname = 'demo_delete';
 ```
+
 这些统计是估计和累计，不是 page 级真相。
 `n_dead_tup` 不能精确解释某个 page 为什么没有 prune。
 VACUUM VERBOSE 可以提供更接近 cleanup 的日志：
+
 ```sql
 VACUUM (VERBOSE, ANALYZE) demo_delete;
 ```
+
 它能看到 scanned pages、removed tuples、dead item 等信息。
 但它仍不会显示每个 tuple 的 infomask。
 `EXPLAIN (ANALYZE, BUFFERS, WAL)` 可以看 DELETE 和后续 VACUUM/UPDATE 是否制造 WAL 和 buffer dirties。
@@ -913,10 +993,13 @@ line pointer flag、raw `xmax`、infomask hex、wait event、backend xmin、slot
 为什么这次 scan 没有拿到 cleanup lock、为什么 `GlobalVisState` 没更新、为什么 on-access pruning 没动某个 line pointer。
 几乎不可见：
 某次短暂 retry loop 中 `xmax` 是否刚好变化、某个 MultiXact 成员解析的 SLRU cache miss、hint bit FPI 是否由这个 visibility check 触发。
-## 15. 课堂实验一：DELETE commit 后 tuple 为什么还在
+
+## 16. 课堂实验一：DELETE commit 后 tuple 为什么还在
+
 目标：
 观察 DELETE 只设置 tuple header，空间不会在 commit 后立刻消失。
 准备：
+
 ```sql
 CREATE EXTENSION IF NOT EXISTS pageinspect;
 DROP TABLE IF EXISTS demo_delete;
@@ -926,7 +1009,9 @@ SELECT g, repeat('x', 100)
 FROM generate_series(1, 20) AS g;
 CHECKPOINT;
 ```
+
 记录初始 page：
+
 ```sql
 SELECT lp, lp_flags, t_xmin, t_xmax, t_ctid,
        to_hex(t_infomask) AS infomask,
@@ -934,18 +1019,24 @@ SELECT lp, lp_flags, t_xmin, t_xmax, t_ctid,
 FROM heap_page_items(get_raw_page('demo_delete', 0))
 ORDER BY lp;
 ```
+
 会话 A：
+
 ```sql
 BEGIN;
 SELECT count(*) FROM demo_delete;
 ```
+
 保持事务打开。
 会话 B：
+
 ```sql
 DELETE FROM demo_delete WHERE id <= 5;
 COMMIT;
 ```
+
 会话 C 观察 raw page：
+
 ```sql
 SELECT lp, lp_flags, t_xmin, t_xmax, t_ctid,
        to_hex(t_infomask) AS infomask,
@@ -954,17 +1045,21 @@ FROM heap_page_items(get_raw_page('demo_delete', 0))
 ORDER BY lp
 LIMIT 8;
 ```
+
 预期：
 前几行的 `t_xmax` 被设置。
 `t_ctid` 通常指向自身。
 `lp_flags` 大概率仍是 normal。
 这说明 DELETE commit 没有立即把 line pointer 改成 dead/unused。
 会话 A：
+
 ```sql
 SELECT count(*) FROM demo_delete;
 COMMIT;
 ```
+
 会话 B 或 C：
+
 ```sql
 VACUUM (VERBOSE) demo_delete;
 SELECT lp, lp_flags, t_xmin, t_xmax, t_ctid,
@@ -974,49 +1069,63 @@ FROM heap_page_items(get_raw_page('demo_delete', 0))
 ORDER BY lp
 LIMIT 8;
 ```
+
 对照源码解释：
 DELETE 在 `heap_delete()` 中设置 `xmax`、`cmax`、`t_ctid` 和 `pd_prune_xid`。
 会话 A 的 old snapshot 压住 horizon。
 VACUUM 或后续 pruning 只有在 old snapshot 结束后才能把 recently dead 转成 dead。
 如果 VACUUM 后 line pointer 仍不是 `LP_UNUSED`，检查是否还有 index cleanup 边界或 page 布局因素。
 不要把一次实验中某个具体 `lp_flags` 变化推广成所有版本和所有 workload 的固定结果。
-## 16. 课堂实验二：tuple lock、MultiXact 与 DELETE 等待
+
+## 17. 课堂实验二：tuple lock、MultiXact 与 DELETE 等待
+
 目标：
 观察多个 tuple locker 如何让 `xmax` 变成 MultiXact，并让 DELETE 通过 tuple lock/MultiXact wait 排队。
 准备：
+
 ```sql
 DROP TABLE IF EXISTS demo_lock;
 CREATE TABLE demo_lock (id int primary key, note text) WITH (autovacuum_enabled = off);
 INSERT INTO demo_lock VALUES (1, 'one');
 ```
+
 会话 A：
+
 ```sql
 BEGIN;
 SELECT * FROM demo_lock WHERE id = 1 FOR KEY SHARE;
 ```
+
 会话 B：
+
 ```sql
 BEGIN;
 SELECT * FROM demo_lock WHERE id = 1 FOR KEY SHARE;
 ```
+
 会话 C 观察 tuple header：
+
 ```sql
 SELECT lp, lp_flags, t_xmin, t_xmax,
        to_hex(t_infomask) AS infomask,
        to_hex(t_infomask2) AS infomask2
 FROM heap_page_items(get_raw_page('demo_lock', 0));
 ```
+
 预期：
 `t_xmax` 可能已经是 MultiXactId。
 `infomask` 中可看到 `HEAP_XMAX_IS_MULTI` 对应 bit。
 具体 hex 需要对照 `htup_details.h`。
 会话 D：
+
 ```sql
 BEGIN;
 DELETE FROM demo_lock WHERE id = 1;
 ```
+
 此时会话 D 应等待。
 会话 C 观察等待：
+
 ```sql
 SELECT pid, wait_event_type, wait_event, state, query
 FROM pg_stat_activity
@@ -1031,32 +1140,40 @@ WHERE pid IN (
 )
 ORDER BY pid, locktype, granted;
 ```
+
 预期：
 能看到 DELETE backend 等待 lock 或 transactionid/MultiXact 相关事件。
 不一定能在 `pg_locks` 中看到所有已经持有的行锁。
 因为长期状态在 tuple header。
 释放会话 A/B：
+
 ```sql
 COMMIT;
 ```
+
 会话 D 完成后 commit。
 再次观察 page：
+
 ```sql
 SELECT lp, lp_flags, t_xmin, t_xmax, t_ctid,
        to_hex(t_infomask) AS infomask,
        to_hex(t_infomask2) AS infomask2
 FROM heap_page_items(get_raw_page('demo_lock', 0));
 ```
+
 对照源码解释：
 两个 KeyShare lockers 可能促使 `compute_new_xmax_infomask()` 使用 MultiXact。
 DELETE 请求 `LockTupleExclusive`。
 它在 `heap_delete()` 中用 `DoesMultiXactIdConflict()` 判断冲突。
 等待时先通过 `heap_acquire_tuplock()` 建立排队优先级，再 `MultiXactIdWait()`。
 等待回来必须 recheck `xmax` 和 infomask。
-## 17. 课堂实验三：on-access pruning 的入口条件
+
+## 18. 课堂实验三：on-access pruning 的入口条件
+
 目标：
 观察 `pd_prune_xid`、page 空间压力、scan 入口和 VACUUM 的差异。
 准备一个容易形成 HOT chain 的表：
+
 ```sql
 DROP TABLE IF EXISTS demo_prune;
 CREATE TABLE demo_prune (
@@ -1069,7 +1186,9 @@ INSERT INTO demo_prune
 SELECT g, 'v1', repeat('x', 100)
 FROM generate_series(1, 50) AS g;
 ```
+
 制造非 key UPDATE：
+
 ```sql
 UPDATE demo_prune
 SET payload = 'v2'
@@ -1079,7 +1198,9 @@ UPDATE demo_prune
 SET payload = 'v3'
 WHERE id BETWEEN 1 AND 20;
 ```
+
 观察 page：
+
 ```sql
 SELECT lp, lp_flags, t_xmin, t_xmax, t_ctid,
        to_hex(t_infomask) AS infomask,
@@ -1087,10 +1208,13 @@ SELECT lp, lp_flags, t_xmin, t_xmax, t_ctid,
 FROM heap_page_items(get_raw_page('demo_prune', 0))
 ORDER BY lp;
 ```
+
 触发普通 scan：
+
 ```sql
 SELECT count(*) FROM demo_prune WHERE id BETWEEN 1 AND 50;
 ```
+
 再观察 page。
 如果没有明显变化，不要立刻判定 pruning 没工作。
 可能原因：
@@ -1100,16 +1224,20 @@ SELECT count(*) FROM demo_prune WHERE id BETWEEN 1 AND 50;
 - exact tuple visibility 仍是 recently dead。
 - 这个 page 不是 id 1 到 20 所在 page。
 强制 VACUUM：
+
 ```sql
 VACUUM (VERBOSE) demo_prune;
 ```
+
 再观察 page。
 对照源码解释：
 普通 scan 走 `heap_page_prune_opt()`。
 它必须通过 hint、horizon、free-space pressure 和 cleanup lock。
 VACUUM 直接调用 `heap_page_prune_and_freeze()`，且有更完整的 index cleanup 和 VM/FSM 处理。
 二者都可能进入 `heap_prune_chain()`，但参数和权限边界不同。
-## 18. 常见误区
+
+## 19. 常见误区
+
 误区一：
 `xmax` 有值就是 tuple 被删除。
 正确说法：
@@ -1148,7 +1276,9 @@ on-access pruning 是 opportunistic。
 正确说法：
 `LP_DEAD` 通常意味着 index 可能还指向这个 root TID。
 只有 `LP_UNUSED` 才能立即复用 line pointer。
-## 19. 讨论题
+
+## 20. 讨论题
+
 1. 为什么 DELETE 使用 `LockTupleExclusive` 语义，而不是只写一个“deleted” bit？
 2. 如果 `xmax` 是 MultiXactId，为什么不能直接把它当成 locker 集合？
 3. `HEAP_XMAX_LOCK_ONLY` 和 `HEAP_KEYS_UPDATED` 分别保护什么语义？
@@ -1157,8 +1287,11 @@ on-access pruning 是 opportunistic。
 6. on-access pruning 为什么要先看 `pd_prune_xid`，再看 horizon，再看 free space heuristic？
 7. 一个长事务如何同时影响 VACUUM、on-access pruning 和查询扫描成本？
 8. `pg_locks` 看不到某些已锁 tuple 时，应该用什么 mental model 解释？
-## 20. 本节小结
+
+## 21. 本节小结
+
 本节的核心链路是：
+
 ```text
 heap_delete()
   -> HeapTupleSatisfiesUpdate()
@@ -1172,6 +1305,7 @@ heap_delete()
   -> heap_prune_chain()
   -> heap_page_prune_execute()
 ```
+
 DELETE 的核心状态在 tuple header。
 它记录删除者、锁语义和 command id。
 但 tuple header 不决定空间复用。

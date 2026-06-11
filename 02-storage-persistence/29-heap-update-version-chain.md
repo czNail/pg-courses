@@ -1,9 +1,11 @@
 # PostgreSQL Heap update、new version 与 old tuple xmax
+
 ## 课程定位
-本节主题：Heap update、new version 与 old tuple xmax。
+
 上一节已经把 heap page、line pointer、tuple header、`xmin/xmax`、`t_ctid` 和 HOT bit 的物理位置讲清楚。
 本节沿着 `UPDATE` 的真实执行路径继续往下走。
 前置知识：已理解 buffer pin/content lock、page LSN、MVCC snapshot、tuple header、line pointer 和 WAL-before-data。
+
 本节唯一主问题：
 `UPDATE` 为什么必须生成一个新的 heap tuple version，同时修改旧版本的 `xmax` 和 `t_ctid`，而不是原地覆盖旧 tuple？
 本节围绕的核心矛盾：
@@ -32,38 +34,11 @@ PostgreSQL 的答案不是“更新一行”，而是同时完成两件事：
 本节不把 `UPDATE` 扩展成完整 executor 课程。
 我们只跟 heap access method 内部的状态变化。
 executor、index AM、logical decoding、vacuum 和 pruning 只讲与本节主链路相交的边界。
-## 源码基线
-源码仓库：
-```text
-/home/nail/postgres-lab
-```
-基线：
-```text
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
-commit date: 2026-06-09
-```
-本节重点阅读：
-```text
-src/backend/access/heap/heapam.c
-src/backend/access/heap/heapam_visibility.c
-src/backend/access/heap/heapam_xlog.c
-src/backend/access/heap/README.HOT
-src/backend/access/heap/README.tuplock
-src/include/access/htup_details.h
-src/include/access/heapam_xlog.h
-```
-辅助核对：
-```text
-src/backend/access/heap/hio.c
-src/backend/access/heap/pruneheap.c
-contrib/pageinspect/heapfuncs.c
-```
-行号来自：
-```text
-git -C /home/nail/postgres-lab show bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8:<file> | nl -ba
-```
-## 1. 先给结论
+
+源码基线：本课使用当前实际源码路径 `/home/highgo/postgres`，branch `master`，commit `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`；核心源码分工见第 3 节。
+
+## 1. 本节在总主线中的位置
+
 `UPDATE` 在 heap 中不是 in-place overwrite。
 它是一次版本追加加一次旧版本头部改写。
 旧版本仍占据原来的 line pointer。
@@ -77,13 +52,17 @@ git -C /home/nail/postgres-lab show bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8:<fi
 如果旧版本上还要保留其他 locker，旧版本 `xmax` 可能变成 MultiXactId。
 如果只是 row lock，`xmax` 也可能有值，但 `HEAP_XMAX_LOCK_ONLY` 说明它不是 updater。
 所以本节最重要的不变量是：
+
 ```text
 UPDATE = insert new version + mark old version as updated by xmax + link old t_ctid to new t_self
 ```
+
 再加一条诊断不变量：
+
 ```text
 xmax raw field is not semantics; xmax + infomask + infomask2 + snapshot + transaction status is semantics
 ```
+
 `heap_update()` 的核心状态变化发生在 `heapam.c:4012-4108`。
 这段代码进入 critical section 后：
 - 调用 `PageSetPrunable()` 给旧页和必要的新页留下 pruning hint。
@@ -105,9 +84,22 @@ xmax raw field is not semantics; xmax + infomask + infomask2 + snapshot + transa
 在 HOT 场景下，旧版本带 `HEAP_HOT_UPDATED`。
 新版本带 `HEAP_ONLY_TUPLE`。
 在非 HOT 场景下，旧版本仍通过 `t_ctid` 指向新版本，但 index 层会为新版本建立新的 index entry。
-## 2. 源码阅读顺序
+
+## 2. 核心矛盾与一句话运行模型
+
+一句话运行模型：
+
+```text
+heap_update 先确认旧 tuple 可被当前事务更新，再为新版本选择落点；critical section 中插入新 tuple、改写旧 tuple 的 xmax/cmax/t_ctid 和 HOT flags，写 WAL 并给相关 page 设置同一条 WAL record 的 LSN。
+```
+
+核心矛盾是：SQL 看起来是在改一行，MVCC、索引 TID、tuple lock、MultiXact、HOT 和 crash redo 却要求旧版本继续可解释，新版本独立存在，并且两者之间的链接可恢复。
+
+## 3. 核心文件分工与阅读顺序
+
 不要从 `heapam.c` 顶部线性读。
 本节推荐按状态转移读。
+
 | 顺序 | 文件 | 读什么 | 目标 |
 | --- | --- | --- | --- |
 | 1 | `htup_details.h` | `HeapTupleFields`、`t_ctid` 注释、infomask bits、accessor | 先建立 header 语义 |
@@ -119,7 +111,9 @@ xmax raw field is not semantics; xmax + infomask + infomask2 + snapshot + transa
 | 7 | `heapam_xlog.h` | `xl_heap_update`、update flags、infobits | 理解 WAL record 表达什么 |
 | 8 | `heapam_xlog.c` | `heap_xlog_update()` | 验证 redo 能重建同一组状态 |
 | 9 | `heapam.c` | `compute_new_xmax_infomask()`、MultiXact wait helpers | 理解锁和并发边界 |
+
 本节的阅读主轴是一个 tuple version 的时间线：
+
 ```text
 old version is visible
   -> updater wants to replace it
@@ -131,7 +125,9 @@ old version is visible
   -> WAL records both sides
   -> readers and vacuum interpret both versions under different horizons
 ```
-## 3. 关键状态不是单个字段
+
+## 4. 关键状态不是单个字段
+
 heap tuple header 的事务字段定义在 `htup_details.h:122-131`。
 它把 `t_xmin`、`t_xmax` 和 `t_field3` 放在 `HeapTupleFields`。
 `t_xmin` 是插入这个 tuple version 的事务。
@@ -167,7 +163,9 @@ speculative insertion 也可能临时把 token 放进 `t_ctid`。
 `heap_get_latest_tid()` 在 `heapam.c:1782-1895` 就是这个规则的运行样本。
 它每次追 `t_ctid` 后都用 `priorXmax` 和目标 tuple 的 `xmin` 匹配。
 如果 offset 无效、line pointer 不是 normal、`xmin` 不匹配，链路停止。
-## 4. `xmax` 的五种常见含义
+
+## 5. `xmax` 的五种常见含义
+
 本节不能把 `xmax` 翻译成“删除事务”。
 `README.tuplock:4-13` 明确说 tuple lock 的第一层就存储在 tuple header 中。
 单个 locker 的 XID 会写入 `xmax`。
@@ -197,6 +195,7 @@ infomask bits 区分这是锁还是删除/更新。
 旧事务 abort 后可能留下 raw 值。
 后续 visibility check 会设置 hint bits。
 因此，诊断时正确的读法是：
+
 ```text
 raw t_xmax
 + HEAP_XMAX_INVALID
@@ -207,7 +206,9 @@ raw t_xmax
 + snapshot
 = visible / locked / updated / deleted / recently dead
 ```
-## 5. `HeapTupleSatisfiesUpdate()` 是 update 前的语义闸门
+
+## 6. `HeapTupleSatisfiesUpdate()` 是 update 前的语义闸门
+
 `heap_update()` 在真正改 page 前，会调用 `HeapTupleSatisfiesUpdate()`。
 调用点在 `heapam.c:3428-3432`。
 这个函数定义在 `heapam_visibility.c:481-736`。
@@ -217,9 +218,11 @@ raw t_xmax
 `TM_Ok` 表示当前 command 可以更新这个 tuple。
 `TM_Invisible` 表示这个 tuple 对当前 command 根本不存在。
 `heap_update()` 遇到它会报错：
+
 ```text
 attempted to update invisible tuple
 ```
+
 `TM_SelfModified` 表示同一事务已经在当前 scan 后修改过。
 `TM_Updated` 表示别的已提交事务更新了它。
 `TM_Deleted` 表示别的已提交事务删除了它。
@@ -238,13 +241,17 @@ attempted to update invisible tuple
 同一个 physical tuple 的 `xmax` 有值，不等于这个 tuple 不能被 update。
 如果这个 `xmax` 只是 lock-only，或者对应事务 abort，它仍然可以更新。
 `heap_update()` 需要先把 header 中这些状态解释完，再决定是否写新版本。
-## 6. 主流程起点：准备 old tuple 和 modified attrs
+
+## 7. 主流程起点：准备 old tuple 和 modified attrs
+
 `heap_update()` 定义在 `heapam.c:3200-4178`。
 入口参数包括 old TID、new tuple、command id、crosscheck snapshot、wait policy 和返回给 caller 的 `TM_FailureData`。
 函数一开始取当前事务 ID：
+
 ```text
 xid = GetCurrentTransactionId()
 ```
+
 这就是后面新 tuple `xmin` 和旧 tuple update `xmax` 的来源。
 `heap_update()` 先计算四组属性 bitmap。
 `hot_attrs` 来自 `INDEX_ATTR_BITMAP_HOT_BLOCKING`。
@@ -276,20 +283,26 @@ BRIN 这类 summarizing index 不保存单个 tuple TID，可以允许 HOT chain
 这个 `HeapTupleData` 不拥有 tuple bytes。
 它只是对 buffer page 的临时视图。
 后面的更新必须在正确的 buffer pin 和 content lock 保护下使用它。
-## 7. 锁强度：key-intact update 的并发收益
+
+## 8. 锁强度：key-intact update 的并发收益
+
 `heap_update()` 在 `heapam.c:3386-3419` 根据修改列选择 tuple lock 强度。
 如果没有修改 `key_attrs`，使用：
+
 ```text
 LockTupleNoKeyExclusive
 MultiXactStatusNoKeyUpdate
 key_intact = true
 ```
+
 如果修改了 key attrs，使用：
+
 ```text
 LockTupleExclusive
 MultiXactStatusUpdate
 key_intact = false
 ```
+
 这个选择不是性能微调。
 它决定 update 是否与 `SELECT FOR KEY SHARE` 冲突。
 `README.tuplock:49-61` 解释了四种 tuple lock：
@@ -309,7 +322,9 @@ key_intact = false
 `compute_new_xmax_infomask()` 在 is-update 场景下，如果 mode 是 `LockTupleExclusive`，会设置 `HEAP_KEYS_UPDATED`。
 如果 mode 是 `LockTupleNoKeyExclusive`，不会设置。
 这就是 key-intact update 的状态落点。
-## 8. 等待、重试和保留 locker
+
+## 9. 等待、重试和保留 locker
+
 `heap_update()` 的等待逻辑从 label `l2` 开始。
 它先调用 `HeapTupleSatisfiesUpdate()`。
 如果返回 `TM_BeingModified` 且 caller 允许 wait，就要处理已有 locker 或 updater。
@@ -339,7 +354,9 @@ heavyweight tuple lock 是第二层仲裁。
 这里的可迁移规律是：
 等待不是简单 sleep。
 等待意味着释放 page lock、建立排队、睡在事务或 MultiXact 上、回来后重新验证物理 header。
-## 9. `compute_new_xmax_infomask()`：把并发历史塞回 old tuple
+
+## 10. `compute_new_xmax_infomask()`：把并发历史塞回 old tuple
+
 真正写旧 tuple `xmax` 前，`heap_update()` 先调用 `compute_new_xmax_infomask()`。
 调用点在 `heapam.c:3686-3691`。
 参数包括旧 raw `xmax`、旧 `infomask`、旧 `infomask2`、当前事务 ID、lock mode 和 `is_update=true`。
@@ -366,16 +383,21 @@ heavyweight tuple lock 是第二层仲裁。
 它可能创建 MultiXactId。
 所以不能把它当纯计算函数。
 它的输出是三件套：
+
 ```text
 xmax_old_tuple
 infomask_old_tuple
 infomask2_old_tuple
 ```
+
 后面 critical section 里会把这三件套写回旧 tuple。
-## 10. 新 tuple 的 `xmin` 和可能继承的 `xmax`
+
+## 11. 新 tuple 的 `xmin` 和可能继承的 `xmax`
+
 旧 tuple 的 `xmax` 需要表达 updater。
 新 tuple 的 `xmin` 则直接表达“谁插入了这个新版本”。
 `heap_update()` 在 `heapam.c:3732-3742` 准备 new tuple header：
+
 ```text
 clear HEAP_XACT_MASK and HEAP2_XACT_MASK
 set xmin = current xid
@@ -383,6 +405,7 @@ set cmin = current cid
 set HEAP_UPDATED
 set xmax = xmax_new_tuple
 ```
+
 `HEAP_UPDATED` 在新版本上。
 它说明这个 tuple version 是由 UPDATE 产生的。
 它不是“旧版本被更新”的标志。
@@ -390,10 +413,12 @@ set xmax = xmax_new_tuple
 新版本是否 heap-only 用 `HEAP_ONLY_TUPLE`。
 大多数情况下，新 tuple 的 `xmax` 是 invalid。
 代码在 `heapam.c:3700-3710` 如果旧 tuple `xmax` invalid、升级遗留 MultiXact、或者等待后没有 locker remain，就设置：
+
 ```text
 xmax_new_tuple = InvalidTransactionId
 infomask_new_tuple = HEAP_XMAX_INVALID
 ```
+
 但也存在新 tuple 继承锁信息的情况。
 如果旧 tuple 上还有 key-share lockers，且当前 update 不与它们冲突，新版本也必须保留这些 lock 语义。
 否则外键检查可能以为新版本没有被保护。
@@ -404,35 +429,45 @@ infomask_new_tuple = HEAP_XMAX_INVALID
 新版本也可能有 `xmax`。
 如果它带 lock-only bits，它仍然可能是 live tuple。
 `xmax` 有值不是“旧版本”的专利。
-## 11. combo CID：同一事务内的 command visibility
+
+## 12. combo CID：同一事务内的 command visibility
+
 在准备 new tuple header 后，`heap_update()` 调用：
+
 ```text
 HeapTupleHeaderAdjustCmax(oldtup.t_data, &cid, &iscombo)
 ```
+
 调用点在 `heapam.c:3744-3748`。
 这一步处理旧 tuple 的 `cmax`。
 如果同一事务内既需要记住 old tuple 的 `cmin`，又需要记住 old tuple 的 `cmax`，单个 `t_field3` 不够。
 于是 `cid` 会被替换成 combo CID。
 后面写旧 tuple 时使用：
+
 ```text
 HeapTupleHeaderSetCmax(oldtup.t_data, cid, iscombo)
 ```
+
 调用点在 `heapam.c:4057`。
 combo CID 的影响只在 originating backend 内完整可解释。
 这也是 `heap_update()` 禁止 parallel mode 的原因。
 逻辑解码还有额外边界。
 如果 relation 能被 logical decoding 访问，`heap_update()` 在 WAL update 前调用：
+
 ```text
 log_heap_new_cid(relation, &oldtup)
 log_heap_new_cid(relation, heaptup)
 ```
+
 调用点在 `heapam.c:4087-4095`。
 原因是 logical decoding 需要正确解释 catalog 的 combo CID。
 普通数据表的 MVCC 可见性可以依赖事务提交顺序和 tuple header。
 但 decoding catalog 变化时，command boundary 和 combo CID 会影响 historic snapshot 的解释。
 所以 combo CID 不只是“同事务里看不看得到”的局部小问题。
 它会影响 WAL 里的可解码语义。
-## 12. TOAST 或同页空间不足时的临时锁路径
+
+## 13. TOAST 或同页空间不足时的临时锁路径
+
 `UPDATE` 的 happy path 是新 tuple 不需要 TOAST 且同页有足够空间。
 但真实系统常常不是这样。
 如果新 tuple 需要 TOAST，或者 old page 放不下新 tuple，`heap_update()` 必须释放 old page content lock 去做额外工作。
@@ -459,7 +494,9 @@ PostgreSQL 的做法是先把 old tuple 临时标记成 locked。
 `UPDATE` 有时会先产生一个 lock WAL record，再产生 update WAL record。
 看到旧 tuple 曾经 `t_ctid` 指向自己，不一定说明没有 update 尝试。
 可能只是 update 在释放 page lock 前的临时 lock 状态。
-## 13. 选择新版本落点和死锁规避
+
+## 14. 选择新版本落点和死锁规避
+
 如果新 tuple 同页放不下，`heap_update()` 调用 `RelationGetBufferForTuple()` 找新 page。
 这不是简单找空间。
 它涉及 old page 和 new page 两个 buffer lock。
@@ -477,28 +514,38 @@ PostgreSQL 的做法是先把 old tuple 临时标记成 locked。
 这会直接结束 HOT 可能性。
 同时 old page 被 `PageSetFull(page)` 标记为可考虑 prune/defrag。
 这个 flag 是 hint，不是严格事实。
-## 14. HOT 与非 HOT 的连接点
+
+## 15. HOT 与非 HOT 的连接点
+
 HOT 不是 update 的另一套实现。
 HOT 是 `heap_update()` 在新版本已经有落点后选择的一组标志和 index 维护策略。
 关键判断在 `heapam.c:3972-3993`。
 必须先满足：
+
 ```text
 newbuf == buffer
 ```
+
 也就是新旧 tuple version 在同一个 heap page。
 然后还要满足：
+
 ```text
 !bms_overlap(modified_attrs, hot_attrs)
 ```
+
 也就是没有修改 HOT-blocking index 相关列。
 满足时：
+
 ```text
 use_hot_update = true
 ```
+
 如果修改了 summarizing index 相关列，还会设置：
+
 ```text
 summarized_update = true
 ```
+
 真正写 bit 在 critical section 里。
 `heapam.c:4029-4037`：
 - 旧 tuple 设置 `HEAP_HOT_UPDATED`。
@@ -520,15 +567,21 @@ index scan 找到 root 后，沿 `HEAP_HOT_UPDATED` 和 `t_ctid` 继续找子版
 跨页会破坏 page-local pruning 的目标。
 也会让 index fetch 为了追链多读 heap page。
 所以新版本离开 old page，就必须结束 HOT chain，并让新版本拥有自己的 index entries。
-## 15. 真正的 page 修改顺序
+
+## 16. 真正的 page 修改顺序
+
 到 `heapam.c:4012`，代码进入：
+
 ```text
 START_CRIT_SECTION()
 ```
+
 注释写着：
+
 ```text
 NO EREPORT(ERROR) from here till changes are logged
 ```
+
 这不是风格要求。
 这是 crash safety 和 shared buffer consistency 的边界。
 进入 critical section 前，代码已经完成可能分配内存的工作。
@@ -542,9 +595,11 @@ critical section 内部的状态变化要么完成并写 WAL，要么 PANIC 让 
 旧 tuple 和新 tuple 的 HOT/heap-only bits 在真正插入新 tuple 前确定。
 第三步是插入新 tuple。
 调用：
+
 ```text
 RelationPutHeapTuple(relation, newbuf, heaptup, false)
 ```
+
 这个函数在 `hio.c:58-79` 调用 `PageAddItem()`，得到 offset number。
 然后设置 `tuple->t_self` 为实际 `(block, offnum)`。
 最后把 page 中实际 tuple header 的 `t_ctid` 设置为这个 `t_self`。
@@ -554,6 +609,7 @@ RelationPutHeapTuple(relation, newbuf, heaptup, false)
 代码清掉旧 tuple 过时的 `HEAP_XMAX_BITS` 和 `HEAP_MOVED`。
 清掉旧 `HEAP_KEYS_UPDATED`。
 然后写：
+
 ```text
 HeapTupleHeaderSetXmax(oldtup.t_data, xmax_old_tuple)
 oldtup.t_data->t_infomask |= infomask_old_tuple
@@ -561,6 +617,7 @@ oldtup.t_data->t_infomask2 |= infomask2_old_tuple
 HeapTupleHeaderSetCmax(oldtup.t_data, cid, iscombo)
 oldtup.t_data->t_ctid = heaptup->t_self
 ```
+
 这就是本节主题的中心。
 旧 tuple 的 `xmax` 和 `t_ctid` 是同一条 update 边的两半。
 `xmax` 说明“哪个事务做了取代”。
@@ -573,9 +630,12 @@ oldtup.t_data->t_ctid = heaptup->t_self
 如果 relation 需要 WAL，调用 `log_heap_update()`。
 返回的 `recptr` 会设置到涉及的 heap page LSN 上。
 这是 WAL-before-data 的页面级落点。
-## 16. WAL record 表达了哪些状态
+
+## 17. WAL record 表达了哪些状态
+
 `heapam_xlog.h:203-235` 定义 `xl_heap_update`。
 核心字段是：
+
 ```text
 old_xmax
 old_offnum
@@ -584,6 +644,7 @@ flags
 new_xmax
 new_offnum
 ```
+
 注意它不直接存完整旧 tuple header。
 旧 tuple 已经在 page 上。
 redo 只需要知道 old offset、old xmax、旧 infomask 中和 xmax 相关的 bits，以及新 tuple 的位置。
@@ -598,11 +659,13 @@ redo 中 `fix_infomask_from_infobits()` 做反向恢复。
 它在 `heapam_xlog.c:259-284`。
 新 tuple 的 WAL 表达不同。
 `xl_heap_header` 只保存：
+
 ```text
 t_infomask2
 t_infomask
 t_hoff
 ```
+
 新 tuple data 会跟在 block data 中。
 `heapam_xlog.h:146-159` 解释了为什么不把整个 fixed header 存进去。
 `xmin` 可以从 WAL record 的 xid 得到。
@@ -611,10 +674,12 @@ t_hoff
 `t_ctid` redo 时设置成 new TID。
 所以 WAL 记录的是重建所需的最小组合，而不是源码里每个字段的镜像。
 `log_heap_update()` 在 `heapam.c:8799-8802` 根据新 tuple 是否 heap-only 选择 record 类型：
+
 ```text
 XLOG_HEAP_HOT_UPDATE
 XLOG_HEAP_UPDATE
 ```
+
 同页 update 且不需要 logical tuple data 时，它还可能只记录新旧 tuple user data 的 prefix/suffix delta。
 这在 `heapam.c:8804-8854`。
 如果 logical decoding 需要完整新 tuple，或者 full-page image 条件要求保留数据，就不能只靠 delta。
@@ -622,14 +687,18 @@ flags 还记录是否清了 old/new all-visible。
 如果更新的 tuple 对 logical decoding 需要 old key 或 old tuple，flags 还会带 `XLH_UPDATE_CONTAINS_OLD_KEY` 或 `XLH_UPDATE_CONTAINS_OLD_TUPLE`。
 这说明 WAL update record 同时服务 crash recovery、standby replay 和 logical decoding。
 它不是单纯的物理 diff。
-## 17. redo 如何重建 old/new 两侧
+
+## 18. redo 如何重建 old/new 两侧
+
 redo 入口是 `heap_xlog_update()`。
 它在 `heapam_xlog.c:693-950`。
 record 类型 `XLOG_HEAP_UPDATE` 和 `XLOG_HEAP_HOT_UPDATE` 都走这里。
 函数先构造 new TID：
+
 ```text
 newtid = (newblk, xlrec->new_offnum)
 ```
+
 如果 old page 和 new page 不同，WAL record 有第二个 block reference。
 redo 注释在 `heapam_xlog.c:757-764` 提醒：
 正常运行要按 page number 顺序加锁避免死锁。
@@ -655,6 +724,7 @@ redo 再处理 new tuple。
 它从 WAL block data 读 `xl_heap_header` 和 tuple data。
 如果 record 使用 prefix/suffix delta，就从 old tuple 复制前后缀。
 然后设置：
+
 ```text
 htup->t_infomask2 = xlhdr.t_infomask2
 htup->t_infomask = xlhdr.t_infomask
@@ -665,6 +735,7 @@ HeapTupleHeaderSetXmax(htup, xlrec->new_xmax)
 htup->t_ctid = newtid
 PageAddItem(...)
 ```
+
 这说明 crash recovery 看到的 new tuple `xmin` 不是 WAL payload 里单独写的字段。
 它来自 WAL record xid。
 redo 把新 tuple `t_ctid` 设成 self。
@@ -675,7 +746,9 @@ redo 把新 tuple `t_ctid` 设成 self。
 但 visibility map 清理可能仍要处理。
 `heap_xlog_update()` 在 old/new all-visible flags 上单独清 VM。
 这解释了为什么 WAL record flags 需要显式记录 VM bit 变化。
-## 18. MVCC reader 如何解释两个版本
+
+## 19. MVCC reader 如何解释两个版本
+
 `HeapTupleSatisfiesMVCC()` 定义在 `heapam_visibility.c:939-1095`。
 它处理普通 MVCC snapshot。
 更新提交前，一个旧 snapshot 可能仍然看见旧版本。
@@ -707,7 +780,9 @@ index scan 命中某个 TID 后，还要按 HOT chain 规则可能继续追同�
 但 VACUUM/pruning 仍不能移除它。
 必须等 horizon 推进。
 这是 UPDATE 版本链和 bloat 的核心边界。
-## 19. HOT chain、pruning 和 line pointer 的后半段故事
+
+## 20. HOT chain、pruning 和 line pointer 的后半段故事
+
 UPDATE 当场只创建 chain。
 它不负责完整清理 chain。
 HOT 让 index entry 指向 root line pointer。
@@ -732,7 +807,9 @@ UPDATE 失败同页放置时设置 `PD_PAGE_FULL` hint。
 `README.HOT:228-239` 说明不能拿 cleanup lock 就推迟。
 最坏后果通常是本来 HOT-safe 的 update 因空间未集中而只能变成非 HOT。
 这也是 fillfactor 和 autovacuum 对 HOT 命中率有影响的原因。
-## 20. 错误路径和异常边界
+
+## 21. 错误路径和异常边界
+
 第一类错误是 parallel mode。
 `heap_update()` 可能分配 combo CID。
 由于没有机制把 combo CID 映射广播给其他 worker，所以在 parallel mode 下直接 ERROR。
@@ -762,7 +839,9 @@ catalog update 如果需要 combo CID，必须在 WAL 中写 `NEW_CID` record。
 这些边界共同说明：
 UPDATE 的正确性不是一个机制保证的。
 它是 tuple header、transaction status、buffer lock、tuple lock、MultiXact、visibility map、WAL、invalidation 和 pruning horizon 的组合。
-## 21. ownership、cleanup 和 abort 后语义
+
+## 22. ownership、cleanup 和 abort 后语义
+
 `heap_update()` 持有的主要资源有：
 - old buffer pin。
 - old buffer exclusive content lock。
@@ -793,7 +872,9 @@ new tuple 可能在 local memory 中，但 old/new 两个版本最好一次传�
 这就是 UPDATE 能依靠事务 abort 回滚逻辑状态，而不是把 page bytes 物理回写到 update 前状态的原因。
 物理页面可能留下 aborted tuple version 或 aborted xmax。
 语义由 visibility rules 解释。
-## 22. 成本模型：一次 UPDATE 放大了哪些资源
+
+## 23. 成本模型：一次 UPDATE 放大了哪些资源
+
 一次 heap UPDATE 至少写两处状态。
 新 tuple bytes 占用 heap page 空间。
 旧 tuple header 被改写。
@@ -833,7 +914,9 @@ CPU 成本包括：
 它既写新数据，又产生旧版本清理债务。
 HOT 只减少 index 放大。
 它不消除 heap version 链。
-## 23. 跨模块连接
+
+## 24. 跨模块连接
+
 executor 调用 table AM update。
 heap AM 返回 `TM_Result` 和 `TU_UpdateIndexes`。
 这决定 executor 是否重试 EvalPlanQual、报错、更新哪些 indexes。
@@ -852,7 +935,9 @@ replica identity 决定 old key/old tuple 是否进入 WAL。
 catalog update 可能需要 `NEW_CID`。
 catalog heap update 必须把 old/new tuple 传给 invalidation 层。
 它不属于单一模块。
-## 24. 可观测状态：能看见、只能推断、几乎不可见
+
+## 25. 可观测状态：能看见、只能推断、几乎不可见
+
 能直接看见的状态：
 - SQL 层的 `ctid`、`xmin`、`xmax` system columns。
 - `pageinspect` 里的 `t_xmin`、`t_xmax`、`t_ctid`、`t_infomask`、`t_infomask2`。
@@ -878,12 +963,15 @@ catalog heap update 必须把 old/new tuple 传给 invalidation 层。
 所以做诊断时不要只看 `xmax`。
 也不要只看 `n_tup_hot_upd`。
 要把 pageinspect、统计计数、WAL 量、锁等待和源码断点合起来看。
-## 25. 实验一：观察 old xmax、new xmin 和 ctid chain
+
+## 26. 实验一：观察 old xmax、new xmin 和 ctid chain
+
 实验目标：
 看到一次普通 update 如何产生两个 tuple version。
 前提：
 需要 superuser 或有权限使用 `pageinspect`。
 建议在测试库执行。
+
 ```sql
 CREATE EXTENSION IF NOT EXISTS pageinspect;
 
@@ -897,13 +985,17 @@ CREATE TABLE upd_chain (
 INSERT INTO upd_chain VALUES (1, 10, repeat('a', 100));
 SELECT ctid, xmin, xmax, id, v FROM upd_chain;
 ```
+
 记录初始 `ctid`。
 然后执行：
+
 ```sql
 UPDATE upd_chain SET v = 11 WHERE id = 1;
 SELECT ctid, xmin, xmax, id, v FROM upd_chain;
 ```
+
 再看 raw page：
+
 ```sql
 SELECT
     lp,
@@ -916,6 +1008,7 @@ FROM heap_page_items(get_raw_page('upd_chain', 0)) h
 CROSS JOIN LATERAL heap_tuple_infomask_flags(h.t_infomask, h.t_infomask2) f
 ORDER BY lp;
 ```
+
 你应该能看到至少两个 line pointer 上有 tuple。
 旧 tuple 的 `t_xmax` 是 update 事务。
 旧 tuple 的 `t_ctid` 指向新 tuple。
@@ -929,39 +1022,52 @@ ORDER BY lp;
 SQL system column `xmax` 的显示值不足以说明 lock/update 语义。
 要结合 infomask flags。
 也要考虑事务是否已经提交和当前 snapshot。
-## 26. 实验二：用长事务固定旧 snapshot
+
+## 27. 实验二：用长事务固定旧 snapshot
+
 实验目标：
 证明旧 tuple version 不是“多余垃圾”。
 它服务旧 snapshot。
 Session A：
+
 ```sql
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 SELECT ctid, xmin, xmax, id, v FROM upd_chain WHERE id = 1;
 ```
+
 Session B：
+
 ```sql
 UPDATE upd_chain SET v = v + 1 WHERE id = 1;
 COMMIT;
 ```
+
 Session A 再查：
+
 ```sql
 SELECT ctid, xmin, xmax, id, v FROM upd_chain WHERE id = 1;
 ```
+
 Session A 仍然应该看到旧版本的值。
 这是因为 Session A 的 snapshot 早于 Session B 的 update commit。
 Session C 或 Session B 新事务中查询，会看到新版本。
 这时用 pageinspect 看 heap page，会看到版本链。
 再尝试：
+
 ```sql
 VACUUM upd_chain;
 ```
+
 只要 Session A 还开着，旧版本通常不能被完全移除。
 提交 Session A 后再 vacuum，旧版本才可能被 pruning/vacuum 清掉。
 这个实验对应 `HeapTupleSatisfiesVacuum()` 的 horizon 逻辑。
 普通查询可见性和可回收性不是同一个问题。
-## 27. 实验三：HOT 与非 HOT 的分界
+
+## 28. 实验三：HOT 与非 HOT 的分界
+
 实验目标：
 观察同页非索引列 update 和索引列 update 的差别。
+
 ```sql
 DROP TABLE IF EXISTS hot_demo;
 CREATE TABLE hot_demo (
@@ -978,7 +1084,9 @@ FROM generate_series(1, 100) g;
 
 SELECT pg_stat_reset_single_table_counters('hot_demo'::regclass);
 ```
+
 先更新非索引列：
+
 ```sql
 UPDATE hot_demo SET v = v + 1 WHERE id BETWEEN 1 AND 20;
 SELECT pg_stat_clear_snapshot();
@@ -986,8 +1094,10 @@ SELECT n_tup_upd, n_tup_hot_upd
 FROM pg_stat_user_tables
 WHERE relname = 'hot_demo';
 ```
+
 如果同页空间足够，`n_tup_hot_upd` 应该增长。
 再更新索引列：
+
 ```sql
 UPDATE hot_demo SET k = k + 1000 WHERE id BETWEEN 21 AND 40;
 SELECT pg_stat_clear_snapshot();
@@ -995,6 +1105,7 @@ SELECT n_tup_upd, n_tup_hot_upd
 FROM pg_stat_user_tables
 WHERE relname = 'hot_demo';
 ```
+
 第二次 update 会修改 `k`。
 `k` 被 btree index 使用。
 这会阻止普通 HOT。
@@ -1006,10 +1117,13 @@ WHERE relname = 'hot_demo';
 HOT 减少 index entry 写入。
 非 HOT 增加 index 维护。
 二者都会增加 heap tuple versions。
-## 28. 实验四：tuple lock 和 MultiXact 边界
+
+## 29. 实验四：tuple lock 和 MultiXact 边界
+
 实验目标：
 看到 `xmax` 可以是 lock-only 或 MultiXact，而不是 update/delete。
 准备：
+
 ```sql
 DROP TABLE IF EXISTS lock_demo;
 CREATE TABLE lock_demo (
@@ -1019,23 +1133,31 @@ CREATE TABLE lock_demo (
 
 INSERT INTO lock_demo VALUES (1, 10);
 ```
+
 Session A：
+
 ```sql
 BEGIN;
 SELECT * FROM lock_demo WHERE id = 1 FOR KEY SHARE;
 ```
+
 Session B：
+
 ```sql
 BEGIN;
 SELECT * FROM lock_demo WHERE id = 1 FOR KEY SHARE;
 ```
+
 Session C：
+
 ```sql
 UPDATE lock_demo SET v = v + 1 WHERE id = 1;
 ```
+
 这个 update 不修改 key。
 它可以与 key-share lockers 兼容。
 随后在另一个 session 查看 page：
+
 ```sql
 SELECT
     lp,
@@ -1048,6 +1170,7 @@ FROM heap_page_items(get_raw_page('lock_demo', 0)) h
 CROSS JOIN LATERAL heap_tuple_infomask_flags(h.t_infomask, h.t_infomask2) f
 ORDER BY lp;
 ```
+
 你可能看到 `HEAP_XMAX_IS_MULTI` 和 `HEAP_XMAX_LOCK_ONLY` 相关 flags。
 具体是否形成 MultiXact 取决于 timing、是否两个 lockers 都仍然存活、以及 update 观察到的 header 状态。
 这个实验的重点不是固定一个输出。
@@ -1056,22 +1179,28 @@ ORDER BY lp;
 多个 locker 会把 raw `xmax` 变成 MultiXactId。
 非 key update 会尽量保留 key-share lockers，而不是无条件等待。
 源码断点建议：
+
 ```text
 break heap_update
 break compute_new_xmax_infomask
 break GetMultiXactIdHintBits
 break MultiXactIdWait
 ```
+
 观察 `old_infomask`、`old_infomask2`、`mode`、`is_update` 和输出的 `result_xmax`。
-## 29. 源码跟读练习
+
+## 30. 源码跟读练习
+
 练习一：画出一次普通 HOT update 的状态表。
 断点：
+
 ```text
 heap_update
 RelationPutHeapTuple
 log_heap_update
 heap_xlog_update
 ```
+
 需要记录：
 - old TID。
 - new TID。
@@ -1094,11 +1223,13 @@ heap_xlog_update
 方法：
 构造需要 TOAST 的新 tuple，或者让 same page 放不下。
 断点：
+
 ```text
 heap_update
 compute_new_xmax_infomask
 XLogInsert
 ```
+
 观察：
 - 第一次 `compute_new_xmax_infomask(..., is_update=false)`。
 - `XLOG_HEAP_LOCK`。
@@ -1106,15 +1237,19 @@ XLogInsert
 - 后续真正 update 时 old `t_ctid = new t_self`。
 练习四：验证 chain 追踪安全检查。
 断点：
+
 ```text
 heap_get_latest_tid
 ```
+
 观察：
 - `priorXmax` 如何从前一个 tuple 的 update xid 得到。
 - 目标 tuple 的 `xmin` 如何与 `priorXmax` 比较。
 - line pointer 非 normal 时如何停止。
 这个练习对应 `htup_details.h:96-103` 的注释。
-## 30. 常见误区
+
+## 31. 常见误区
+
 误区一：
 `xmax` 有值表示 tuple 已删除。
 正确说法：
@@ -1148,7 +1283,9 @@ HOT root/index TID 与可见 heap-only tuple 之间还可能有 redirect。
 HOT 减少 index 放大。
 heap 版本链仍然存在。
 如果 horizon 不推进或 pruning 失败，heap bloat 仍会增长。
-## 31. 讨论题
+
+## 32. 讨论题
+
 1. 为什么 `UPDATE` 不能只把旧 tuple 的用户列值改掉？
 2. 如果 old tuple 的 `xmax` 是 MultiXact，为什么 `HeapTupleHeaderGetUpdateXid()` 可能触发 I/O？
 3. 为什么 non-key update 可以和 `FOR KEY SHARE` 并发？
@@ -1157,8 +1294,11 @@ heap 版本链仍然存在。
 6. 为什么 HOT chain 不能跨 heap page？
 7. 为什么沿 `t_ctid` 追链时要验证 `new.xmin == old.update_xmax`？
 8. 为什么 old tuple 已经对当前 query 不可见，也未必能被 VACUUM 立即移除？
-## 32. 本节小结
+
+## 33. 本节小结
+
 本节的核心链路是：
+
 ```text
 heap_update()
   -> interpret old tuple visibility and locks
@@ -1174,6 +1314,7 @@ heap_update()
   -> WAL log update
   -> return index maintenance decision
 ```
+
 核心状态是四组字段。
 第一组是 old tuple：
 `xmax`、`infomask`、`infomask2`、`cmax`、`t_ctid`。

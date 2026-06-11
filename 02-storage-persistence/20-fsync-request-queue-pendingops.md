@@ -1,9 +1,6 @@
 # PostgreSQL fsync request queue 与 pending operations
 
 ## 课程定位
-本节主题：backend 写 relation 文件以后，PostgreSQL 如何把“这个文件段需要 fsync”的责任交给 checkpointer，并在 checkpoint 的同步阶段兑现这个责任。
-本节只讲一条主线：`md.c` 写文件，`checkpointer.c` 投递和吸收 fsync request，`sync.c` 维护 pending operations，checkpoint 最后完成 data file fsync 与 delayed unlink。
-本节主流程：`mdwritev()` / `mdextend()` 登记 dirty segment -> `RegisterSyncRequest()` 投递 request -> checkpointer `AbsorbSyncRequests()` 记入 `pendingOps` / `pendingUnlinks` -> checkpoint sync phase 执行 fsync 或合法 cancel -> post-checkpoint cleanup delayed unlink。
 
 本节唯一主问题：
 data page 已经被 backend、bgwriter 或 checkpointer 写进内核 page cache 后，PostgreSQL 怎样保证 checkpoint 对外承诺完成之前，对应 relation segment 已经被 fsync 或被合法取消？
@@ -28,9 +25,30 @@ data page 已经被 backend、bgwriter 或 checkpointer 写进内核 page cache 
 - fsync failure 为什么不能被静默忽略。
 - 如果漏登记 fsync、过早 unlink 或 truncate 后不 fsync，会出现什么崩溃持久化漏洞。
 
-## 源码基线
-源码仓库：`/home/nail/postgres-lab`
+源码基线：本课使用当前实际源码路径 `/home/highgo/postgres`，branch `master`，commit `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`；核心源码分工见第 3 节。
+
+## 1. 本节在总主线中的位置
+
+前面已经说明 data page write 和 WAL-before-data 的关系，但 `write()` 到内核 page cache 还不是 durability。本节把 relation segment 写出之后的责任继续向后追：普通 backend 怎样把需要 fsync 的文件身份交给 checkpointer，checkpointer 又怎样在 checkpoint sync phase 兑现。
+
+## 2. 核心矛盾与一句话运行模型
+
+一句话运行模型：
+
+```text
+mdwritev/mdextend 写 relation segment 后构造 FileTag 并调用 RegisterSyncRequest；普通 backend 把请求放入 checkpointer 共享队列，checkpointer 吸收到本地 pendingOps/pendingUnlinks，ProcessSyncRequests 在 checkpoint sync phase 对本轮 FileTag 执行 fsync 或合法取消。
+```
+
+核心矛盾是：前台不能每次 relation write 后同步 fsync，但 checkpoint 一旦发布新的 redo 边界，就不能丢掉此前应持久化的数据文件变化。
+
+## 3. 核心文件分工与阅读顺序
+
+本节把源码基线、重点入口和辅助核对路径集中放在这里，避免课程定位之后再漂一个未编号大节。
+
+源码仓库：`/home/highgo/postgres`
+
 基线：`master` = `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`
+
 本节重点阅读：
 - `src/backend/storage/sync/sync.c`
 - `src/include/storage/sync.h`
@@ -46,9 +64,8 @@ data page 已经被 backend、bgwriter 或 checkpointer 写进内核 page cache 
 - `src/include/storage/smgr.h`
 - `src/include/storage/fd.h`
 
----
+## 4. 主流程入口：dirty segment 到 pending fsync
 
-## 1. 先给结论
 当前基线里没有 `RegisterSyncRequestType()` 这个函数。
 真实入口是 `RegisterSyncRequest(const FileTag *ftag, SyncRequestType type, bool retryOnError)`。
 `SyncRequestType` 是枚举，不是函数。
@@ -76,7 +93,8 @@ data page 已经被 backend、bgwriter 或 checkpointer 写进内核 page cache 
 这套机制解决的不是“buffer 是否 dirty”。
 它解决的是：某个进程已经把脏页写进内核 page cache 后，谁负责在 checkpoint 完成前把对应 data file fsync 到稳定存储。
 
-## 2. 写和 fsync 是两件事
+## 5. 写和 fsync 是两件事
+
 `FlushBuffer()` 写 data page 之前会先按 page LSN 调用 `XLogFlush()`。
 这是 WAL-before-data 的边界。
 随后它调用 `smgrwrite(..., false)`。
@@ -95,7 +113,8 @@ checkpoint 完成之前，checkpointer 会集中执行这些 fsync。
 如果 checkpointer queue 满了，并且 compact 后仍无法投递，backend 会 fallback 自己 fsync。
 所以 correctness 规则是：写完 relation 文件后，要么成功投递 fsync request，要么当前 backend 自己完成 fsync。
 
-## 3. `FileTag` 是请求身份
+## 6. `FileTag` 是请求身份
+
 `src/include/storage/sync.h` 定义了 `FileTag`。
 它当前包含：
 - `handler`
@@ -116,7 +135,8 @@ fd 是进程本地资源。
 queue 必须保存跨进程可解释的文件身份。
 这就是 `FileTag` 的作用。
 
-## 4. 两层 pending：共享队列与本地表
+## 7. 两层 pending：共享队列与本地表
+
 本节最容易混淆的是 pending 到底在哪里。
 第一层在 `checkpointer.c`。
 这是共享内存里的 request queue。
@@ -143,7 +163,8 @@ entry 是 `PendingFsyncEntry`。
 它保存 checkpoint 完成后才能 unlink 的文件。
 `pendingUnlinks` 用链表，不用 hash table，因为源码假设 unlink request 不常重复。
 
-## 5. `storage.c` 也有 pending，但不是同一个
+## 8. `storage.c` 也有 pending，但不是同一个
+
 `src/backend/catalog/storage.c` 中有 `pendingSyncHash`。
 它不是 checkpointer fsync queue。
 它也不是 `sync.c` 的 `pendingOps`。
@@ -161,12 +182,15 @@ entry 是 `PendingFsyncEntry`。
 本节主线是 checkpoint-time sync。
 不要把 `pendingSyncHash` 和 `pendingOps` 混为一谈。
 
-## 6. `InitSync()`：普通 backend 没有 `pendingOps`
+## 9. `InitSync()`：普通 backend 没有 `pendingOps`
+
 `sync.c` 的 `InitSync()` 只在两类进程中创建 `pendingOps`。
 条件是：
+
 ```c
 if (!IsUnderPostmaster || AmCheckpointerProcess())
 ```
+
 也就是 standalone backend 或 checkpointer auxiliary process。
 普通 backend 在 postmaster 管理下运行。
 它不会创建本地 `pendingOps`。
@@ -181,7 +205,8 @@ standalone 模式没有 checkpointer。
 源码选择在这种场景下 PANIC。
 这是持久化 correctness 的要求，不是普通内存分配策略。
 
-## 7. `RegisterSyncRequest()` 的分支
+## 10. `RegisterSyncRequest()` 的分支
+
 `RegisterSyncRequest()` 先看 `pendingOps` 是否存在。
 如果存在，说明当前进程可以本地记录请求。
 它直接调用 `RememberSyncRequest(ftag, type)`。
@@ -196,7 +221,8 @@ standalone 模式没有 checkpointer。
 unlink、forget、filter 通常使用 `true`。
 因为这些请求是删除协议的一部分，不能简单本地替代。
 
-## 8. `ForwardSyncRequest()`：共享 ring queue
+## 11. `ForwardSyncRequest()`：共享 ring queue
+
 `ForwardSyncRequest()` 在 `checkpointer.c`。
 它是普通 backend 投递 sync request 的函数。
 它先检查是否在 postmaster 下。
@@ -215,7 +241,8 @@ unlink、forget、filter 通常使用 `true`。
 `MAX_CHECKPOINT_REQUESTS` 是 `10000000`。
 队列大小与 `NBuffers` 相关，是因为每个 shared buffer 写出都可能生成 fsync request。
 
-## 9. 为什么队列允许重复
+## 12. 为什么队列允许重复
+
 `ForwardSyncRequest()` 通常不在 backend 侧去重。
 源码注释说，这是为了避免长时间持有 `CheckpointerCommLock`。
 backend 写路径很热。
@@ -233,7 +260,8 @@ compact 会用临时 hash table 找重复的 `CheckpointerRequest`。
 compact 不能改变这些请求的相对语义。
 这就是 fsync queue compact 的 correctness 边界。
 
-## 10. `AbsorbSyncRequests()`：从共享队列搬到本地
+## 13. `AbsorbSyncRequests()`：从共享队列搬到本地
+
 checkpointer 不直接在共享 queue 上 fsync。
 它先调用 `AbsorbSyncRequests()`。
 这个函数只在 checkpointer 进程中做事。
@@ -253,7 +281,8 @@ checkpointer 不直接在共享 queue 上 fsync。
 丢失 fsync request 会让 checkpoint 错误成功。
 所以源码要求这种失败必须 PANIC。
 
-## 11. `RememberSyncRequest()`：四类请求落地
+## 14. `RememberSyncRequest()`：四类请求落地
+
 `RememberSyncRequest()` 是 checkpointer side 的落表函数。
 它要求 `pendingOps` 已存在。
 收到 `SYNC_REQUEST` 时，它在 `pendingOps` 中 `HASH_ENTER`。
@@ -275,7 +304,8 @@ handler 相同且 `sync_filetagmatches()` 返回 true 的 entry 会 canceled。
 delayed unlink requests 进入 `pendingUnlinks`。
 forget/filter 是取消语义。
 
-## 12. `ProcessSyncRequests()`：执行 pending fsync
+## 15. `ProcessSyncRequests()`：执行 pending fsync
+
 `ProcessSyncRequests()` 是 checkpoint sync phase 的核心。
 它只应该在拥有 `pendingOps` 的进程中运行。
 如果没有 `pendingOps`，它 ERROR。
@@ -295,7 +325,8 @@ backend 在清 dirty bit 前会登记 fsync request。
 旧 entry 会调用 handler 的 sync callback。
 成功后从 `pendingOps` 删除。
 
-## 13. `sync_cycle_ctr` 的失败恢复
+## 16. `sync_cycle_ctr` 的失败恢复
+
 `ProcessSyncRequests()` 有一个静态变量 `sync_in_progress`。
 进入 fsync loop 前，它设置为 true。
 函数成功结束后，它设置为 false。
@@ -308,7 +339,8 @@ backend 在清 dirty bit 前会登记 fsync request。
 这条路径正常系统很少走。
 但它说明 pending ops 表必须能承受 checkpoint sync 中途失败。
 
-## 14. `syncsw[]` 与 md handler
+## 17. `syncsw[]` 与 md handler
+
 `sync.c` 不知道 relation path 怎么拼。
 它通过 `syncsw[]` 函数表调用 handler。
 `SYNC_HANDLER_MD` 的回调是：
@@ -316,9 +348,11 @@ backend 在清 dirty bit 前会登记 fsync request。
 - `mdunlinkfiletag`
 - `mdfiletagmatches`
 `ProcessSyncRequests()` 对 fsync entry 调用：
+
 ```c
 syncsw[entry->tag.handler].sync_syncfiletag(&entry->tag, path)
 ```
+
 对 relation 文件，这就是 `mdsyncfiletag()`。
 `mdsyncfiletag()` 通过 `FileTag` 打开或复用目标 segment 文件。
 然后调用 `FileSync(file, WAIT_EVENT_DATA_FILE_SYNC)`。
@@ -326,7 +360,8 @@ syncsw[entry->tag.handler].sync_syncfiletag(&entry->tag, path)
 它还把 path 写到输出 buffer，用于错误信息。
 这说明 queue 中保存的是文件身份，而不是 fd。
 
-## 15. `md.c` 的登记点
+## 18. `md.c` 的登记点
+
 relation 文件的底层写入在 `md.c`。
 本节关注这些函数：
 - `mdextend()`
@@ -346,15 +381,18 @@ relation 文件的底层写入在 `md.c`。
 它遍历 active 和 inactive segments，并对每个 segment 调用 `register_dirty_segment()`。
 这在 bulk write 路径中很重要。
 
-## 16. `register_dirty_segment()` 的 fallback
+## 19. `register_dirty_segment()` 的 fallback
+
 `register_dirty_segment()` 是 `md.c` 中的静态函数。
 它用 `INIT_MD_FILETAG()` 构造 `FileTag`。
 然后断言 temp relation 不应到这里。
 temp relation 不需要 fsync，也不需要 delayed unlink 保护。
 它调用：
+
 ```c
 RegisterSyncRequest(&tag, SYNC_REQUEST, false)
 ```
+
 这里 `retryOnError=false`。
 如果返回 true，请求已经本地记录或成功投递给 checkpointer。
 如果返回 false，说明无法投递。
@@ -365,7 +403,8 @@ RegisterSyncRequest(&tag, SYNC_REQUEST, false)
 queue 满会让 backend 做昂贵的本地 fsync。
 这是性能退化，不是允许丢请求。
 
-## 17. `mdunlink()` 的 delayed unlink
+## 20. `mdunlink()` 的 delayed unlink
+
 `mdunlink()` 的注释是本节关键。
 普通 relation drop 时，main fork 的第一个 segment 不会直接 unlink。
 它会先 truncate 到 0。
@@ -388,11 +427,14 @@ checkpoint 完成后，旧删除已经越过恢复边界。
 temp relation 也不用这套 dance。
 redo 场景也可以立即删除，因为 redo 中不会创建冲突的新 relation。
 
-## 18. `pendingUnlinks` 与 `checkpoint_cycle_ctr`
+## 21. `pendingUnlinks` 与 `checkpoint_cycle_ctr`
+
 `register_unlink_segment()` 调用：
+
 ```c
 RegisterSyncRequest(&tag, SYNC_UNLINK_REQUEST, true)
 ```
+
 这里 `retryOnError=true`。
 delayed unlink request 不能因为 queue 满而丢。
 `RememberSyncRequest()` 收到 `SYNC_UNLINK_REQUEST` 后，append 一个 `PendingUnlinkEntry` 到 `pendingUnlinks`。
@@ -406,13 +448,16 @@ checkpoint 过程中才来的 unlink request 会记录新 counter。
 因为新 entry append 在链表尾部，遍历可以停止。
 这个 counter 保证文件不会在覆盖它的 checkpoint 完成前被删除。
 
-## 19. `SYNC_FORGET_REQUEST`
+## 22. `SYNC_FORGET_REQUEST`
+
 forget request 取消一个具体 `FileTag` 的 pending fsync。
 md 层入口是 `register_forget_request()`。
 它调用：
+
 ```c
 RegisterSyncRequest(&tag, SYNC_FORGET_REQUEST, true)
 ```
+
 删除额外 segment 前，`mdunlinkfork()` 会先发 forget。
 普通立即删除路径也会先 forget，再 unlink。
 为什么不能等 fsync 时看到 ENOENT 就忽略？
@@ -424,16 +469,19 @@ checkpointer absorb 后把对应 `pendingOps` entry 标记为 canceled。
 如果没有合法 cancel，第二次失败会报错。
 所以 forget request 是“这个 fsync 不再需要”的证明。
 
-## 20. `SYNC_FILTER_REQUEST`
+## 23. `SYNC_FILTER_REQUEST`
+
 filter request 取消一批请求。
 md handler 的 match 函数是 `mdfiletagmatches()`。
 当前实现按 database OID 匹配。
 `ForgetDatabaseSyncRequests(Oid dbid)` 构造一个特殊 `FileTag`。
 它只关心 `rlocator.dbOid`。
 然后调用：
+
 ```c
 RegisterSyncRequest(&tag, SYNC_FILTER_REQUEST, true)
 ```
+
 `RememberSyncRequest()` 收到 filter request 后遍历 `pendingOps`。
 匹配的 fsync entry 被标 canceled。
 它还遍历 `pendingUnlinks`。
@@ -442,7 +490,8 @@ RegisterSyncRequest(&tag, SYNC_FILTER_REQUEST, true)
 drop database 删除整个数据库目录前，必须让 checkpointer 忘记该 database 相关的 pending fsync 和 pending unlink。
 否则 checkpointer 之后可能尝试 fsync 或 unlink 已经删除的路径。
 
-## 21. `mdtruncate()` 为什么登记 fsync
+## 24. `mdtruncate()` 为什么登记 fsync
+
 truncate 改变文件长度。
 文件长度变化也需要持久化。
 `mdtruncate()` 从最后一个打开 segment 往前处理。
@@ -457,7 +506,8 @@ truncate 改变文件长度。
 这会破坏 relation size、FSM、visibility map 或页面可见性假设。
 所以 truncate 后必须让 checkpoint sync phase fsync 对应 segment。
 
-## 22. `RelationTruncate()` 的两个 delay flag
+## 25. `RelationTruncate()` 的两个 delay flag
+
 `RelationTruncate()` 在 `storage.c`。
 它处理 relation-level truncate。
 源码注释说明它和 checkpoint 有两类 race。
@@ -469,16 +519,19 @@ truncate 改变文件长度。
 如果 truncate WAL record 早于并发 checkpoint 的 redo pointer，但 sync request 晚于该 checkpoint 的 `ProcessSyncRequests()`，checkpoint 就会漏掉文件长度 fsync。
 所以还需要 `DELAY_CHKPT_START`。
 `RelationTruncate()` 设置：
+
 ```c
 MyProc->delayChkptFlags |= DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE;
 ```
+
 如果 relation needs WAL，它先写 `XLOG_SMGR_TRUNCATE`。
 然后 `XLogFlush(lsn)`。
 之后在 critical section 中调用 `smgrtruncate()`。
 完成后清掉两个 delay flags。
 这说明 truncate 同时跨越 WAL、buffer、文件长度和 checkpoint 边界。
 
-## 23. checkpoint 同步顺序
+## 26. checkpoint 同步顺序
+
 checkpoint 主入口是 `CreateCheckPoint()`。
 完整细节在 `xlog.c`。
 本节只关心同步顺序：
@@ -509,7 +562,8 @@ delayed unlink 在 checkpoint record flush 和 control file 更新之后。
 不能把 `ProcessSyncRequests()` 放在 `CheckPointBuffers()` 前。
 否则 write phase 产生的 fsync request 可能漏掉。
 
-## 24. `BufferSync()` 与 backend write race
+## 27. `BufferSync()` 与 backend write race
+
 `BufferSync()` 先扫描 buffer pool。
 它给 checkpoint 开始时需要写的 dirty buffers 标记 `BM_CHECKPOINT_NEEDED`。
 checkpoint 过程中后来变 dirty 的 buffers 不属于本轮 checkpoint。
@@ -526,7 +580,8 @@ checkpoint 过程中后来变 dirty 的 buffers 不属于本轮 checkpoint。
 这解释了 `ProcessSyncRequests()` 开头的 `AbsorbSyncRequests()`。
 如果 backend 在 checkpointer 扫描期间帮忙写出了 checkpoint-needed buffer，checkpointer 在 `BufferSync()` 之后 absorb，就能看到它的 fsync request。
 
-## 25. checkpoint 期间持续 absorb
+## 28. checkpoint 期间持续 absorb
+
 checkpointer 不只在 `ProcessSyncRequests()` 开头吸收请求。
 `CheckpointerMain()` 主循环会 absorb。
 `CheckpointWriteDelay()` 控速时会 absorb。
@@ -541,7 +596,8 @@ checkpointer 不只在 `ProcessSyncRequests()` 开头吸收请求。
 queue 满会让 backend fallback 自己 fsync。
 这会显著拖慢写路径。
 
-## 26. fsync failure 处理
+## 29. fsync failure 处理
+
 `ProcessSyncRequests()` 对每个旧 entry 调用 handler sync。
 如果 `enableFsync` 为 false，它跳过实际 fsync。
 这符合 `fsync=off` 的配置语义，但这会放弃正常 crash 持久性保证。
@@ -557,7 +613,8 @@ Windows 上还包括 `EACCES`。
 所以 ENOENT 不是无条件忽略。
 只有删除路径提供了合法 cancel，fsync 缺失才被视为正常。
 
-## 27. checkpoint failure 与 PANIC
+## 30. checkpoint failure 与 PANIC
+
 fsync error 在 checkpoint 中通常会让 checkpoint 失败。
 `CheckpointerMain()` 捕获 checkpoint ERROR 后，会更新共享状态。
 它递增 `ckpt_failed`。
@@ -571,7 +628,8 @@ fsync error 在 checkpoint 中通常会让 checkpoint 失败。
 继续运行可能让 checkpoint 错误成功。
 PANIC 触发重启和 crash recovery，比继续提交错误状态安全。
 
-## 28. immediate sync 与 queued sync
+## 31. immediate sync 与 queued sync
+
 不是所有写入都适合只登记 queued sync。
 `smgrimmedsync()` 是立即 sync 某个 relation fork。
 md handler 对应 `mdimmedsync()`。
@@ -589,7 +647,8 @@ bulk write 也会在某些情况下 immediate sync。
 此时不能只 `smgrregistersync()` 给未来 checkpoint。
 必须 `smgrimmedsync()`。
 
-## 29. 反例一：漏登记 fsync
+## 32. 反例一：漏登记 fsync
+
 假设 `mdwritev()` 写 permanent relation 成功后没有调用 `register_dirty_segment()`。
 随后 checkpoint 发生。
 `BufferSync()` 看到 buffer 已 clean。
@@ -606,7 +665,8 @@ crash 后磁盘仍是旧 page。
 它不需要磁盘损坏。
 只需要未 fsync 的写入在 crash 后丢失。
 
-## 30. 反例二：过早 unlink main fork 首段
+## 33. 反例二：过早 unlink main fork 首段
+
 假设 `mdunlink()` 删除普通 relation 时直接 unlink main fork 第一个 segment。
 旧 relfilenumber 文件名马上消失。
 随后新 relation 复用同一个 relfilenumber。
@@ -619,7 +679,8 @@ PostgreSQL 用 0 长度占位文件阻止这个 relfilenumber 复用。
 checkpoint 完成后再 unlink。
 这就是 delayed unlink 的 crash recovery contract。
 
-## 31. 反例三：truncate 后不 fsync 文件长度
+## 34. 反例三：truncate 后不 fsync 文件长度
+
 假设 relation 从 10000 blocks truncate 到 100 blocks。
 WAL 记录了 truncate。
 buffer manager 丢弃了尾部 buffers。
@@ -635,7 +696,8 @@ checkpoint 成功。
 所以 `mdtruncate()` 必须登记 fsync。
 `RelationTruncate()` 还必须用 delay checkpoint flags 避免并发 checkpoint 漏掉该 sync。
 
-## 32. 反例四：随便忽略 ENOENT
+## 35. 反例四：随便忽略 ENOENT
+
 假设 `ProcessSyncRequests()` 对 fsync ENOENT 直接忽略。
 这似乎解决了 drop relation race。
 但它也会掩盖真实错误。
@@ -651,7 +713,8 @@ recovery 之后可能缺少本应存在的数据文件内容。
 删除路径必须先通知 checkpointer。
 fsync 路径不能自己猜测“文件没了就是正常”。
 
-## 33. request 类型速查
+## 36. request 类型速查
+
 `SYNC_REQUEST` 的典型入口是 `register_dirty_segment()`。
 它也可由 `mdregistersync()` 间接产生。
 它表示某个 segment 需要 fsync。
@@ -666,7 +729,8 @@ fsync 路径不能自己猜测“文件没了就是正常”。
 普通 dirty sync 可以 fallback backend fsync。
 unlink、forget、filter 必须可靠投递。
 
-## 34. 从 UPDATE 到 fsync queue
+## 37. 从 UPDATE 到 fsync queue
+
 一次普通 UPDATE 修改 heap page。
 heap AM 生成 WAL。
 page LSN 更新。
@@ -686,7 +750,8 @@ checkpoint sync phase 调用 `ProcessSyncRequests()`。
 md handler 最终 `FileSync()`。
 checkpoint record 最后才写出和 flush。
 
-## 35. 从 DROP 到 delayed unlink
+## 38. 从 DROP 到 delayed unlink
+
 `RelationDropStorage()` 把 relation 加入 `pendingDeletes`。
 事务提交时 `smgrDoPendingDeletes(true)` 处理删除。
 它调用 smgr unlink。
@@ -704,7 +769,8 @@ md handler 进入 `mdunlink()`。
 3. 立即 unlink。
 这两个路径的差别来自 relfilenumber 复用保护。
 
-## 36. 从 TRUNCATE 到 fsync
+## 39. 从 TRUNCATE 到 fsync
+
 `RelationTruncate()` 准备 main fork、FSM fork、visibility map fork。
 它调用 `RelationPreTruncate(rel)`。
 它设置 checkpoint delay flags。
@@ -724,7 +790,8 @@ checkpoint sync phase fsync 对应 segment。
 - 文件 truncate 必须执行。
 - 文件长度变化必须在 checkpoint 完成前 fsync。
 
-## 37. pending ops 不是 WAL
+## 40. pending ops 不是 WAL
+
 fsync request queue 不写 WAL。
 `pendingOps` 也不写 WAL。
 它们是内存结构。
@@ -740,7 +807,8 @@ fsync request queue 不写 WAL。
 但运行时不能丢请求。
 所以 `AbsorbSyncRequests()` 清共享队列后不能失败后继续运行。
 
-## 38. bgwriter 与 WAL writer 的边界
+## 41. bgwriter 与 WAL writer 的边界
+
 background writer 也会写 dirty buffers。
 它的目标是提前制造 reusable clean buffers。
 它不是 checkpoint correctness 的最终负责人。
@@ -755,7 +823,8 @@ checkpoint record 之前需要 data file fsync。
 WAL writer 优化前者。
 checkpointer sync manager 保障后者。
 
-## 39. 生命周期 / ownership / cleanup
+## 42. 生命周期 / ownership / cleanup
+
 fsync request 的生命周期从 `md.c` 写文件后开始。`register_dirty_segment()` 构造 `FileTag`，普通 backend 通过 `RegisterSyncRequest(SYNC_REQUEST, retryOnError=false)` 交给 checkpointer；如果 queue 满且 compact 后仍无法投递，backend 必须 fallback 自己 `FileSync()`。
 
 共享 queue 只是投递通道，owner 是 checkpointer shared memory。真正的 pending state 在 checkpointer 本地 `pendingOps` hash table，key 是 `FileTag`，entry 记录 cycle 和 cancel 状态。checkpoint sync phase 成功处理后，entry 被移除。
@@ -764,14 +833,16 @@ unlink 是另一条生命周期。`SYNC_UNLINK_REQUEST` 进入 `pendingUnlinks`�
 
 cleanup 的关键边界是：pending ops 不写 WAL。checkpoint 未完成就 crash，恢复从旧 checkpoint 开始 replay；checkpoint 一旦完成，所有本轮应 fsync 的 data file 必须已经 fsync 或合法 cancel。
 
-## 40. 成本、资源与观测诊断
+## 43. 成本、资源与观测诊断
+
 成本来自三处：共享 request queue 的争用和 compact，checkpointer 本地 `pendingOps` 的 hash 合并和遍历，以及 sync phase 的真实 fsync latency。变量包括 dirty relation segment 数、backend 写入并发、checkpoint 频率、WAL 产生速度、磁盘 flush latency、unlink/filter 请求数量。
 
 资源压力会传播：backend 写 buffer 触发 md dirty request；bgwriter 和 checkpointer 写 buffer 也走同一路径；queue 满会把 fsync 延迟推回前台 backend；sync phase 变慢会拉长 checkpoint total time，并影响 WAL 回收、redo distance 和后续 checkpoint 压力。
 
 能直接观察的是 checkpoint 日志中的 write/sync/total time、`pg_stat_bgwriter`/`pg_stat_checkpointer` 相关累计、`pg_stat_io` 的 data file fsync/write、wait event 和 `log_checkpoints`。只能推断的是 queue 压力、`pendingOps` entry 数、compact 触发次数和合法 cancel 是否刚好发生；这些需要 gdb 断点或临时 instrumentation。
 
-## 41. 常见误区
+## 44. 常见误区
+
 - write 成功不等于持久化；没有 fsync，crash 后仍可能丢。
 - checkpoint 写出 dirty buffers 不够；还必须处理 `ProcessSyncRequests()`。
 - 共享 queue 不是最终状态；最终 pending fsync 在 checkpointer 本地 `pendingOps`。
@@ -779,11 +850,12 @@ cleanup 的关键边界是：pending ops 不写 WAL。checkpoint 未完成就 cr
 - fsync 的 ENOENT 不能无条件忽略；必须由 forget/filter cancel 解释。
 - queue 满不是 correctness 失败；正确 fallback 是当前 backend 自己 fsync。
 
-## 42. 课堂实验
+## 45. 课堂实验
+
 实验 1：确认当前基线真实命名。
 
 ```bash
-cd /home/nail/postgres-lab
+cd /home/highgo/postgres
 rg -n "RegisterSyncRequest|RegisterSyncRequestType|SyncRequestType" \
   src/include/storage/sync.h src/backend/storage/sync/sync.c
 ```
@@ -813,7 +885,8 @@ CHECKPOINT;
 
 观察 checkpoint complete 日志中的 write time、sync time、total time。再用 gdb 断点 `register_dirty_segment`、`RegisterSyncRequest`、`ForwardSyncRequest`、`RememberSyncRequest` 对齐一次 request 的流转。
 
-## 43. 讨论题
+## 46. 讨论题
+
 1. 为什么 fsync request 的粒度是 relation fork segment，而不是 relation 或 fd？
 2. 为什么普通 backend 没有本地 `pendingOps`，而 checkpointer 有？
 3. queue 允许重复请求会带来什么成本？为什么仍然可以接受？
@@ -823,7 +896,8 @@ CHECKPOINT;
 7. pending ops 为什么不需要 crash 后恢复？
 8. 哪些指标能看到 sync phase 变慢，哪些内部状态只能断点或推断？
 
-## 44. 本节小结
+## 47. 本节小结
+
 本节核心链路是：relation 文件写成功后，`md.c` 构造 `FileTag`，通过 `RegisterSyncRequest()` 投递 fsync 责任；checkpointer absorb 到 `pendingOps`；checkpoint sync phase 调 handler fsync；checkpoint 完成后再处理 delayed unlink。
 
 核心状态边界是：共享 queue 是跨进程投递通道，`pendingOps` 是 checkpointer 本地 truth，`pendingUnlinks` 保存 checkpoint 后才能删除的对象。`FileTag` 用 handler、locator、fork 和 segment 表达跨进程文件身份，不能保存 fd。

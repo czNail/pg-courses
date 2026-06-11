@@ -10,50 +10,50 @@
 一个 relation fork 的 block 如何在 shared/local buffer 中获得稳定身份，并在 slot 复用、I/O、pin、content lock 同时发生时不被认错？
 ```
 
-核心矛盾：
+核心矛盾：buffer pool slot 必须被不断复用，才能用有限内存缓存无限磁盘页；但同一时刻，一个磁盘 block 又必须只有一个可被并发 backend 查到、pin 住、等待 I/O、访问内容的 buffer identity。
+
+一句话运行模型：
 
 ```text
-buffer pool slot 必须被不断复用，才能用有限内存缓存无限磁盘页；
-但同一时刻，一个磁盘 block 又必须只有一个可被并发 backend 查到、pin 住、等待 I/O、访问内容的 buffer identity。
+磁盘身份由 BufferTag 表达，cache slot 由 BufferDesc.buf_id 和 Buffer handle 表达，page bytes 位于 BufferBlocks / LocalBufferBlockPointers，并发状态在 BufferDesc.state 中，本 backend 的使用生命周期由 private refcount 与 ResourceOwner 兜住。
 ```
 
-本节只回答 identity 的问题。
+学完后应能判断：`Buffer` 为什么只是 handle，不是磁盘页身份；`BM_TAG_VALID` 和 `BM_VALID` 为什么是两个阶段；shared buffer 与 local buffer 为什么使用不同 identity 边界。
 
-它不展开 partition lock 的竞争细节。
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。
 
-它不展开 clock sweep 的 victim 选择。
+## 1. 本节在总主线中的位置
 
-它不展开 content lock 的完整协议。
+第二个目录进入 storage persistence 主线。第 1 节不急着讲 lookup 锁、clock sweep 或 I/O，而是先把“一个 buffer 到底是谁”讲清楚。后续所有命中、miss、replacement、pin、dirty 和 WAL-before-data，都建立在这个 identity 分层上。
 
-这些会在后续三节分别处理。
+本节只回答 identity 的问题：一个磁盘 block 如何被绑定到 shared 或 local buffer slot。partition lock、victim 选择、content lock 和读 I/O 会在后续几节分别展开。
 
-本节结束后，你应该能判断：
+## 2. 核心矛盾与一句话运行模型
 
-- `Buffer` 为什么只是 handle，不是磁盘页身份。
-- `BufferTag` 为什么必须能脱离 relcache / catalog 定位磁盘页。
-- `BufferDesc.buf_id`、`BufferDesc.tag`、`BufferBlocks` 为什么不能合成一个概念。
-- `BM_TAG_VALID` 和 `BM_VALID` 为什么是两个不同阶段。
-- shared pin、private refcount、`ResourceOwner` 各自兜住哪一段生命周期。
-- temporary relation 为什么走 local buffer，为什么其他 backend 不能直接访问。
+这里的核心矛盾是：有限的 buffer slot 必须高频复用，但任何时刻同一个磁盘 block 都不能被系统误认为两个不同缓存对象，也不能让一个仍被 backend 使用的 slot 悄悄换成别的 block。
 
-源码基线：
+因此 PostgreSQL 把 identity 拆成五层：
 
 ```text
-/home/nail/postgres-lab
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
+磁盘身份: BufferTag
+cache slot: BufferDesc.buf_id / Buffer handle
+页内容地址: BufferBlocks / LocalBufferBlockPointers
+共享并发状态: BufferDesc.state
+本 backend 使用状态: PrivateRefCountEntry / LocalRefCount / ResourceOwner
 ```
 
-核心源码锚点：
+只要把这五层分清，后续 lookup、replacement、pin/content lock 的复杂路径就不会混成一团。
 
-| 顺序 | 文件 | 本节读什么 |
+## 3. 核心文件分工与阅读顺序
+
+| 阅读顺序 | 文件 | 本节读什么 |
 | --- | --- | --- |
 | 1 | `src/include/storage/buf.h` | `typedef int Buffer`、`InvalidBuffer`、正数 shared / 负数 local 的 handle 编码。 |
 | 2 | `src/include/storage/bufmgr.h` | `BufferBlocks`、`LocalBufferBlockPointers`、`BufferGetBlock()`、`BufferGetPage()`。 |
 | 3 | `src/include/storage/buf_internals.h` | `BufferTag`、`BufferDesc`、`BufferDescPadded`、`BM_TAG_VALID`、`BM_VALID`、refcount / usage_count bit layout。 |
 | 4 | `src/backend/storage/buffer/buf_init.c` | `BufferManagerShmemRequest()`、`BufferManagerShmemInit()` 如何分配 descriptor、page memory、I/O condition variable。 |
 | 5 | `src/backend/storage/buffer/buf_table.c` | `BufferTag -> buf_id` mapping table 的 entry、lookup、insert、delete。 |
-| 6 | `src/backend/storage/buffer/bufmgr.c` | `ReadBuffer_common()`、`PinBufferForBlock()`、`BufferAlloc()`、`PinBuffer()`、`UnpinBuffer()`、`StartSharedBufferIO()`、`TerminateBufferIO()`。 |
+| 6 | `src/backend/storage/buffer/bufmgr.c` | `ReadBuffer_common()`、`PinBufferForBlock()`、`BufferAlloc()`、`PinBuffer()`、`UnpinBuffer()`、I/O 状态入口。 |
 | 7 | `src/backend/storage/buffer/localbuf.c` | `LocalBufferAlloc()`、`PinLocalBuffer()`、`UnpinLocalBufferNoOwner()` 的 backend-local 对照。 |
 
 短阅读路径：
@@ -70,19 +70,7 @@ Buffer handle 编码
   -> LocalBufferAlloc()
 ```
 
-本节要带走的模型很短：
-
-```text
-磁盘身份: BufferTag
-cache slot: BufferDesc.buf_id / Buffer handle
-页内容地址: BufferBlocks / LocalBufferBlockPointers
-共享并发状态: BufferDesc.state
-本 backend 使用状态: PrivateRefCountEntry / LocalRefCount / ResourceOwner
-```
-
-只要把这五层分清，后续 lookup、replacement、pin/content lock 的复杂路径就不会混成一团。
-
-## 1. 问题：一个 buffer 到底是谁
+## 4. 入口问题：一个 buffer 到底是谁
 
 从调用者看，访问页面经常只有两行：
 
@@ -181,7 +169,7 @@ local buffer 则把“跨进程可见”这个维度拿掉，只保留本 backen
 tag 要早可见，content 要晚可见，pin 要覆盖这两个阶段之间的 slot 身份。
 ```
 
-## 2. 状态：identity 被拆在五层
+## 5. 状态：identity 被拆在五层
 
 第一层是 `BufferTag`。
 
@@ -347,7 +335,7 @@ mapping table 中存在 tag
 
 这是后续三节共同复用的 mental model。
 
-## 3. 主流程：从 ReadBuffer 到稳定身份
+## 6. 主流程：从 ReadBuffer 到稳定身份
 
 主流程从一个普通 read 开始。
 
@@ -575,7 +563,7 @@ local temp table 仍然需要 `BM_VALID`。
 
 `PinLocalBuffer()` 返回 `buf_state & BM_VALID`，与 shared `PinBuffer()` 的语义对应。
 
-## 4. 边界：哪些机制不能互相替代
+## 7. 边界：哪些机制不能互相替代
 
 第一条边界是 `Buffer` 与 `BufferTag`。
 
@@ -691,7 +679,7 @@ local buffer 的指针和 refcount 都是 backend-local。
 
 但需要知道 `BufferTag` 和 persistence flag 在 writeback 路径上共同决定“写到哪里、是否按 permanent buffer 处理”。
 
-## 5. 异常：identity 如何在非 happy path 收尾
+## 8. 异常：identity 如何在非 happy path 收尾
 
 异常路径一：lookup hit 但 content invalid。
 
@@ -800,7 +788,7 @@ ERROR / abort 时 `ResOwnerReleaseBuffer()` 会释放可能残留的 content loc
 
 真正的释放顺序要能同时处理 content lock 和 pin。
 
-## 6. 诊断与实验
+## 9. 诊断与实验
 
 本节可观测的 runtime truth 是：
 
@@ -834,7 +822,7 @@ ERROR / abort 时 `ResOwnerReleaseBuffer()` 会释放可能残留的 content loc
 准备：
 
 ```text
-cd /home/nail/postgres-lab
+cd /home/highgo/postgres
 ```
 
 断点：
@@ -959,7 +947,7 @@ BM_TAG_VALID 和 BM_VALID 分别是什么？
 
 这不是检查清单，而是按 identity 生命周期排序的最小诊断路径。
 
-## 7. 讨论题
+## 10. 讨论题
 
 1. 为什么 `Buffer` handle、`BufferTag`、`BufferDesc.buf_id` 不能合并成一个概念？
 2. 如果 `BM_TAG_VALID` 已经成立但 `BM_VALID` 还没有成立，调用者能安全做什么、不能做什么？
@@ -967,7 +955,7 @@ BM_TAG_VALID 和 BM_VALID 分别是什么？
 4. local buffer 没有跨 backend 并发，为什么仍然需要 identity、valid 和 refcount 边界？
 5. 诊断 buffer identity 问题时，哪些状态能从 SQL 或扩展视图看到，哪些只能用断点推断？
 
-## 8. 本节小结
+## 11. 本节小结
 
 本节核心链路是：
 

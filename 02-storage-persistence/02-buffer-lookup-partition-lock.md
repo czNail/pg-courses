@@ -10,43 +10,39 @@
 同一个磁盘 block 在 shared buffers 中最多只能有一个 buffer slot，PostgreSQL 如何在高并发 lookup、miss、victim reuse 和 I/O 等待之间维护这个唯一性？
 ```
 
-核心矛盾：
+核心矛盾：每次 page access 都要快速从 `BufferTag` 找到 `BufferDesc`；但所有 backend 又必须共同维护同一张 shared mapping table，不能让一个 block 被两个 slot 同时代表，也不能用全局大锁把 hot path 完全串行化。
+
+一句话运行模型：
 
 ```text
-每次 page access 都要快速从 BufferTag 找到 BufferDesc；
-但所有 backend 又必须共同维护同一张 shared mapping table，不能让一个 block 被两个 slot 同时代表，也不能用全局大锁把 hot path 完全串行化。
+ReadBuffer_common() 进入 PinBufferForBlock()，先在 partition lock 下查 BufferTag -> buf_id；命中时先 pin 再释放锁，miss 时由 BufferAlloc() 选择并安装唯一 new tag，遇到并发插入则放弃自己 candidate 并重试。
 ```
 
-本节围绕 mapping table 展开。
+学完后应能判断：mapping table 只解决 identity uniqueness；pin 解决 slot lifetime；`BM_VALID` 解决 page bytes 是否可用；content lock 解决 page contents 并发访问。
 
-它不完整讲 replacement 算法。
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。
 
-它不完整讲 dirty page writeback。
+## 1. 本节在总主线中的位置
 
-它不完整讲 content lock。
+上一节建立了 buffer identity 的分层，本节进入第一个并发共享点：多个 backend 如何从同一个 `BufferTag` 找到同一个 slot。它还不讲完整 replacement，也不讲 dirty writeback 和 content lock，只讲 shared mapping table 如何维护唯一性。
 
-它只解释 lookup 命中、lookup miss、并发插入冲突、旧 tag 删除和 I/O invalid buffer 的边界。
+后续 clock sweep、read I/O 和 pin/content lock 都会回到这个结论：只要 mapping table 里有某个 `BufferTag`，系统就必须让后来者看见同一个 `buf_id`，而不是再创建第二个缓存副本。
 
-学完后应能判断：
+## 2. 核心矛盾与一句话运行模型
 
-- 为什么 `BufTableLookup()` 命中后仍必须先 pin 再释放 partition lock。
-- 为什么 `BufTableInsert()` 返回已有 `buf_id` 是正常 race。
-- 为什么 `BM_TAG_VALID` 可以为 true 而 `BM_VALID` 为 false。
-- 为什么 `buf_table.c` 自己不加锁。
-- 为什么 mapping lock 保护的是 `BufferTag -> buf_id`，不是 page contents。
-- 为什么 victim 被选中后仍可能因为 concurrent pin / dirty 放弃。
+`BufTableLookup()` 命中只是 mapping hit，不等于 page 已可读，也不等于调用者已经安全使用这个 slot。PostgreSQL 的做法是在 partition lock 保护下把 mapping entry 和 descriptor tag 作为一个 identity 边界处理，随后通过 pin、I/O 状态和 content lock 分别处理 lifetime、readiness 和 page bytes 并发。
 
-源码基线：
+本节要守住三个不变量：
 
 ```text
-/home/nail/postgres-lab
-branch: master
-commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
+对任意有效 BufferTag，同一时刻 shared mapping table 中最多有一个 buf_id；
+只要 mapping table 中存在该 tag，承载它的 BufferDesc 应该处于 BM_TAG_VALID；
+但 BM_TAG_VALID 不承诺 page bytes 已经 BM_VALID。
 ```
 
-核心源码锚点：
+## 3. 核心文件分工与阅读顺序
 
-| 顺序 | 文件 | 本节读什么 |
+| 阅读顺序 | 文件 | 本节读什么 |
 | --- | --- | --- |
 | 1 | `src/backend/storage/buffer/bufmgr.c` | `ReadBuffer_common()`、`PinBufferForBlock()`、`BufferAlloc()`、`InvalidateVictimBuffer()`、`StartSharedBufferIO()`。 |
 | 2 | `src/backend/storage/buffer/buf_table.c` | `BufferLookupEnt`、`BufTableHashCode()`、`BufTableLookup()`、`BufTableInsert()`、`BufTableDelete()`。 |
@@ -54,7 +50,7 @@ commit: bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8
 | 4 | `src/backend/storage/buffer/freelist.c` | `StrategyGetBuffer()` 只作为 miss 后找 candidate 的边界，不展开 clock sweep。 |
 | 5 | `src/backend/storage/buffer/localbuf.c` | local buffer 的无 shared partition lock 对照。 |
 
-本节的最短调用链：
+最短调用链：
 
 ```text
 ReadBufferExtended()
@@ -66,19 +62,7 @@ ReadBufferExtended()
   -> BufTableLookup()/BufTableInsert()/BufTableDelete()
 ```
 
-本节要守住的核心不变量：
-
-```text
-对任意有效 BufferTag，同一时刻 shared mapping table 中最多有一个 buf_id；
-只要 mapping table 中存在该 tag，承载它的 BufferDesc 应该处于 BM_TAG_VALID；
-但 BM_TAG_VALID 不承诺 page bytes 已经 BM_VALID。
-```
-
-这三个不变量比函数名更重要。
-
-后续所有锁顺序、retry 和异常路径都是为了维护它们。
-
-## 1. 问题：mapping hit 不是完整 buffer hit
+## 4. 入口现象：mapping hit 不是完整 buffer hit
 
 普通读路径最终需要回答一个问题：
 
@@ -153,7 +137,7 @@ but does NOT read in new page.
 
 这条线比“函数清单”更重要。
 
-## 2. 状态：mapping table、partition lock 和 descriptor tag
+## 5. 状态：mapping table、partition lock 和 descriptor tag
 
 `BufferTag` 是 hash key。
 
@@ -274,7 +258,7 @@ mapping table entry
 
 它也避免未读完的 content 被当成有效 page。
 
-## 3. 主流程：hit、miss、collision
+## 6. 主流程：hit、miss、collision
 
 shared read 的入口不在 `buf_table.c`。
 
@@ -471,7 +455,7 @@ foundPtr = false
 
 让并发 miss 在 identity 阶段汇合，而不是在 I/O 完成后才发现重复。
 
-## 4. 边界：锁粒度和模块职责
+## 7. 边界：锁粒度和模块职责
 
 第一条边界：partition lock 不是 relation lock。
 
@@ -618,7 +602,7 @@ bgwriter 和 checkpointer 不通过 SQL 层访问 page。
 
 但要记住 mapping table 与 descriptor tag 的一致性会被前台 backend、bgwriter、checkpointer、I/O completion path 共同依赖。
 
-## 5. 异常：race、retry 和 failure 如何收尾
+## 8. 异常：race、retry 和 failure 如何收尾
 
 异常路径一：并发插入同一 tag。
 
@@ -722,7 +706,7 @@ ResourceOwner 再释放本 backend 已经持有的 pin。
 
 因为 other session 的 local buffers 对当前 backend 不存在可验证的 shared identity。
 
-## 6. 诊断与实验
+## 9. 诊断与实验
 
 本节可观测的 runtime truth 是：
 
@@ -854,7 +838,7 @@ foundPtr 是 true 还是 false？
 
 它比背诵函数参数更接近真实排障过程。
 
-## 7. 讨论题
+## 10. 讨论题
 
 1. 为什么 mapping table hit 不能直接等价为 page 内容可读？
 2. miss 后释放 partition lock 再找 victim，会引入什么 race？`BufTableInsert()` 怎样把它收回来？
@@ -862,7 +846,7 @@ foundPtr 是 true 还是 false？
 4. old tag 删除时为什么要重新检查 `refcount`、`BM_DIRTY` 和 tag？
 5. 如果把 partition lock 粒度改成 relation 级或全局级，成本和正确性边界会怎样变化？
 
-## 8. 本节小结
+## 11. 本节小结
 
 本节核心链路是：
 

@@ -1,630 +1,883 @@
-# PostgreSQL SnapshotData 字段语义
+# PostgreSQL SnapshotData 的区间、运行集合与命令边界
+
 ## 课程定位
+
 前置知识：
-- 已理解 XID 分配、ProcArray、CLOG/pg_xact 和子事务父链。
-- 已理解普通 MVCC 读不是读“最新行”，而是读某个时间点下可见的 tuple version。
-- 已理解 tuple header 的 `xmin` / `xmax` 指向事务身份，不直接等于可见性结论。
+
+你已经理解 XID 不是事务一开始就分配。你已经理解 commit 结果要通过 WAL 和 CLOG/pg_xact 建立持久边界。
+
+你已经理解 SubXID overflow 会让子事务集合从完整枚举退化到 `pg_subtrans` fallback。你已经知道 heap tuple header 里的 `xmin` / `xmax` 只是事务 ID 引用，不是完整可见性答案。
+
 本节唯一主问题：
-`SnapshotData` 为什么只靠 `xmin`、`xmax`、`xip`、`subxip`、`suboverflowed`、`takenDuringRecovery` 和 `curcid` 这一组字段，就能描述一个 MVCC 读视图？
-核心矛盾：
-读取 tuple 时希望用一份本地 snapshot 快速判断可见性；
-但事务运行集合在全局共享内存中不断变化，子事务可能 overflow，recovery 中 running XID 来源也不是普通 ProcArray。
-PostgreSQL 的选择是：
-snapshot 创建时把“当时仍运行的事务集合”压缩成一个区间加两个数组。
-后续 tuple visibility 不再重新扫描全局 ProcArray，而是用这份 frozen view 判断。
-学完后应能判断：
-- `xmin` 不是“最老已提交事务”，而是本 snapshot 下仍可能运行的下界。
-- `xmax` 不是“最大已提交事务”，而是本 snapshot 下新事务不可见的上界。
-- `xip` 只列出 `[xmin, xmax)` 中仍在运行的 top-level XID。
-- `subxip` 只在未 overflow 或 recovery 特殊场景下能完整回答子事务问题。
-- `curcid` 只回答本事务内 command 可见性，不是全局 MVCC 时间。
-- `takenDuringRecovery` 改变 `xip/subxip` 的解释来源。
-源码基线：
+
 ```text
-/home/nail/postgres-lab
-branch: feature/pg-pv-storage-design
-commit: 2d5ed10b0bb1d1c16df7ff408eb65df4609006ae
+`SnapshotData` 为什么必须同时保存 `xmin`、`xmax`、`xip`、`subxip`、`suboverflowed` 和 `curcid`，而不能只是一个时间戳或一个事务列表？
 ```
+
+本节核心矛盾：
+
+一个 MVCC snapshot 必须给每个 tuple 一个稳定、一致、可重复的运行事务视角。但 tuple visibility hot path 不能在每个 tuple 上重新扫描 ProcArray、重新查询所有事务结果，或者保存无界事务历史。
+
+学完本节后，你应该能独立判断：
+
+- 为什么 snapshot 是区间加例外集合。
+- 为什么 `xmin` 和 cleanup horizon 相关，但不是“所有旧 tuple 都能删”的同义词。
+- 为什么 `xmax` 之后的事务对当前 snapshot 一律按仍在运行处理。
+- 为什么 `xip` 保存的是 running top-level XID，而不是 committed 列表。
+- 为什么 `subxip` 只是 fast path，`suboverflowed` 会改变判断路径。
+- 为什么同一事务内部还需要 `curcid` 来切开命令边界。
+- 为什么 `HeapTupleSatisfiesMVCC()` 既看 snapshot，又看 tuple hint bit 和 CLOG。
+
+本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`；源码阅读顺序放在第 3 节。
+
+本节不展开：
+
+- READ COMMITTED 语句级生命周期。
+- REPEATABLE READ 的事务级 snapshot。
+- ActiveSnapshot / RegisteredSnapshot 的完整资源释放细节。
+- VACUUM cleanup horizon 的完整计算。
+
+这里先把一个 `SnapshotData` 本身为什么长成现在这样讲清楚。
+
 ## 1. 本节在总主线中的位置
-前 6 节回答了事务身份和事务结果。
-现在进入 snapshot。
-事务系统能告诉你：
-某个 XID 是否仍在运行。
-某个 XID 是否已经 committed。
-某个 subxid 属于哪个 parent。
-但普通 SELECT 不能在每个 tuple 上重新扫描 ProcArray。
-那会把 heap scan 变成共享锁热点。
-因此 SQL 语句开始时要把全局运行集合冻结成本地对象。
-这个本地对象就是 `SnapshotData`。
-本节不讲 READ COMMITTED 与 REPEATABLE READ 何时复用 snapshot。
-那是下一节和第 9 节。
-本节也不展开 tuple visibility 的所有分支。
-第 14 节会专门讲 `HeapTupleSatisfiesMVCC()`。
-本节只建立字段语义。
-一条主线是：
-```text
-ProcArray running state
-  -> GetSnapshotData()
-  -> SnapshotData fields
-  -> XidInMVCCSnapshot()
-  -> HeapTupleSatisfiesMVCC()
-```
-如果字段语义理解错，后面的隔离级别、VACUUM horizon、index-only scan 诊断都会错。
+
+前六节课回答了事务 ID 和事务结果从哪里来。第一节说明一个事务什么时候真正拥有 XID。
+
+第三节说明 commit WAL 和 CLOG/pg_xact 状态之间的顺序。第六节说明 SubXID overflow 后为什么仍然能判断可见性，只是成本会退化。
+
+现在要把这些状态合成一个读者视角。一个 heap tuple 上可能有 `xmin`。
+
+一个 heap tuple 上可能有 `xmax`。这两个字段可能指向顶层事务。
+
+也可能指向子事务。它们可能已经提交。
+
+可能已经回滚。也可能在 snapshot 创建时仍在运行。
+
+如果每次判断 tuple 都去全局事务系统问一次最新状态，结果会变快照外的实时读。如果只用事务提交时间戳，系统又无法表达“某些更老的事务还没结束”。
+
+如果只保存完整 running 列表，子事务和 backend 数一多就会让 snapshot 大小失去上界。`SnapshotData` 的设计不是为了漂亮。
+
+它是 PostgreSQL 在 MVCC correctness、ProcArray 扩展性、heap visibility 热路径和本事务自可见性之间做出的组合。本节只追一条主链路。
+
+一个查询开始时获取 MVCC snapshot。`GetSnapshotData()` 从 ProcArray 复制运行事务集合。
+
+`XidInMVCCSnapshot()` 把 tuple XID 对照这个集合。`HeapTupleSatisfiesMVCC()` 再把 snapshot 结果、当前事务命令边界和 CLOG/hint bit 合并成 tuple 可见性。
+
+这条链路之后，下一节才能讨论 READ COMMITTED 为什么每条语句重取一次 snapshot。
+
 ## 2. 核心矛盾与一句话运行模型
+
 一句话运行模型：
-`SnapshotData` 把不断变化的全局 running XID 集合，冻结成 “区间 + 例外集合 + 子事务 fallback 标志 + 本事务命令边界”。
-全局运行集合是动态的。
-一个 backend 正在分配 XID。
-另一个 backend 正在 commit。
-第三个 backend 正在从 ProcArray 清除 XID。
-如果每次 tuple visibility 都去问“此刻它是否 running”，同一条 SQL 可能在扫描过程中得到不一致答案。
-snapshot 的核心就是把“此刻”固定下来。
-`xmin` 是区间下界。
-任何 XID 小于 `xmin`，对这个 snapshot 来说不再是 running。
-它要么已经完成，要么太老而不能再出现在 running 集合。
-`xmax` 是区间上界。
-任何 XID 大于等于 `xmax`，对这个 snapshot 来说都当作未来事务。
-即使它稍后 commit，也不能被当前 snapshot 看见。
-`xip` 是区间内的 running top-level XID 列表。
-它回答：
-这个 XID 在 snapshot 创建时是否还没有结束。
-`subxip` 是区间内 running subxid 的 fast path。
-它回答：
-这个 tuple header 里的子事务 XID 是否仍属于某个 running top-level transaction。
-`suboverflowed` 是准确性边界。
-它不是“snapshot 坏了”。
-它表示 `subxip` 不完整，必须用 `pg_subtrans` 追溯 parent。
-`curcid` 是 self-visibility 边界。
-它让同一事务内部不同 command 之间仍能保持 SQL 语义。
-## 3. 核心文件分工与阅读顺序
-推荐阅读顺序：
-| 顺序 | 文件 | 关注点 |
-| --- | --- | --- |
-| 1 | `src/include/utils/snapshot.h` | `SnapshotType`、`SnapshotData` 字段定义 |
-| 2 | `src/backend/storage/ipc/procarray.c` | `GetSnapshotData()` 如何填字段 |
-| 3 | `src/backend/utils/time/snapmgr.c` | snapshot 生命周期、复制、注册和 `XidInMVCCSnapshot()` |
-| 4 | `src/backend/access/heap/heapam_visibility.c` | `HeapTupleSatisfiesMVCC()` 如何消费 snapshot |
-| 5 | `src/backend/access/transam/subtrans.c` | overflow 后 parent chain fallback |
-| 6 | `src/include/storage/proc.h` | `PGPROC.xid`、`xmin`、subxid cache |
-不要从 `HeapTupleSatisfiesMVCC()` 直接硬读。
-那会混在 xmin/xmax、CLOG、hint bit、command id 和 tuple lock 分支里。
-先把 snapshot 字段当成接口 contract 读清楚。
-`snapshot.h` 是入口。
-`SnapshotData` 的字段旁边有注释。
-这些注释很短，但密度很高。
-`procarray.c` 是生成侧。
-它决定哪些 running XID 被复制进 snapshot。
-`snapmgr.c` 是生命周期侧。
-它决定哪些 snapshot 可以被复用、注册、导出、释放。
-`heapam_visibility.c` 是消费侧。
-它不重新解释 ProcArray。
-它只问 `XidInMVCCSnapshot()` 和事务结果状态。
-## 4. 关键数据结构与状态
-`SnapshotData.snapshot_type` 指明规则族。
-本节关注 `SNAPSHOT_MVCC`。
-特殊 snapshot 另有课程。
-`xmin` 是最低仍可能运行 XID。
-更准确说：
-小于 `xmin` 的普通 XID 不需要再查 snapshot running set。
-它可能 committed，也可能 aborted。
-具体结果要问 CLOG 或 hint bit。
-它不可能被当前 snapshot 当作 in-progress。
-`xmax` 是 upper bound。
-大于等于 `xmax` 的 XID 对当前 snapshot 都视为 in-progress / future。
-它们不该对当前 MVCC 读可见。
-这个规则防止扫描过程中后启动或后分配的事务突然变可见。
-`xip` 是 top-level XID 数组。
-只有 `[xmin, xmax)` 内的 XID 才需要在这里查。
-因此 `XidInMVCCSnapshot()` 先做 range check。
-低于 `xmin` 直接 false。
-高于等于 `xmax` 直接 true。
-中间才查数组。
-`xcnt` 是 `xip` 元素数。
-它不是全系统事务数。
-它只是这个 snapshot 看到的运行事务数量。
-`subxip` 是子事务 XID 数组。
-`subxcnt` 是数量。
-当 `suboverflowed` 为 false 时，`subxip` 可以帮助快速判断 running subxid。
-当 `suboverflowed` 为 true 时，不在 `subxip` 不能证明它不 running。
-必须追 parent。
-`takenDuringRecovery` 表示 snapshot 来自 recovery shaped running set。
-Hot standby 里没有普通 backend ProcArray 的全部写事务状态。
-系统维护 KnownAssignedXids。
-这会影响 `xip/subxip` 的来源和解释。
-`curcid` 是 command id 边界。
-`HeapTupleSatisfiesMVCC()` 用它判断本事务内同一 XID 的写入是否早于当前 command。
-这解释了为什么 snapshot 不是纯事务 ID 集合。
-## 5. 主流程源码 walkthrough
-主流程从 `GetSnapshotData()` 开始。
-调用方传入一个 `SnapshotData` 存储对象。
-`GetSnapshotData()` 持有 ProcArrayLock 读取运行事务状态。
-它填出 `xmin`、`xmax`、`xip`、`subxip` 和 overflow 标记。
-然后 `snapmgr.c` 负责把这个 snapshot 放进当前语句或事务生命周期。
-普通 tuple 判断进入 `HeapTupleSatisfiesMVCC()`。
-对于 tuple `xmin`：
-如果是当前事务 XID，转入 command id 分支。
-如果 hint bit 已经说明 committed 或 invalid，减少 CLOG 查询。
-否则可能先问 `XidInMVCCSnapshot(xmin, snapshot)`。
-如果 `xmin` 在 snapshot 中 running，tuple 对当前 snapshot 不可见。
-如果不 running，再问事务是否 committed。
-对于 tuple `xmax`：
-如果没有有效 `xmax`，tuple 没有被删除或锁定。
-如果 `xmax` 在 snapshot 中 running，删除对当前 snapshot 不可见。
-如果 `xmax` committed，tuple 可能已经死亡。
-`XidInMVCCSnapshot()` 的运行模型是三步：
+
 ```text
-if xid < snapshot->xmin: not running
-if xid >= snapshot->xmax: running/future
-else search xip/subxip or subtrans fallback
+GetSnapshotData() 在一个时刻复制 ProcArray 中的 running top-level XID 和 cached SubXID；
+SnapshotData 用 xmin/xmax 给出区间边界，用 xip/subxip 描述区间内仍 running 的例外；
+suboverflowed 决定是否需要 pg_subtrans fallback；
+curcid 再把同一事务内部的命令顺序切开。
 ```
-这个函数是 snapshot 字段语义的集中体现。
-注意：
-`XidInMVCCSnapshot()` 不回答 committed。
-它只回答“在这个 snapshot 中是否视为 in-progress”。
-事务最终结果仍由 CLOG/pg_xact 和 hint bit 判定。
-所以 snapshot 和 CLOG 是两层。
-snapshot 定义“读视图的时间边界”。
-CLOG 定义“事务最终命运”。
-## 6. 生命周期 / ownership / cleanup
-`SnapshotData` 可以是静态对象、复制对象、active snapshot 或 registered snapshot。
-`snapmgr.c` 中有 `CurrentSnapshotData`、`SecondarySnapshotData`、`CatalogSnapshotData`。
-这些静态对象减少重复分配。
-但调用者如果需要跨函数、跨 executor 节点或 portal 持有 snapshot，必须复制或注册。
-`active_count` 表示 active snapshot stack 上的引用。
-`regd_count` 表示 RegisteredSnapshots 的引用。
-两者都为 0 时，复制出来的 snapshot 可以释放。
-`PushActiveSnapshot()` 会把 snapshot 放入 active stack。
-`PopActiveSnapshot()` 释放这一层引用。
-`RegisterSnapshot()` 会把 snapshot 注册到 ResourceOwner。
-`UnregisterSnapshot()` 解除注册。
-ERROR 时 ResourceOwner 负责清理注册引用。
-active stack 则由上层 executor / portal 调用协议维护。
-`SnapshotResetXmin()` 是重要 cleanup。
-当没有 active 或 registered snapshot 需要保护 xmin 时，backend 可以清空 `MyProc->xmin`。
-否则 VACUUM horizon 会被长期 snapshot 拖住。
-这也是 snapshot 生命周期不是内存生命周期的原因。
-它还影响全局回收边界。
-## 7. 正确性机制层次
-第一层正确性是 snapshot 一致性。
-同一 SQL 语句使用同一个 snapshot，就不会在扫描中途看到后来的 commit。
-第二层正确性是区间规则。
-`xmin/xmax` 让大多数 XID 不需要查数组，也避免未来事务被误看见。
-第三层正确性是 running set。
-`xip/subxip` 记录创建 snapshot 时仍运行的事务。
-第四层正确性是 overflow fallback。
-`suboverflowed` 不允许系统把“不在 subxip”误判为“不 running”。
-第五层正确性是 self-command visibility。
-`curcid` 保证同一事务内部也遵守 SQL command 顺序。
-第六层正确性是 recovery 区分。
-`takenDuringRecovery` 防止把 hot standby 的 KnownAssignedXids 规则误用成普通 backend ProcArray 规则。
-这些层次共同形成一个判断：
-snapshot 不是时间戳。
-snapshot 是一个可验证的事务集合边界。
-它的每个字段都服务一个具体分支。
-## 8. 错误路径 / 异常路径 / fallback
-常见 fallback 是 subxid overflow。
-如果 `suboverflowed` 为 true，`XidInMVCCSnapshot()` 需要调用 `SubTransGetTopmostTransaction()`。
-这会从 `pg_subtrans` 追溯 parent。
-正确性保持，成本上升。
-另一个 fallback 是 snapshot copy。
-如果调用者要长期持有 snapshot，不能直接拿静态 `CurrentSnapshotData`。
-必须 `CopySnapshot()` 或注册。
-否则后续 `GetSnapshotData()` 可能覆盖内容。
-ERROR cleanup 依赖 ResourceOwner。
-registered snapshot 如果没有 unregister，事务 abort 时会清理。
-active snapshot stack 若被调用协议破坏，通常会触发 assertion 或 end-of-xact 检查。
-导出 snapshot 还有额外边界。
-导出到文件时要序列化字段。
-导入时要重新安装 xmin。
-如果源事务不再能保护 xmin，导入会失败。
-这说明 snapshot 不是纯数据文件。
-它必须和某个仍存在的 xmin owner 关联。
-## 9. 成本、资源与跨模块传播
-获取 snapshot 的成本来自 ProcArray 扫描。
-backend 数越多，ProcArray 越大，`GetSnapshotData()` 越贵。
-running XID 越多，`xip` 越长。
-子事务越多，`subxip` 越长或 overflow。
-overflow 会把成本转给 `pg_subtrans`。
-长期 snapshot 会把成本传播给 VACUUM。
-因为 `MyProc->xmin` 不能提前清掉。
-old tuple version 不能被回收。
-visibility map all-visible 也可能推迟。
-READ COMMITTED 每条语句取 snapshot，增加 ProcArray 读取频率。
-REPEATABLE READ 复用 snapshot，减少获取频率，但延长 xmin 持有时间。
-cursor、portal、logical decoding、复制槽和 prepared transaction 都可能形成 horizon 传播。
-本节只讲普通 snapshot。
-后续会拆开各自语义。
-## 10. 观测与诊断入口
-SQL 可见入口：
-`pg_stat_activity.backend_xid` 和 `backend_xmin`。
-`backend_xmin` 能提示某个 backend 正在保护旧版本。
-它不是 snapshot 全部字段。
-`txid_current_snapshot()` 可显示类似 `xmin:xmax:xip_list` 的用户层表示。
-它不展示 `subxip` 完整细节。
-`pg_locks` 可看到 virtualxid 和 transactionid lock。
-这些不是 snapshot 字段，但能帮助定位谁在运行。
-`pg_stat_slru` 的 `subtransaction` 可间接提示 overflow fallback 压力。
-`VACUUM VERBOSE` 可提示旧版本无法回收。
-gdb 入口：
-`GetSnapshotData`、`GetTransactionSnapshot`、`XidInMVCCSnapshot`、`HeapTupleSatisfiesMVCC`。
-观察字段：
-`snapshot->xmin`、`xmax`、`xcnt`、`subxcnt`、`suboverflowed`、`curcid`。
-不要期待 SQL 直接显示所有字段。
-很多判断只能通过断点或源码插桩确认。
-## 11. 常见误区
-- 把 `xmin` 当成最老已提交事务。
-- 把 `xmax` 当成当前最大 XID。
-- 以为不在 `xip` 就一定 committed。
-- 忽略 `[xmin, xmax)` 范围判断。
-- 以为 `suboverflowed` 代表 snapshot 不可靠。
-- 把 `curcid` 当成全局事务时间。
-- 把 snapshot 生命周期当成普通内存引用。
-- 用 `txid_current_snapshot()` 直接推断所有内部字段。
-## 12. 课堂实验
-实验 1：观察用户层 snapshot。
+
+本节的核心矛盾不是“snapshot 里字段很多”。
+
+真正的矛盾是：查询需要一个创建后稳定的可见性世界，但 heap visibility hot path 又不能在每个 tuple 上重新扫描 ProcArray、保存完整历史或依赖提交时间戳。
+
+因此 `SnapshotData` 选择了一个压缩结构：
+
+```text
+区间边界
+  + running exception set
+  + subtransaction fallback flag
+  + current-command cutoff
+```
+
+后面的 runtime 现象、源码 walkthrough、成本模型都围绕这个压缩结构展开。
+
+## 3. 核心文件分工与阅读顺序
+
+| 顺序 | 文件 | 本节关注点 |
+| --- | --- | --- |
+| 1 | `src/include/utils/snapshot.h` | 先看 `SnapshotData` 字段、snapshot 类型和 `curcid` 边界。 |
+| 2 | `src/backend/storage/ipc/procarray.c` | 再读 `GetSnapshotData()` / `GetSnapshotDataReuse()` 如何复制 running XID 集合。 |
+| 3 | `src/backend/utils/time/snapmgr.c` | 跟 `XidInMVCCSnapshot()` 如何消费 `xmin/xmax/xip/subxip/suboverflowed`。 |
+| 4 | `src/backend/access/heap/heapam_visibility.c` | 看 `HeapTupleSatisfiesMVCC()` 如何把 snapshot、hint bit 和 CLOG 合并。 |
+| 5 | `src/include/access/xact.h` | 对照隔离级别和事务 accessor 的公开边界。 |
+| 6 | `src/backend/access/transam/xact.c` | 最后看 command id 推进与 `curcid` 更新来源。 |
+
+## 4. 一个 runtime 现象先定锚
+
+先看一个可以复现的现象。它不需要任何源码修改。
+
+建一张普通表。一个会话打开事务并插入一行但不提交。
+
+另一个会话启动一个查询。在第二个会话查询运行期间，第一个会话提交。
+
+第二个会话的这一次查询仍然不会把那一行纳入自己的扫描结果。下一条语句才可能看到。
+
+这个现象不是 READ COMMITTED 的全部。本节只借它说明 `SnapshotData` 的形状。
+
+在第二个会话创建 snapshot 的时刻，第一个会话的 top-level XID 还在运行。`GetSnapshotData()` 会把这个 XID 放进 `snapshot->xip`。
+
+以后即使第一个事务真实提交了，这个 snapshot 仍然把它当作“创建 snapshot 时 running”。`HeapTupleSatisfiesMVCC()` 遇到那行的 `xmin` 时会调用 `XidInMVCCSnapshot()`。
+
+`XidInMVCCSnapshot()` 发现 `xmin` 在 `xip` 中。于是这行对该 snapshot 不可见。
+
+关键点是：
+
+snapshot 保存的是创建时的运行集合。它不是全局事务状态的实时视图。
+
+这能解释“单条查询内部稳定”。但它还不能解释“为什么不是一个时间戳”。
+
+因为 PostgreSQL 的 XID 分配顺序不是事务完成顺序。一个更小的 XID 可以在 snapshot 创建时还没提交。
+
+一个更大的 XID 可以已经提交。单个时间点或单个最大已提交 ID 都无法表达这个交错。
+
+因此 snapshot 需要区间。还需要区间里的例外集合。
+
+还需要对本事务内命令边界的特殊处理。这就是本节主线。
+
+## 5. `SnapshotData` 不是事务状态本身
+
+`SnapshotData` 是 backend-local 的读视角。它不是 shared memory 中的全局事实。
+
+它保存的是某一刻从全局状态复制出来的一份判断材料。`xip` 和 `subxip` 指针指向当前 backend 私有内存。
+
+其他 backend 不能直接使用这份指针。snapshot 创建以后，它的运行集合不再跟随 ProcArray 实时变化。
+
+这正是 MVCC snapshot 的意义。如果一个事务在 snapshot 创建后提交，旧 snapshot 不会把它从 `xip` 中删除。
+
+如果一个事务在 snapshot 创建后分配了新 XID，新 XID 通常会因为 `xid >= xmax` 被旧 snapshot 当作 still-running。因此 snapshot 的字段不是“最新事务系统状态”。
+
+它们是“这个读者在创建 snapshot 时承诺要使用的可见性边界”。普通 MVCC snapshot 中最核心的字段组合是：
+
+`xmin` `xmax`
+
+`xip` `subxip`
+
+`suboverflowed` `takenDuringRecovery`
+
+`curcid`此外还有生命周期字段：
+
+`active_count` `regd_count`
+
+`copied` `snapXactCompletionCount`
+
+这些字段不参与 tuple 可见性本身。但它们决定 snapshot 能不能安全地被 executor、portal 或 resource owner 持有。
+
+这点后续课程会展开。本节先记住一句话：
+
+raw field 不是语义。`xmin + xmax + xip + subxip + suboverflowed + curcid + snapshot type + lifecycle` 才是语义。
+
+## 6. 为什么不是一个时间戳
+
+看起来最简单的 MVCC snapshot 是一个时间戳。例如“读取 T 时刻以前提交的所有版本”。
+
+PostgreSQL 没有把普通 MVCC snapshot 建成这个形状。原因不是没有 timestamp。
+
+原因是 tuple header 存的是 XID。heap visibility hot path 面对的是 `xmin` 和 `xmax`。
+
+它需要快速判断这些 XID 在 snapshot 创建时是否 running。提交时间戳不是普通 tuple 可见性的主索引。
+
+并且 PostgreSQL 的普通事务提交时间戳功能本身也是可选能力，不是 MVCC 判断的基础。更关键的是，时间戳无法直接表达并发事务交错。
+
+设想三个事务。T1 分配 XID 100，长时间不提交。
+
+T2 分配 XID 101，很快提交。T3 分配 XID 102，并创建 snapshot。
+
+T3 的 snapshot 应该能看见 T2 的提交。但不能看见 T1 的未提交写入。
+
+如果 snapshot 只保存一个“最大可见 XID = 101”，它会误以为 100 也可见。如果保存一个“当前时间戳”，还需要把 tuple XID 映射到 commit timestamp。
+
+这会把 heap scan 的 hot path 推向事务结果查询。如果 T1 后来提交，旧 snapshot 仍然不能因此看到 T1。
+
+所以 snapshot 不能只描述完成时间。它必须描述“创建 snapshot 时哪些 XID 仍在运行”。
+
+这就是 `xip` 存在的根本原因。
+
+## 7. 为什么不是一个完整事务列表
+
+另一个简单方案是保存完整事务列表。把所有正在运行的 XID 全部塞进 snapshot。
+
+包括顶层事务。包括所有子事务。
+
+再让 visibility check 只做成员判断。PostgreSQL 的 common case 确实接近这个模型。
+
+但它不能把这个模型无限扩展。顶层事务数量受 `max_connections`、prepared transaction、后台进程等影响。
+
+子事务数量则可以被 savepoint、PL/pgSQL exception block 和复杂过程放大。每个 `PGPROC` 只缓存有限数量的 SubXID。
+
+本源码基线中 `PGPROC_MAX_CACHED_SUBXIDS` 是 64。第 65 个以后不会继续完整公开到 `PGPROC->subxids.xids[]`。
+
+这不是子事务失败。这是 shared memory fast path 的容量边界。
+
+因此 snapshot 保存 `subxip`。同时还必须保存 `suboverflowed`。
+
+`suboverflowed == false` 时，不在 `subxip` 里基本可以当作不在 running subxid fast path 中。`suboverflowed == true` 时，不在 `subxip` 里不能证明它不 running。
+
+`XidInMVCCSnapshot()` 需要把候选 XID 通过 `SubTransGetTopmostTransaction()` 规范化到 top-level XID。然后再查 `xip`。
+
+这就是 PostgreSQL 的取舍：
+
+保存完整 top-level running 集合。尽量保存 SubXID fast path。
+
+当 SubXID 信息不完整时，显式把不完整性写入 snapshot。后续 hot path 在必要时走 fallback。
+
+完整事务列表看起来简单。但它会把 shared memory 和 snapshot 大小变成无界。
+
+PostgreSQL 选择了有界 fast path 加 correctness fallback。
+
+## 8. `xmin`：不是删除许可，而是范围下界
+
+`SnapshotData.xmin` 在 `snapshot.h` 中表达一个下界。普通 MVCC 语义里，所有 XID `< xmin` 对这个 snapshot 来说不再 running。
+
+这句话经常被误读成“这些 XID 的 tuple 都可见”。更准确的说法是：
+
+`xmin` 之前的 XID 不需要再查 `xip` 来判断 running。它们仍然可能 committed。
+
+也仍然可能 aborted。heap visibility 还要看 tuple hint bit 或 CLOG/pg_xact。
+
+如果 `xmin` 是插入事务，并且该事务 committed，插入版本可能可见。如果 `xmin` 是插入事务，并且该事务 aborted，插入版本不可见。
+
+如果 `xmax` 是删除事务，并且该事务 committed，旧版本通常不可见。如果 `xmax` 是删除事务，并且该事务 aborted，旧版本仍然可见。
+
+所以 `SnapshotData.xmin` 不是最终 visibility answer。它是 running-set 搜索优化。
+
+`XidInMVCCSnapshot()` 先做范围判断。如果候选 XID `< snapshot->xmin`，直接返回 false。
+
+false 的意思是“按这个 snapshot 不在运行”。它不是“tuple 可见”。
+
+最终可见性由 `HeapTupleSatisfiesMVCC()` 继续判断。`GetSnapshotData()` 计算 `xmin` 时从 `xmax` 初始化。
+
+然后考虑当前 backend 自己的 XID。再扫描 ProcArray 中 relevant backend 的 top-level XID。
+
+如果某个 running XID 更老，就把 `xmin` 拉低。这也是为什么长事务会拖住 cleanup horizon。
+
+只要某个 backend 的 snapshot 需要旧 XID，系统就不能简单回收所有旧版本。但本节仍然要把两件事分开：
+
+snapshot 的 `xmin` 是这个读者的可见性下界。VACUUM 的可移除边界还要结合全局 horizon、catalog/shared relation、replication slot、prepared xact 等因素。
+
+不要把某个 backend 的 `backend_xmin` 直接等同于某个 tuple 可以删除。
+
+## 9. `xmax`：为什么未来和并发晚到者都不可见
+
+`SnapshotData.xmax` 是普通 MVCC snapshot 的上界。`GetSnapshotData()` 中它来自 `TransamVariables->latestCompletedXid + 1`。
+
+源码注释说 `xmax` 永远是 latest completed xid 加一。对 `XidInMVCCSnapshot()` 来说，任何候选 XID `>= snapshot->xmax` 都按 still-running 返回 true。
+
+这不是因为这些事务一定真实还在运行。而是因为它们在 snapshot 创建时不可能已经作为 completed 事务进入这个读视角。
+
+一个事务可能在 snapshot 创建后才分配 XID。它自然不应该被旧 snapshot 看见。
+
+一个事务可能在 snapshot 创建后很快提交。旧 snapshot 也不应该因为它提交了就突然看见它。
+
+因此 `xmax` 把“snapshot 创建之后才进入可见性世界的事务”全部挡住。这能避免每次 visibility check 都去问“这个更大的 XID 是否后来提交了”。
+
+它也解释了为什么 snapshot 不是 committed-list。PostgreSQL 不需要列出所有 committed XID。
+
+它只需要：
+
+低于 `xmin` 的 XID 不再 running。高于等于 `xmax` 的 XID 对我仍算 running。
+
+中间区间用 running set 做例外判断。这个模型把大量旧 tuple 的判断变成范围检查。
+
+把大量新事务的判断也变成范围检查。只有 `[xmin, xmax)` 区间内的候选 XID 需要数组搜索或 fallback。
+
+这就是区间设计的性能意义。
+
+## 10. `xip`：区间里的 running top-level 例外
+
+`xip` 保存普通运行期的 running top-level XID。它不是所有事务。
+
+它不是所有 committed 事务。它也不保存当前 backend 自己的 XID。
+
+`GetSnapshotData()` 持有 `ProcArrayLock` shared。它扫描 `ProcGlobal->xids[]` 这样的 dense array。
+
+遇到 `InvalidTransactionId` 就跳过。遇到自己也跳过。
+
+遇到 `xid >= xmax` 也跳过，因为这种 XID 之后会被范围规则当作 running。遇到 lazy vacuum 或 logical decoding 特殊状态也有对应跳过或另行处理。
+
+剩下的 top-level XID 被加入 `snapshot->xip`。这组 XID 的意义很窄：
+
+它们在 snapshot 创建时仍在运行。并且它们落在 `[xmin, xmax)`。
+
+后续 `XidInMVCCSnapshot()` 在非 overflow 情况下会搜索 `xip`。如果候选 XID 在 `xip`，返回 true。
+
+这表示该 XID 对这个 snapshot 仍在运行。对插入者 `xmin` 来说，通常意味着插入版本不可见。
+
+对删除者 `xmax` 来说，通常意味着删除尚未生效，旧版本仍可见。这也说明不要把 `xip` 当成“不可见 tuple 列表”。
+
+同一个 running XID 出现在 `xip` 中，对 `xmin` 和 `xmax` 的影响方向不同。visibility 函数必须知道它正在解释的是插入事务还是删除事务。
+
+## 11. `subxip` 与 `suboverflowed`：完整性标志比数组本身更重要
+
+子事务让 snapshot 复杂起来。heap tuple header 里可能保存 SubXID。
+
+例如某个 savepoint 内执行了 INSERT。tuple 的 `xmin` 就可能是子事务 XID。
+
+如果 snapshot 只保存 top-level XID，遇到这个 SubXID 时就无法直接判断它是否属于某个 running top transaction。PostgreSQL 的 fast path 是把每个 backend 缓存的 running SubXID 复制到 `snapshot->subxip`。
+
+如果所有 relevant backend 都没有 overflow，`subxip` 是完整的 running subtransaction fast path。`XidInMVCCSnapshot()` 会先搜索 `subxip`。
+
+找到了就返回 true。没找到再搜索 `xip`。
+
+如果某个 backend 的 SubXID cache overflow，`GetSnapshotData()` 设置 `snapshot->suboverflowed = true`。这时 `subxip` 不再是完整集合。
+
+`XidInMVCCSnapshot()` 不再用“不在 subxip”来证明不 running。它会调用 `SubTransGetTopmostTransaction()`。
+
+候选 XID 被沿 `pg_subtrans` parent chain 转成 top-level XID。然后再查 `xip`。
+
+这个设计有一个重要后果：
+
+`suboverflowed` 是 snapshot 语义的一部分。它不是附加诊断字段。
+
+如果丢掉这个 bool，系统会把未缓存 SubXID 错判为不在运行。这会直接破坏 MVCC correctness。
+
+也要注意它不是 per-tuple 或 per-backend 的精确标志。只要 snapshot 采集时发现 relevant overflow，它就是 true。
+
+tuple header 不告诉你这个 XID 来自哪个 backend。所以 visibility check 只能在整个 snapshot 层面保守处理。
+
+## 12. `curcid`：为什么同一事务内部还需要命令切口
+
+到这里，snapshot 已经能描述其他事务了。但它还不能描述当前事务自己的写入。
+
+`GetSnapshotData()` 不会把当前 backend 自己的 XID 放进 `xip`。`XidInMVCCSnapshot()` 的注释也说明，调用者通常会先检查 `TransactionIdIsCurrentTransactionId()`。
+
+当前事务的可见性不是靠 `xip` 判断。它靠 command id。
+
+`SnapshotData.curcid` 记录当前命令开始时的 command id 边界。`HeapTupleSatisfiesMVCC()` 遇到当前事务插入的 tuple 时，会比较 tuple 的 `cmin` 和 `snapshot->curcid`。
+
+如果 `cmin >= curcid`，说明这个 tuple 是当前扫描开始后插入的。它对这个 snapshot 不可见。
+
+如果当前事务删除了 tuple，也会用 `cmax` 和 `curcid` 判断删除发生在扫描前还是扫描后。这解释了一个常见现象：
+
+同一个事务中，前一条命令插入的行，后一条命令能看到。但同一条语句内部，主查询通常看不到同一命令刚写入基表的新版本。
+
+这不是隔离级别之间的差异。这是同一事务内部 command cutoff 的规则。
+
+`CommandCounterIncrement()` 在命令之间推进 `currentCommandId`。如果当前 command id 曾被用来标记 tuple，它会加一。
+
+然后调用 `SnapshotSetCommandId()` 把新的 command id 传播到静态 snapshot。`GetSnapshotDataReuse()` 复用 snapshot 内容时，也会更新 `snapshot->curcid`。
+
+因此 `curcid` 是 snapshot 的必要字段。没有它，PostgreSQL 只能在同一事务里选择“永远看不到自己的写入”或“扫描中途看到自己刚写的行”。
+
+这两个选择都不符合 SQL 执行需要。
+
+## 13. `GetSnapshotData()` 主流程
+
+现在把字段放回创建流程。`GetSnapshotData(snapshot)` 要求传入的 snapshot 通常是静态存储。
+
+第一次使用时，它会给 `xip` 和 `subxip` 分配数组。分配发生在拿 `ProcArrayLock` 之前。
+
+这样 out-of-memory 不会发生在持锁区中。之后函数拿 `ProcArrayLock` shared。
+
+先尝试 `GetSnapshotDataReuse(snapshot)`。如果上一次构造 snapshot 后没有带 XID 的事务完成，旧的 running-set 内容仍然可用。
+
+这时函数只需要重新安装 `MyProc->xmin`、更新 `RecentXmin`、更新 `curcid` 和生命周期计数。如果不能复用，就读取 `latestCompletedXid`。
+
+计算 `xmax = latestCompletedXid + 1`。把 `xmin` 初始化为 `xmax`。
+
+把自己的 XID纳入 `xmin` 计算，但不加入 `xip`。然后扫描 ProcArray。
+
+每个 proc 只读取一次 top-level XID。没有 XID 的 backend 跳过。
+
+自己的 backend 跳过。`xid >= xmax` 的 backend 跳过。
+
+相关 backend 的 top-level XID 加入 `xip`。如果尚未发现 suboverflow，就检查该 backend 的 SubXID 状态。
+
+没有 overflow 时复制 cached SubXID 到 `subxip`。复制前使用 read barrier，和 SubXID 发布时的 write barrier 配对。
+
+发现 overflow 时设置本地 `suboverflowed`。recovery 分支不同。
+
+在 hot standby 中，系统从 KnownAssignedXids 获取 XID。因为恢复过程中不总是知道哪些是 top-level、哪些是 subxact，普通 `xip` 会保持空，XID 主要放进 `subxip`。
+
+`takenDuringRecovery` 让 `XidInMVCCSnapshot()` 使用不同解释。离开锁前，函数还读取 replication slot xmin 等信息。
+
+释放锁后，更新 `GlobalVis*` 的近似边界。最后写回 snapshot 字段：
+
+`xmin` `xmax`
+
+`xcnt` `subxcnt`
+
+`suboverflowed` `snapXactCompletionCount`
+
+`curcid` `active_count`
+
+`regd_count` `copied`
+
+这条流程解释了两个边界。snapshot 内容在持 `ProcArrayLock` 时形成。
+
+snapshot 消费时不继续持这个锁。PostgreSQL 用一次复制换来后续 heap scan 的无锁可见性判断。
+
+## 14. `GetSnapshotDataReuse()` 为什么成立
+
+`GetSnapshotDataReuse()` 是本基线源码里必须注意的优化。它依赖 `TransamVariables->xactCompletionCount`。
+
+这个计数在带 XID 的事务完成时、持 `ProcArrayLock` exclusive 的路径中推进。`GetSnapshotDataReuse()` 在持 `ProcArrayLock` shared 时读取当前计数。
+
+如果当前计数等于 snapshot 上次构造时记录的 `snapXactCompletionCount`，说明从上次构造到现在没有带 XID 的事务完成。在这个条件下，重新扫描 ProcArray得到的 running-set 内容应与旧 snapshot 一致。
+
+所以可以复用 `xip` 和 `subxip`。但 reuse 不是简单返回旧对象。
+
+函数仍然要处理当前 backend 的 snapshot 持有边界。如果 `MyProc->xmin` 无效，会重新安装 `snapshot->xmin`。
+
+`RecentXmin` 也会更新。`snapshot->curcid` 会用 `GetCurrentCommandId(false)` 更新。
+
+`active_count` 和 `regd_count` 会清零。`copied` 会设回 false。
+
+这说明 snapshot 有两类内容。一类是 running-set 内容。
+
+它可以在事务完成计数没变时复用。另一类是调用者当前命令和生命周期内容。
+
+它每次都要重新设置。如果把 snapshot 当成不可变值对象，就会误解这个优化。
+
+它更像一个可复用的 backend-local 工作区。
+
+## 15. `XidInMVCCSnapshot()` 的判断顺序
+
+`XidInMVCCSnapshot(xid, snapshot)` 不返回 tuple 可见性。它只回答这个 XID 按该 snapshot 是否仍在运行。
+
+第一步是范围判断。如果 `xid < snapshot->xmin`，返回 false。
+
+如果 `xid >= snapshot->xmax`，返回 true。这两个判断过滤掉大量 tuple。
+
+只有落在 `[xmin, xmax)` 内的 XID 才继续。普通运行期且未 overflow：
+
+先搜 `subxip`。再搜 `xip`。
+
+都没有则返回 false。普通运行期且 overflow：
+
+先用 `SubTransGetTopmostTransaction(xid)` 把候选 XID 转成 top-level XID。如果转换后小于 `xmin`，返回 false。
+
+然后只搜 `xip`。recovery snapshot 的结构不同。
+
+`xip` 通常为空。XID 主要保存在 `subxip`。
+
+overflow 时同样需要先走 `pg_subtrans` 转换。最后搜索 `subxip`。
+
+这段代码最重要的不是数组搜索函数。而是判断顺序。
+
+先用区间减少工作。再根据 `takenDuringRecovery` 选择解释方式。
+
+再根据 `suboverflowed` 决定是否需要 `pg_subtrans` fallback。最后才搜索数组。
+
+## 16. `HeapTupleSatisfiesMVCC()` 如何消费 snapshot
+
+`HeapTupleSatisfiesMVCC()` 是本节从 snapshot 回到 tuple 的核心入口。它的第一条重要约束是 snapshot 必须 active 或 registered。
+
+源码里有断言检查 `regd_count > 0 || active_count > 0`。这不是 visibility 逻辑本身需要 refcount。
+
+而是防止调用者使用可能被释放或失效的 snapshot。然后它处理插入事务 `xmin`。
+
+如果 tuple 已有 `HEAP_XMIN_INVALID`，不可见。如果插入事务是当前事务，就用 `cmin` 和 `snapshot->curcid` 判断。
+
+如果插入事务按 snapshot 仍在运行，返回不可见。如果不在运行，再查它是否 committed。
+
+committed 时可以设置 committed hint bit。否则设置 invalid hint bit 并返回不可见。
+
+如果 `xmin` 已有 committed hint bit，仍然不能直接认为可见。函数还会调用 `XidInMVCCSnapshot()`。
+
+因为一个事务可能已经真实提交，并被某个访问者设置了 hint bit。但对旧 snapshot 来说，它在创建 snapshot 时仍然 running。
+
+这种情况下仍要把它当作 running。处理删除或更新事务 `xmax` 时方向相反。
+
+如果 `xmax` 无效或只是锁，不影响可见。如果删除事务是当前事务，用 `cmax` 和 `curcid` 判断删除是否发生在扫描开始前。
+
+如果删除事务按 snapshot 仍在运行，旧版本仍可见。如果删除事务 committed，旧版本不可见。
+
+如果删除事务 aborted，旧版本可见。这解释了为什么 `XidInMVCCSnapshot()` 不能叫 `TupleVisibleInSnapshot()`。
+
+同一个 running 判断要根据它落在 `xmin` 还是 `xmax` 上翻译成不同结果。
+
+## 17. 可复现 SQL 现象一：区间和 running set
+
+下面实验展示 snapshot 不是最新全局状态。它要求两个会话。
+
+会话 A：
+
+```sql
+DROP TABLE IF EXISTS mvcc07;
+CREATE TABLE mvcc07(id int primary key, note text);
+INSERT INTO mvcc07 VALUES (1, 'old');
+BEGIN;
+INSERT INTO mvcc07 VALUES (2, 'from A, not committed yet');
+SELECT pg_backend_pid();
+-- 保持事务打开，不要提交。
+```
+
+会话 B：
+
 ```sql
 BEGIN;
-SELECT txid_current_snapshot();
-SELECT txid_snapshot_xmin(txid_current_snapshot());
-SELECT txid_snapshot_xmax(txid_current_snapshot());
+SELECT pg_current_snapshot() AS s1;
+SELECT count(*) FROM mvcc07, pg_sleep(5);
+SELECT pg_current_snapshot() AS s2;
 COMMIT;
 ```
-开另一个会话保持写事务，再观察 `xip` 是否变化。
-实验 2：断点观察字段。
-在 debug 环境断 `GetSnapshotData` 和 `XidInMVCCSnapshot`。
-执行一次普通 SELECT。
-打印 `snapshot->xmin`、`xmax`、`xcnt`、`subxcnt`、`suboverflowed`。
-实验 3：观察 snapshot 对 VACUUM 的影响。
-会话 A 开长事务并 SELECT。
-会话 B UPDATE/DELETE 大量行后 VACUUM。
-观察 `pg_stat_activity.backend_xmin` 和 VACUUM 是否不能回收全部 dead tuple。
-## 13. 源码细读补充：从 ProcArray 到 tuple 判断
-第一步，读 `snapshot.h`。
-不要先看字段名，先看 `SnapshotType`。
-`SNAPSHOT_MVCC` 的语义是普通 MVCC 读。
-它不同于 `SNAPSHOT_SELF`。
-它不同于 `SNAPSHOT_ANY`。
-它不同于 `SNAPSHOT_DIRTY`。
-本节所有 `xmin/xmax/xip` 讨论都默认 `SNAPSHOT_MVCC`。
-第二步，读 `SnapshotData` 字段注释。
-`xmin` 注释告诉你：
-小于它的 XID 都不在 snapshot running set。
-这不是 committed 断言。
-这是 in-progress 断言的下界。
-`xmax` 注释告诉你：
-大于等于它的 XID 都视为 in-progress。
-这不是说这些事务现在一定存在。
-它是 snapshot 对未来 XID 的屏障。
-第三步，读 `procarray.c:GetSnapshotData()`。
-这里会扫描 `PGPROC`。
-它读取每个 backend 发布的 top-level xid。
-它读取 subxid cache。
-它维护 `xmin`。
-它填充 `xip`。
-它在 subxid cache overflow 时设置 `suboverflowed`。
-第四步，读 `snapmgr.c:XidInMVCCSnapshot()`。
-这是消费 snapshot 字段的最短路径。
-先做 range check。
-再判断 recovery 与普通 snapshot。
-再查 `subxip` 或 `xip`。
-最后在 overflow 情况下追 parent。
-第五步，回到 `heapam_visibility.c`。
-`HeapTupleSatisfiesMVCC()` 对 `xmin` 和 `xmax` 分别调用事务状态和 snapshot 判断。
-它不会重新扫描 ProcArray。
-这说明 snapshot 是 visibility 的输入，而不是附属缓存。
-## 14. 字段判定矩阵
-看到 `xid < snapshot->xmin`：
-这个 XID 对本 snapshot 不 running。
-下一步通常要问 CLOG 或 hint bit。
-不要直接说它 committed。
-看到 `xid >= snapshot->xmax`：
-这个 XID 对本 snapshot 是未来事务。
-tuple 的插入者是这种 XID，则 tuple 不可见。
-tuple 的删除者是这种 XID，则删除对当前 snapshot 不可见。
-看到 `xmin <= xid < xmax` 且 xid 在 `xip`：
-这个 top-level XID 在 snapshot 创建时 running。
-它的插入对当前 snapshot 不可见。
-它的删除对当前 snapshot 不生效。
-看到 `xmin <= xid < xmax` 且 xid 不在 `xip`：
-如果它是 top-level XID，说明不 running。
-仍要问 commit/abort。
-如果它可能是 subxid，要看 `suboverflowed`。
-看到 `suboverflowed = false`：
-`subxip` 是子事务 fast path。
-不在 `subxip` 的 subxid 不是 snapshot 中的 running subxid。
-看到 `suboverflowed = true`：
-不能用“不在 subxip”下结论。
-必须追 `pg_subtrans` 找 top-level XID。
-看到 `takenDuringRecovery = true`：
-snapshot 来源不是普通 backend ProcArray。
-要把 KnownAssignedXids 纳入 mental model。
-看到 `curcid`：
-不要把它和全局 XID 比较。
-只用它判断本事务内 command 顺序。
-## 15. Runtime case：为什么同一条扫描稳定
-场景：
-会话 A 开始一次长 SELECT。
-会话 B 在 SELECT 扫描过程中 INSERT 并 COMMIT。
-READ COMMITTED 下，会话 A 下一条语句可能看到新行。
-但当前这条 SELECT 不应中途看到。
-原因是会话 A 的 executor 使用同一个 active snapshot。
-这份 snapshot 的 `xmax` 在语句开始时已经确定。
-会话 B 后来分配或提交的 XID 大概率大于等于这个 `xmax`。
-因此它被当作 future。
-如果会话 B 的 XID 已经在会话 A snapshot 创建前分配但未提交，它会在 `xip` 中。
-即使会话 B 扫描中途 commit，它仍对当前 snapshot 不可见。
-这解释了“statement-level consistency”。
-不是因为 heap scan 锁住了表。
-不是因为 SELECT 等待所有并发写入。
-而是 snapshot 字段把读视图固定。
-## 16. Runtime case：为什么 `txid_current_snapshot()` 不能替代内核诊断
-`txid_current_snapshot()` 能展示用户可见的 xmin、xmax 和 xip 列表。
-它对理解事务级边界有帮助。
-但它不展示所有内部细节。
-它不直接展示 `subxip` 完整情况。
-它不展示 `active_count`。
-它不展示 `regd_count`。
-它不展示 RegisteredSnapshots heap。
-它不展示 snapshot 是不是来自 recovery。
-它也不告诉你某个 heap tuple 的 hint bit 是否绕过了 CLOG 查询。
-因此诊断时不能只拿它当 truth。
-正确做法是：
-用 SQL 确认大方向。
-用 `pg_stat_activity.backend_xmin` 查 horizon。
-用 gdb 在 `GetSnapshotData()` 和 `XidInMVCCSnapshot()` 验证字段。
-用 `pageinspect` 或断点看 tuple header。
-把四者连起来。
-## 17. 诊断顺序：一行为什么不可见
-第一步，看 tuple header。
-确认 `xmin`、`xmax`、infomask、hint bit。
-第二步，看当前 snapshot。
-确认 `xmin/xmax/xip/suboverflowed/curcid`。
-第三步，对插入者 `xmin` 做判断。
-它是当前事务吗？
-它小于 snapshot xmin 吗？
-它大于等于 snapshot xmax 吗？
-它在 xip 中吗？
-它是 subxid 吗？
-第四步，问事务结果。
-如果不 running，查 CLOG 或 hint bit。
-第五步，对删除者 `xmax` 做同样判断。
-第六步，如果是当前事务，进入 command id 分支。
-第七步，如果是 row lock / MultiXact，不要套用普通 delete 语义。
-后续课程会展开。
-这个顺序能避免两个常见错误：
-把 snapshot 判断和 commit 判断混成一步。
-把 `xmax` 一律理解为删除者。
-## 18. 版本与实现边界
-`SnapshotData` 的核心语义稳定。
-但生成 snapshot 的具体优化会变化。
-例如 ProcArray 扫描复用、completion count、KnownAssignedXids 管理都可能演化。
-课程中要区分：
-稳定语义是 snapshot 固定读视图。
-当前实现是 `GetSnapshotData()` 填字段。
-稳定语义是 `suboverflowed` 触发 parent fallback。
-当前实现是通过 `pg_subtrans` SLRU 查 parent。
-稳定语义是 `curcid` 管 self-command visibility。
-当前实现是 `SnapshotSetCommandId()` 更新 snapshot。
-诊断时要以本地源码为准。
-不要把某篇旧博客里的字段顺序或函数名当成当前 truth。
-## 19. 逐函数阅读任务
-任务 1：`snapshot.h` 字段标注。
-把 `SnapshotData` 每个字段分成四类。
-第一类是事务区间字段：`xmin`、`xmax`。
-第二类是数组字段：`xip`、`subxip`、`xcnt`、`subxcnt`。
-第三类是解释标志：`suboverflowed`、`takenDuringRecovery`。
-第四类是生命周期和本地语义：`curcid`、`active_count`、`regd_count`。
-标注时不要复制结构体。
-只写每个字段回答哪个可见性问题。
-任务 2：`GetSnapshotData()` 生成字段。
-在 `procarray.c` 中找到函数入口。
-记录它什么时候持有 ProcArrayLock。
-记录它什么时候设置 `xmin`。
-记录它如何处理每个 `PGPROC` 的 xid。
-记录它如何复制 subxids。
-记录它如何处理 overflow。
-记录它如何让 `MyProc->xmin` 与 snapshot 对齐。
-任务 3：`XidInMVCCSnapshot()` 消费字段。
-画出 range check。
-再画出非 recovery 的 top-level XID 判断。
-再画出 suboverflowed fallback。
-最后把每个 return true/false 写成一句话语义。
-不要写“返回 true”。
-要写“在这个 snapshot 中视为 running”。
-任务 4：`HeapTupleSatisfiesMVCC()` 接入点。
-标出对 `xmin` 的判断。
-标出对 `xmax` 的判断。
-标出当前事务分支。
-标出 hint bit 分支。
-标出调用 `XidInMVCCSnapshot()` 的位置。
-最后回答：
-snapshot 判断和 CLOG 判断谁先谁后，为什么。
-任务 5：recovery snapshot 对照。
-在 `procarray.c` 搜 KnownAssignedXids。
-把 hot standby running set 和普通 ProcArray running set 分开画。
-解释 `takenDuringRecovery` 为什么不能省。
-## 20. 案例推演：给定字段如何判定
-案例 1：
-`snapshot xmin=100, xmax=120, xip={105,110}`。
-tuple `xmin=90`。
-结论：
-不在 snapshot running set。
-下一步查事务结果。
-如果 committed，则插入可见。
-如果 aborted，则插入不可见。
-案例 2：
-同一 snapshot，tuple `xmin=105`。
-结论：
-插入者在 `xip`。
-它在 snapshot 中 running。
-插入不可见。
-即使它在扫描后半段 commit，也不改变当前 snapshot。
-案例 3：
-同一 snapshot，tuple `xmin=121`。
-结论：
-大于等于 `xmax`。
-它是 future transaction。
-插入不可见。
-案例 4：
-tuple `xmax=110`。
-删除者在 snapshot running set。
-删除对当前 snapshot 不生效。
-如果插入可见，则旧版本仍可见。
-案例 5：
-tuple `xmax=90` 且删除事务 committed。
-删除早于 snapshot。
-旧版本不可见。
-案例 6：
-tuple XID 是 subxid，`suboverflowed=false`，不在 `subxip`。
-可以按不 running 继续查最终结果。
-案例 7：
-tuple XID 是 subxid，`suboverflowed=true`。
-必须追 parent。
-不允许因为不在 `subxip` 就判定不 running。
-案例 8：
-tuple 是当前事务插入，cmin 大于等于 `curcid`。
-它来自当前 snapshot 之后的 command。
-当前 command 不应看见。
-## 21. 与后续课程的衔接
-第 8 节会问：
-READ COMMITTED 什么时候重新构造这些字段。
-第 9 节会问：
-REPEATABLE READ 什么时候复用这些字段。
-第 10 节会问：
-`curcid` 如何把同一事务内部 command 纳入判断。
-第 11 节会问：
-`active_count/regd_count` 如何决定字段对象活多久。
-第 12 节会问：
-`xmin` 如何变成 VACUUM cleanup horizon。
-第 14 节会把这些字段带入 `HeapTupleSatisfiesMVCC()` 的完整分支。
-所以本节最重要的产出不是背字段。
-而是形成一个判断流程：
-先判断 XID 区间。
-再判断 running set。
-再处理子事务 fallback。
-再问最终事务结果。
-最后处理当前事务 command id。
-## 22. 深入展开：`xmin/xmax` 的双重误读
-`xmin` 最容易被误读成“最老可见事务”。
-这个说法不够精确。
-对 snapshot 来说，`xmin` 是 running set 的低水位。
-它告诉 visibility code：
-小于这个 XID 的事务，不需要再问“它是否还在本 snapshot 中运行”。
-它没有告诉你这个事务 committed。
-如果 CLOG 说 aborted，tuple 仍不可见。
-如果 hint bit 说 invalid，tuple 也不可见。
-所以 `xmin` 只排除 in-progress，不证明 success。
-`xmax` 也容易被误读成“当前 nextXid”。
-它更像 snapshot 的 future fence。
-大于等于 `xmax` 的 XID，对本 snapshot 来说都是未来。
-未来事务的插入不可见。
-未来事务的删除不生效。
-这个 fence 是 READ COMMITTED 单语句稳定性的关键。
-如果没有 `xmax`，扫描中途新分配 XID 的事务可能被错误纳入。
-`xmin/xmax` 合起来把无限 XID 空间切成三段：
-低段不 running。
-中段需要查数组或 fallback。
-高段视为 future/running。
-`xip/subxip` 只负责中段。
-这能显著减少查找成本。
-这也解释了为什么 snapshot 不是单纯保存 running XID list。
-没有区间边界，数组缺失就无法解释。
-## 23. 深入展开：`xip` 与 `subxip` 的不同承诺
-`xip` 是 top-level running XID 列表。
-普通事务的 tuple header 大多数时候记录 top-level XID。
-查 `xip` 就能回答它在 snapshot 中是否 running。
-`subxip` 是优化。
-它允许直接判断某个 subxid 是否 running。
-但系统不保证 shared memory 中永远能保存完整 subxid 集合。
-因此 `suboverflowed` 是 `subxip` 的 contract 边界。
-如果没有 overflow：
-`subxip` 不包含某 subxid，通常可以认为它不在 snapshot 的 running subxid 集合中。
-如果 overflow：
-`subxip` 不完整。
-不在数组里不能说明 anything decisive。
-必须追 parent。
-这体现了 PostgreSQL 的常见设计：
-fast path 保存有限集合。
-overflow 后回到更慢但正确的持久映射。
-把这个模式记住，后面看 MultiXact、predicate lock、relcache invalidation 都会遇到类似结构。
-`takenDuringRecovery` 让这个判断更复杂。
-recovery 中没有普通写事务 backend 发布自己的 `PGPROC.xid`。
-standby 需要从 WAL replay 中维护 KnownAssignedXids。
-因此 snapshot 的 running set 来源变了。
-字段名称一样，生成机制不同。
-诊断 hot standby 可见性时必须把这一层纳入。
-## 24. 深入展开：snapshot 字段与 CLOG 的先后关系
-普通 MVCC 判断经常遵循这个思路：
-先判断事务是否在 snapshot 中 running。
-再判断事务最终是否 committed。
-这个顺序不是随意的。
-`heapam_visibility.c` 文件开头注释解释了 race。
-如果只查 CLOG，可能看到某个事务已经 committed。
-但另一个并发 snapshot 在更早时刻仍会把它视作 running。
-为了保持一致，visibility code 需要遵守 snapshot 的 running 判断。
-这就是为什么 `TransactionIdIsInProgress()` / `XidInMVCCSnapshot()` 和 `TransactionIdDidCommit()` 不能任意交换。
-在 snapshot 语境下：
-“现在已经提交”不等于“对这个 snapshot 可见”。
-可见性要问：
-它在 snapshot 创建时是否 running？
-如果 running，当前 snapshot 不看见它的插入。
-如果不 running，再问它最终是否 committed。
-这个顺序也解释了 hint bit 的保守设置。
-hint bit 可以缓存 commit/abort 事实。
-但它不能改变 snapshot 的时间边界。
-一个 committed hint bit 只能说明事务成功。
-不能让已经在 snapshot `xip` 中的事务突然可见。
-## 25. 深入展开：`curcid` 为什么也在 `SnapshotData`
-`SnapshotData` 看起来是事务间读视图。
-但它还带 `curcid`。
-原因是 visibility routine 的输入需要同时处理两类问题：
-其他事务是否 running。
-当前事务内哪个 command 的效果可见。
-如果把 `curcid` 放在别处，heap visibility 每次处理 current transaction tuple 时仍要取本地事务状态。
-把它放进 snapshot，可以让 visibility routine 用统一输入判断。
-`SnapshotSetCommandId()` 负责同步。
-`CommandCounterIncrement()` 递增 command id 后，会更新当前 snapshot。
-这就是第 10 节要展开的内容。
-本节先记住：
-`curcid` 不参与 `xip` 判断。
-它只在 tuple 的 `xmin/xmax` 属于当前事务时生效。
-它和 `xmin/xmax` 字段同名相近，但语义完全不同。
-一个是事务 ID 区间。
-一个是命令 ID 边界。
-## 26. 小型练习：手写 `XidInMVCCSnapshot()` 判定表
-拿一张纸写四列：
-输入 XID。
-范围判断。
-数组判断。
-返回语义。
-对下列输入逐个填写：
-`xid=90, xmin=100, xmax=120`。
-`xid=100, xip` 中存在。
-`xid=100, xip` 中不存在。
-`xid=119, suboverflowed=false, subxip` 中不存在。
-`xid=119, suboverflowed=true`。
-`xid=120`。
-填表时不要写 committed / aborted。
-只能写 running for this snapshot 或 not running for this snapshot。
-然后再加一列：
-下一步是否需要 CLOG。
-这个练习能强迫你把 snapshot 判断和事务结果判断分开。
-## 27. 讨论题
-1. 为什么 snapshot 需要同时有 `xmin` 和 `xmax`，只保存 running XID 数组不够吗？
-2. `xid < xmin` 时为什么不能直接说 committed？
-3. `xid >= xmax` 为什么要当作 running/future？
-4. `suboverflowed` 为什么是正确性 fallback，而不是错误状态？
-5. `curcid` 为什么放在 snapshot 中，而不只放在全局 transaction state？
-6. hot standby snapshot 为什么需要 `takenDuringRecovery` 这种标志？
-7. 长期 registered snapshot 为什么会影响 VACUUM？
-8. 诊断“为什么旧版本不回收”时，snapshot 字段和 CLOG 状态分别回答什么问题？
-## 23. 本节小结
-`SnapshotData` 是 MVCC 读视图的压缩表示。
-`xmin/xmax` 给出事务 ID 区间边界。
-`xip/subxip` 给出区间内仍运行的事务集合。
-`suboverflowed` 保护子事务集合不完整时的正确性。
-`takenDuringRecovery` 区分 recovery snapshot。
-`curcid` 处理同事务内 command 可见性。
-它不直接说明事务是否 committed。
-它只说明在这个读视图中哪些事务仍应被视为进行中或未来。
-最终可见性由 snapshot、CLOG/hint bit、tuple header 和 command id 共同决定。
+
+在 B 的 `pg_sleep(5)` 期间让会话 A 执行：
+
+```sql
+COMMIT;
+```
+
+B 的这一次 `SELECT count(*)` 不会因为 A 在扫描期间提交而突然多出一行。如果 B 随后再执行一条新的查询，在 READ COMMITTED 下通常能看到第二行。
+
+本节只解释第一条查询内部为什么稳定。B 创建 snapshot 时，A 的 XID 在运行。
+
+这个 XID 落进 `xip` 或被 `xmax` 范围挡住。`HeapTupleSatisfiesMVCC()` 遇到 A 插入的 tuple `xmin` 时，按这个 snapshot 把它视为 still-running。
+
+A 后来提交只会改变真实事务状态。不会修改 B 已经拿到的 snapshot。
+
+所以单条查询内部稳定来自 snapshot 的复制语义。不是来自阻塞提交。
+
+不是来自表锁。也不是来自每行重新读取最新 CLOG。
+
+## 18. 可复现 SQL 现象二：同一事务内的 command cutoff
+
+下面实验展示 `curcid`。仍然只需要普通 SQL。
+
+```sql
+DROP TABLE IF EXISTS mvcc07_cid;
+CREATE TABLE mvcc07_cid(id int primary key);
+BEGIN;
+INSERT INTO mvcc07_cid VALUES (1);
+SELECT count(*) FROM mvcc07_cid;
+WITH ins AS (
+  INSERT INTO mvcc07_cid VALUES (2)
+  RETURNING id
+)
+SELECT
+  (SELECT count(*) FROM mvcc07_cid) AS count_from_base_table,
+  (SELECT count(*) FROM ins) AS count_from_returning;
+COMMIT;
+```
+
+第一条 `SELECT count(*)` 能看到前一条命令插入的 `id = 1`。这是命令之间执行了 command counter 推进。
+
+`currentCommandId` 增加后，新的 snapshot `curcid` 边界允许看到之前命令的写入。数据修改 CTE 这一条语句里，主查询对基表的读取仍使用同一语句的 snapshot/command boundary。
+
+刚由同一命令写入的基表版本不会通过重新扫描基表变成可见。但 `RETURNING` 结果是数据修改节点显式返回的结果流。
+
+它不是靠基表 visibility 重新读出来。这组现象能把两个概念分开：
+
+前后两条命令之间，自写入通过 CCI 变得可见。同一条命令内部，`curcid` 阻止扫描中途看到自己刚写的基表版本。
+
+源码对应点在 `HeapTupleSatisfiesMVCC()`。当前事务插入路径比较 `HeapTupleHeaderGetCmin(tuple)` 和 `snapshot->curcid`。
+
+当前事务删除路径比较 `HeapTupleHeaderGetCmax(tuple)` 和 `snapshot->curcid`。
+
+## 19. 观测入口：能看到什么，不能看到什么
+
+SQL 层可以看到一部分 snapshot 边界。`pg_current_snapshot()` 返回外部化的 snapshot 表示。
+
+`pg_snapshot_xmin()` 可以取出 xmin。`pg_snapshot_xmax()` 可以取出 xmax。
+
+`pg_snapshot_xip()` 可以列出 snapshot 外部表示里的 in-progress XID。历史兼容函数 `txid_current_snapshot()` 也存在。
+
+这些函数适合展示区间模型。它们不完整暴露内部 `SnapshotData`。
+
+例如 `curcid` 不会作为 SQL snapshot 输出的一部分出现。`suboverflowed` 也不是普通 SQL 直接可见字段。
+
+`takenDuringRecovery` 是内部解释标志。`active_count` / `regd_count` 是生命周期字段。
+
+`pg_stat_activity.backend_xmin` 能观察 backend 暴露给全局 cleanup 的 xmin。它不是某个具体 query 的完整 `SnapshotData` dump。
+
+`backend_xid` 能看到该 backend 当前顶层事务 XID。没有 XID 的事务不会因此出现在 tuple visibility 的 XID 世界里。
+
+如果要观察 `XidInMVCCSnapshot()` 是否走 overflow fallback，通常需要断点、debug log、DTrace/perf 或临时计数器。如果要观察 `HeapTupleSatisfiesMVCC()` 的分支，需要 gdb、tracepoint 或构造 hint bit/CLOG 状态实验。
+
+不要把 `pg_current_snapshot()` 输出等同于所有内部字段。它是用户态可读的投影。
+
+不是 `SnapshotData` 原样序列化。
+
+## 20. 错误路径与 fallback
+
+第一个错误路径是 snapshot 数组分配失败。`GetSnapshotData()` 第一次使用静态 snapshot 时会为 `xip` 和 `subxip` 调用 `malloc`。
+
+失败会报 out of memory。这发生在拿 `ProcArrayLock` 之前。
+
+因此不会留下持锁状态。第二个 fallback 是 `GetSnapshotDataReuse()` 失败。
+
+只要 `snapXactCompletionCount` 为 0，或者全局 completion count 改变，就必须重新扫描 ProcArray。这不是错误。
+
+这是复用条件不成立。第三个 fallback 是 SubXID overflow。
+
+`suboverflowed` 不会让 snapshot 无效。它让 `XidInMVCCSnapshot()` 在必要时走 `pg_subtrans`。
+
+正确性保住了。成本转移到了 tuple visibility hot path。
+
+第四个边界是 recovery snapshot。`takenDuringRecovery` 改变 `xip` 和 `subxip` 的解释。
+
+如果课程或调试时把 recovery snapshot 当成普通 snapshot，会把 `xip` 为空误读为没有 running XID。第五个边界是 command id overflow。
+
+`CommandCounterIncrement()` 如果把 command id 推到无效值，会报错。这属于事务内命令数量的极端边界。
+
+普通 workload 很少碰到。但它说明 `curcid` 不是无限计数器。
+
+第六个边界是使用未注册 snapshot。生产版本不一定靠断言保护你。
+
+代码约定要求调用者在非平凡工作前 `RegisterSnapshot()` 或 `PushActiveSnapshot()`。这就是为什么 `HeapTupleSatisfiesMVCC()` 开头强调 active/registered。
+
+## 21. 成本模型
+
+snapshot 的成本有两个阶段。创建阶段主要随 backend 数和 SubXID cache 大小增长。
+
+消费阶段主要随扫描 tuple 数、XID 分布和 overflow 状态增长。`GetSnapshotData()` 要扫描 ProcArray。
+
+相关成本受 `arrayP->numProcs`、active XID 数、SubXID 数、是否 recovery、是否能复用影响。它持 `ProcArrayLock` shared。
+
+高并发提交路径需要 exclusive 结束事务状态。因此 snapshot 获取和事务结束之间存在同步边界。
+
+`GetSnapshotDataReuse()` 减少重复扫描。当没有带 XID 的事务完成时，旧 running set 可以复用。
+
+这对高频短查询有意义。但它不能消除所有 snapshot 成本。
+
+`curcid`、refcount、`MyProc->xmin` 仍要更新。`XidInMVCCSnapshot()` 的成本通常很低。
+
+大量 tuple 会被 `xid < xmin` 或 `xid >= xmax` 范围判断过滤。落在区间内才搜索数组。
+
+数组搜索使用 `pg_lfind32()` 这样的局部优化。但它仍然是每个候选 tuple 的工作。
+
+SubXID overflow 会把部分判断推到 `pg_subtrans`。这可能引入 SLRU lookup、cache miss 和 parent chain 遍历。
+
+这个成本常常由读者承担。不一定由制造大量 savepoint 的事务承担。
+
+hint bit 也影响成本。如果 tuple 上没有 committed/invalid hint bit，visibility 需要查询 CLOG/pg_xact。
+
+但如果按旧 snapshot 某个 XID still-running，`HeapTupleSatisfiesMVCC()` 故意不去更新 hint bit。这样避免对高流量共享状态做无意义查询。
+
+代价是后续足够新的 snapshot 才能设置 hint bit。成本传播路径可以概括为：
+
+backend 数增加，ProcArray scan 成本上升。长事务存在，`xmin` 下界被拉低，旧版本和 CLOG 压力延长。
+
+SubXID overflow 出现，tuple visibility fallback 成本上升。tuple 数增加，`XidInMVCCSnapshot()` 的每行成本被放大。
+
+hint bit 未设置，CLOG 查询和 buffer dirty 机会增加。
+
+## 22. 跨模块边界
+
+`SnapshotData` 连接多个模块。第一个边界是 ProcArray。
+
+`GetSnapshotData()` 从 ProcArray 复制 running top XID 和 SubXID 状态。它依赖事务结束路径先写事务结果，再从 ProcArray 清除 running 身份。
+
+否则 snapshot 可能把一个结果还不可解释的事务当成已结束。第二个边界是 CLOG/pg_xact。
+
+snapshot 只回答 running 与否。不回答 committed 或 aborted。
+
+当 `XidInMVCCSnapshot()` 返回 false，`HeapTupleSatisfiesMVCC()` 还要通过 hint bit 或 `TransactionIdDidCommit()` 解释结果。第三个边界是 `pg_subtrans`。
+
+当 `suboverflowed` 为 true，SubXID 需要映射到 top-level XID。`pg_subtrans` 只提供 parent chain。
+
+它不提供事务结果。第四个边界是 command counter。
+
+当前事务的可见性不能靠 ProcArray。它靠 `curcid`、`cmin`、`cmax` 和 combo CID 相关机制。
+
+第五个边界是 VACUUM / GlobalVis。`GetSnapshotData()` 会维护 `RecentXmin` 和 `GlobalVis*` 近似边界。
+
+这些边界影响 cleanup。但普通 MVCC tuple 可见性不能简化成 vacuum horizon 判断。
+
+第六个边界是 recovery。Hot standby 使用 KnownAssignedXids。
+
+它让 snapshot 字段布局和普通运行期不同。因此课程、断点和工具都必须先区分 `takenDuringRecovery`。
+
+## 23. 常见误区
+
+误区一：
+
+把 `xmin` 读成“所有小于它的 tuple 都可见”。正确说法是小于它的 XID 按该 snapshot 不在运行。
+
+最终可见性还要看 committed/aborted 以及它是 `xmin` 还是 `xmax`。误区二：
+
+把 `xmax` 读成“最大可见事务”。更准确的是所有 `xid >= xmax` 对该 snapshot 视为 still-running。
+
+它是上界，不是 commit 列表末尾。误区三：
+
+把 `xip` 当成不可见行列表。`xip` 是 running top-level XID 列表。
+
+对插入者和删除者的效果不同。误区四：
+
+认为 `subxip` 为空说明没有 running SubXID。如果 `suboverflowed` 为 true，这个结论不成立。
+
+如果 `takenDuringRecovery` 为 true，字段解释也不同。误区五：
+
+把 `pg_current_snapshot()` 当成内部 `SnapshotData` 完整输出。它只是外部类型 `pg_snapshot` 的投影。
+
+看不到 `curcid`、refcount、recovery 标志等内部状态。误区六：
+
+把 hint bit 当成 snapshot 语义。hint bit 是 tuple header 上对事务结果的缓存。
+
+旧 snapshot 仍然可以把一个已有 committed hint bit 的 XID 当作 still-running。误区七：
+
+以为同一事务里所有自写入都自动可见。自写入要过 command cutoff。
+
+`curcid` 决定当前扫描是否能看到该命令之前的写入。
+
+## 24. 课堂实验
+
+实验一：画出 snapshot 区间。打开两个会话。
+
+在会话 A 中 `BEGIN` 并执行一次写入，保持不提交。在会话 B 中执行 `SELECT pg_current_snapshot();`。
+
+再用 `pg_snapshot_xmin()`、`pg_snapshot_xmax()`、`pg_snapshot_xip()` 拆开输出。然后提交 A。
+
+在 B 中再次执行 `SELECT pg_current_snapshot();`。对比两次输出。
+
+把变化回到 `GetTransactionSnapshot()` 和 `GetSnapshotData()` 的调用边界解释。实验二：观察 long transaction 对 `backend_xmin` 的影响。
+
+会话 A 执行 `BEGIN; SELECT pg_current_snapshot();` 后保持打开。会话 B 查询 `pg_stat_activity` 中 A 的 `backend_xmin`。
+
+再制造大量 update/delete。观察 VACUUM 不能轻易移除仍可能被旧 snapshot 看到的版本。
+
+解释时不要把 `backend_xmin` 当成唯一 cleanup 决策。只把它当成重要输入之一。
+
+实验三：验证 command cutoff。使用前面 `mvcc07_cid` 的 SQL。
+
+在 `HeapTupleSatisfiesMVCC()` 给当前事务插入分支打断点。观察 `HeapTupleHeaderGetCmin(tuple)` 与 `snapshot->curcid` 的比较。
+
+再在 `CommandCounterIncrement()` 打断点。观察命令之间 `SnapshotSetCommandId()` 如何传播新的 command id。
+
+实验四：观察 SubXID overflow 退化。用 PL/pgSQL exception block 或大量 savepoint 生成超过 64 个写入型子事务。
+
+保持事务打开。另一个会话扫描这些 tuple。
+
+在 `XidInMVCCSnapshot()` 和 `SubTransGetTopmostTransaction()` 打断点。对照 `snapshot->suboverflowed` 是否改变路径。
+
+这个实验不要求把所有性能差异量化。重点是看 fallback 边界。
+
+## 25. 讨论题
+
+为什么一个更小的 XID 可能对当前 snapshot 不可见，而一个更大的 XID 可能已经对下一条语句可见？为什么 `GetSnapshotData()` 不把当前 backend 自己的 XID 放进 `xip`？
+
+如果没有 `xmax`，系统要如何处理 snapshot 创建后才分配 XID 的事务？如果没有 `suboverflowed`，SubXID cache 满了以后哪类 tuple 会被错判？
+
+为什么 `HeapTupleSatisfiesMVCC()` 在旧 snapshot 下不急着查询真实事务状态并设置 hint bit？`curcid` 解决的是隔离级别问题，还是同一事务内部命令边界问题？
+
+`pg_current_snapshot()` 能证明哪些字段，不能证明哪些字段？为什么 snapshot 的 `xmin` 和 VACUUM 的可移除边界不能简单画等号？
+
+## 26. 一次可见性判断的时间线复盘
+
+把本节所有字段放进一条时间线。事务 A 分配 XID 100。
+
+A 插入一行。tuple header 的 `xmin` 写成 100。
+
+A 暂时不提交。事务 B 创建 snapshot。
+
+`GetSnapshotData()` 计算 `xmax`。如果 latest completed 是 99，那么 `xmax` 可能是 100。
+
+但如果 A 的 XID 已经分配且仍 running，它会被纳入 running 判断。实际情况取决于 A 分配和完成时序。
+
+关键不是某个具体数字。关键是 snapshot 会把“创建时还没完成”的事实编码进区间或 `xip`。
+
+B 开始扫描。`HeapTupleSatisfiesMVCC()` 看到 tuple 的 `xmin = 100`。
+
+它先处理 hint bit。如果没有 committed hint bit，它会问 `XidInMVCCSnapshot(100, snapshot)`。
+
+如果 100 按 B 的 snapshot still-running，B 直接认为插入者还在运行。这行不可见。
+
+此时 A 提交。CLOG/pg_xact 已经可以回答 100 committed。
+
+但 B 的旧 snapshot 不因此改变。B 再次扫描同一行时，如果仍在同一 statement 或同一 registered snapshot 下，它仍按旧 snapshot 判断。
+
+这就是 MVCC snapshot 的稳定性。之后事务 C 创建新的 snapshot。
+
+100 已经不在 ProcArray running set 中。如果 100 小于 C 的 `xmin`，`XidInMVCCSnapshot()` 会直接返回 false。
+
+`HeapTupleSatisfiesMVCC()` 再通过 hint bit 或 CLOG 确认 100 committed。这行对 C 可见。
+
+同一个事务结果，在不同 snapshot 下得到不同 visibility。这不是矛盾。
+
+这是 snapshot 语义。它表达的是“对这个读者而言，创建 snapshot 时世界长什么样”。
+
+真实事务状态会继续前进。旧读者不会追着它前进。
+
+如果 tuple 上后来被 C 设置了 committed hint bit，B 的旧 snapshot 仍然可能把 100 当成 still-running。`HeapTupleSatisfiesMVCC()` 里有专门分支处理这种情况。
+
+hint bit 只是事务结果缓存。snapshot running 判断优先保留旧读者的稳定视角。
+
+这条时间线也解释了为什么不能把 visibility debug 简化成“看 CLOG 当前状态”。你必须同时问：
+
+tuple header 指向哪个 XID。这个 XID 对当前 snapshot 是否 still-running。
+
+如果不 running，它在 CLOG 中 committed 还是 aborted。如果是当前事务，它的 command id 和 snapshot `curcid` 如何比较。
+
+这四个问题少一个都会误判。
+
+## 27. 为什么 snapshot 不记录 committed set
+
+有人会提出另一种模型：
+
+snapshot 创建时，把已经提交的事务都记录下来。之后 visibility 只问 tuple 的 XID 是否在 committed set 中。
+
+这个模型在小型教学系统里很直观。但在 PostgreSQL 里不可行。
+
+第一，committed set 会无限增长。集群运行时间越长，提交过的 XID 越多。
+
+把它们复制进每个 snapshot，内存和 CPU 都无法接受。第二，tuple visibility 不只需要判断插入事务是否 committed。
+
+删除事务 `xmax` committed 时，旧版本反而不可见。因此 committed set 仍然需要额外上下文。
+
+第三，子事务状态会引入 `SUB_COMMITTED`、parent chain 和 top-level commit。单纯 committed set 无法表达“子事务自己的状态需要回到父事务解释”。
+
+第四，当前事务自可见性不能用 committed set 解决。当前事务还没提交，但前一条命令写入的 tuple 对后一条命令可见。
+
+同一条命令刚写入的 tuple 对基表扫描通常不可见。这只能靠 command id 边界解释。
+
+第五，abort 和 crash 也必须能解释。如果 snapshot 只保存 committed set，那么不在集合里的 XID 可能是 running、aborted、future 或 unknown。
+
+这些状态对 `xmin` 和 `xmax` 的处理不同。PostgreSQL 选择记录 running set。
+
+因为活跃集合的规模受 backend 数和 SubXID cache/fallback 约束。旧的 committed 事务不需要逐个列出。
+
+它们通过 `xmin` 范围和 CLOG/hint bit 被延迟解释。这个选择把 snapshot 大小从“历史长度”压缩到“当前并发宽度”。
+
+这就是 MVCC 系统中非常典型的工程取舍。保存历史完整性很贵。
+
+保存当前不稳定边界更划算。
+
+## 28. 版本、workload 与推断边界
+
+本节基于 `/home/highgo/postgres` 的当前分支。核心语义相对稳定。
+
+例如普通 MVCC snapshot 由区间加 running set 构成。`XidInMVCCSnapshot()` 先做范围判断。
+
+`HeapTupleSatisfiesMVCC()` 区分插入事务和删除事务。这些不是某个小 patch 的偶然结果。
+
+但具体实现细节会随版本变化。`GetSnapshotDataReuse()`、dense ProcGlobal arrays、`GlobalVis*` 维护、batch visibility helper 都可能演进。
+
+课程中提到的性能结论要带 workload 条件。backend 很少、事务很短时，ProcArray scan 可能不是瓶颈。
+
+backend 很多、语句很短时，snapshot 获取可能很显眼。SubXID overflow 少见时，`pg_subtrans` fallback 不是主要成本。
+
+PL/pgSQL exception block 很多时，它可能突然出现在读路径 profile 中。hint bit 已经热身过的表，CLOG 查询少。
+
+冷数据、频繁 vacuum freeze、异步 commit 或 crash recovery 之后，hint bit 和事务状态查询的分布会不同。诊断时不要把一个实验结果直接推广到所有系统。
+
+先确认 workload 的并发宽度。再确认长事务和 backend_xmin。
+
+再确认 SubXID overflow 可能性。最后再把现象映射回本节的 snapshot 字段和 heap visibility 分支。
+
+## 29. 本节小结
+
+本节只回答了一个问题：
+
+`SnapshotData` 为什么是区间、running set、SubXID 完整性标志和 command cutoff 的组合。答案来自 PostgreSQL 的运行约束。
+
+XID 分配顺序不是提交顺序。事务完成状态会在 snapshot 创建后继续变化。
+
+子事务集合不能无限保存在 shared memory 中。heap scan 不能每个 tuple 都重新扫描 ProcArray。
+
+同一事务内部还必须区分不同命令写入的 tuple。因此普通 MVCC snapshot 采用：
+
+`xmin` 过滤足够旧的 XID。`xmax` 挡住 snapshot 创建后才进入视野的 XID。
+
+`xip` 保存区间内 running top-level XID。`subxip` 保存可枚举的 running SubXID。
+
+`suboverflowed` 在信息不完整时触发 `pg_subtrans` fallback。`curcid` 切开当前事务自己的命令边界。
+
+`XidInMVCCSnapshot()` 只回答 XID 是否按 snapshot still-running。`HeapTupleSatisfiesMVCC()` 才把这个答案翻译成 tuple 可见或不可见。
+
+本节的可迁移规律是：
+
+一个系统快照不是全局状态本身。它是为了后续 hot path 可重复判断而复制出来的最小充分状态。
+
+字段的意义必须和创建时机、生命周期、fallback 和消费路径一起解释。下一节会把这个字段模型放进 READ COMMITTED。
+
+同样的 `SnapshotData` 会在每条语句重新创建，但在单条语句内部被注册并固定。

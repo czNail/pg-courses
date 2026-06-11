@@ -1,58 +1,63 @@
 # PostgreSQL WAL resource manager 与 redo contract
 
 ## 课程定位
-本节主题：PostgreSQL 如何把 WAL record 分派给 resource manager，也就是 rmgr，以及每个 rmgr 的 redo routine 必须遵守什么 contract。
-上一节已经看过 full-page image、torn page 和 page LSN。
-这一节继续往 recovery 侧走。
-前置知识：已理解 WAL record layout、FPI、page LSN 和 WAL-before-data。
-本节唯一主问题：一条已经通过通用 WAL 层读取和校验的 record，怎样交给 rmgr 安全、幂等地改变数据页？
-本节核心矛盾：通用 WAL 层必须不理解 heap、btree、GIN 等具体语义；但 crash recovery 又必须让每个具体页面修改严格按模块 contract 生效。
-本节主流程：recovery loop 读 record -> xlogreader 校验并 decode -> `ApplyWalRecord()` 按 `xl_rmid` 分派 -> rmgr 通过 xlogutils 取得 page/action -> redo 修改 page 并设置 LSN -> cleanup/error context 收尾。
-观测与诊断入口是 startup/recovery 日志、`pg_waldump` 的 rmgr desc、redo 错误上下文、`ReadRecord()` / `ApplyWalRecord()` / rmgr redo 断点，以及 page LSN 对 redo skip 的验证。
-重点不是“WAL record 里有什么字段”。
-重点是：一条已经读出来、校验过、decode 过的 WAL record，怎样变成一次安全、幂等、可中断边界清晰的 redo 动作。
-读完本节，你应该能回答：
-- `RmgrId` 为什么是 WAL 格式的一部分。
-- `rmgrlist.h` 的顺序为什么不能随便改。
-- `RmgrTable` 里除了 `rm_redo` 之外还有哪些 recovery 相关回调。
-- crash recovery 主循环在哪里调用 rmgr redo。
-- `XLogReaderState` 什么时候已经完成 record decode。
-- main data、block data、full-page image 在 redo 侧怎样取。
-- 为什么有 FPI 时可能不看 page LSN，直接 restore。
-- 为什么无 FPI 时必须用 record end LSN 和 page LSN 做幂等判断。
-- `XLogReadBufferForRedo()` 的返回值对 redo routine 意味着什么。
-- `XLogInitBufferForRedo()` 和 `BKPBLOCK_WILL_INIT` 之间是什么 contract。
-- heap、btree、GiST、GIN 的 redo 例子展示了哪些不同边界。
-- redo routine 遇到不可能的 WAL 内容时为什么通常 `PANIC`。
 
-## 源码基线
-源码仓库：`/home/nail/postgres-lab`
-基线：`master` = `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`
-本节重点阅读：
-- `src/backend/access/transam/rmgr.c`
-- `src/backend/access/transam/xlogrecovery.c`
-- `src/backend/access/transam/xlogreader.c`
-- `src/backend/access/transam/xlogutils.c`
-- `src/include/access/rmgr.h`
-- `src/include/access/rmgrlist.h`
-- `src/include/access/xlogreader.h`
-本节 redo 示例重点阅读：
-- `src/backend/access/heap/heapam_xlog.c`
-- `src/backend/access/nbtree/nbtxlog.c`
-- `src/backend/access/gist/gistxlog.c`
-- `src/backend/access/gin/ginxlog.c`
-辅助核对：
-- `src/include/access/xlog_internal.h`
-- `src/include/access/xlogrecord.h`
-- `src/include/access/xlogutils.h`
-- `src/include/access/heapam_xlog.h`
-- `src/include/access/nbtxlog.h`
-- `src/include/access/gistxlog.h`
-- `src/include/access/ginxlog.h`
+前置知识：已经看过 WAL record layout、full-page image、page LSN、WAL-before-data 和 crash recovery 需要按 record 顺序重放数据页修改。
 
----
+本节唯一主问题：
 
-## 1. 先给结论
+```text
+一条已经通过通用 WAL 层读取和校验的 record，怎样交给 rmgr 安全、幂等地改变数据页？
+```
+
+核心矛盾：通用 WAL 层必须不理解 heap、btree、GIN 等具体语义；但 crash recovery 又必须让每个具体页面修改严格按模块 contract 生效。
+
+一句话运行模型：
+
+```text
+recovery loop 读取并校验 record 后，ApplyWalRecord() 根据 xl_rmid 分派到 RmgrTable；rmgr 通过 xlogreader helper 读取 main/block data，通过 xlogutils 获取或初始化 page，按 FPI/page LSN 判断是否需要 redo，修改后设置 page LSN 并 mark dirty。
+```
+
+学完后应能判断：`RmgrId` 为什么是 WAL 格式的一部分；`rmgrlist.h` 顺序为什么不能随便改；有 FPI 和无 FPI 时 redo 判断为什么不同；`BLK_DONE`、`BLK_NEEDS_REDO`、`BLK_RESTORED` 对 redo routine 意味着什么。
+
+源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。
+
+## 1. 本节在总主线中的位置
+
+前面课程已经把 WAL record 的生成、插入、flush、FPI 和 segment 生命周期讲完。本节转到 recovery 侧：一条 record 被读出并校验之后，如何变成对具体数据页的一次安全修改。
+
+这节不是重新列举所有 rmgr。它重点讲通用 WAL 层和具体 rmgr redo routine 之间的 contract，这个 contract 决定 crash recovery 是否幂等、是否能防 torn page、是否能在错误 WAL 内容上及时停止。
+
+## 2. 核心矛盾与一句话运行模型
+
+通用 WAL 层负责读取 WAL page、拼接跨页 record、校验 CRC、decode block references 和 FPI；但它不能理解 heap tuple 或 btree split 的业务语义。rmgr 层正好接过这一部分，同时必须遵守 page LSN 和 FPI 的幂等规则。
+
+redo routine 的最短 contract：
+
+```text
+只解释自己的 xl_info/payload
+  -> 用 xlogreader helper 取 main/block data
+  -> 用 xlogutils 获取、初始化或 restore page
+  -> 仅在需要 redo 的页面上做物理修改
+  -> 修改后设置 page LSN 并 mark dirty
+  -> 对 WAL 内容自相矛盾的情况报错
+```
+
+## 3. 核心文件分工与阅读顺序
+
+| 阅读顺序 | 文件 | 本节读什么 |
+| --- | --- | --- |
+| 1 | `src/backend/access/transam/rmgr.c`、`src/include/access/rmgr.h`、`src/include/access/rmgrlist.h` | `RmgrId`、`RmgrTable`、rmgr entry 顺序和 WAL 格式边界。 |
+| 2 | `src/backend/access/transam/xlogrecovery.c` | recovery 主循环、`ApplyWalRecord()` 如何分派 rmgr redo。 |
+| 3 | `src/backend/access/transam/xlogreader.c`、`src/include/access/xlogreader.h` | `XLogReaderState`、decoded record、main/block data helper。 |
+| 4 | `src/backend/access/transam/xlogutils.c`、`src/include/access/xlogutils.h` | `XLogReadBufferForRedo()`、FPI restore、page LSN 判断、redo buffer contract。 |
+| 5 | `src/backend/access/heap/heapam_xlog.c` | heap redo 示例。 |
+| 6 | `src/backend/access/nbtree/nbtxlog.c` | btree redo 与多页 split 示例。 |
+| 7 | `src/backend/access/gist/gistxlog.c`、`src/backend/access/gin/ginxlog.c` | GiST/GIN 对 `BLK_RESTORED` 等边界的差异。 |
+| 8 | `src/include/access/xlog_internal.h`、`src/include/access/xlogrecord.h` | record header、block reference 和 FPI 格式辅助核对。 |
+
+## 4. 关键结论：rmgr redo contract
+
 PostgreSQL 的 WAL replay 分成两层 contract。
 第一层是通用 WAL 层。
 它负责读取 WAL page、校验 page header、拼接跨页 record、校验 record CRC、decode record header、decode block reference、decode full-page image 和 block data。
@@ -104,9 +109,8 @@ redo routine 自己的 contract 可以概括为七条：
 6. 对 `BLK_DONE` 保持幂等，不重复做物理修改。
 7. 对 WAL 内容自相矛盾的情况报错，常见边界是 `PANIC` 或 `ERROR`。
 
----
+## 5. rmgr id 与 rmgr table
 
-## 2. rmgr id 与 rmgr table
 先看 `src/include/access/rmgr.h`。
 这个头文件定义：
 
@@ -194,9 +198,8 @@ PG_RMGR(symbol, name, redo, desc, identify, startup, cleanup, mask, decode)
 数据库无法知道这个 record 对哪些文件做了什么语义修改。
 因此 recovery 必须停止。
 
----
+## 6. record header：`xl_rmid` 与 `xl_info`
 
-## 3. record header：`xl_rmid` 与 `xl_info`
 `src/include/access/xlogrecord.h` 定义 WAL record 的通用格式。
 固定头是 `XLogRecord`。
 关键字段包括：
@@ -234,9 +237,8 @@ heap 的未知 opcode 会在 `heap_redo()` 里 `PANIC`。
 btree 的未知 opcode 会在 `btree_redo()` 里 `PANIC`。
 这就是通用层和 rmgr 层的错误边界。
 
----
+## 7. crash recovery 主循环如何进入 rmgr redo
 
-## 4. crash recovery 主循环如何进入 rmgr redo
 主线在 `src/backend/access/transam/xlogrecovery.c`。
 `PerformWalRecovery()` 是 WAL recovery 的核心函数。
 如果系统干净关闭，就不会进入这个函数。
@@ -300,9 +302,8 @@ redo loop 结束后，`PerformWalRecovery()` 调用 `RmgrCleanup()`。
 这说明 rmgr cleanup 不是普通内存释放那么简单。
 它也属于 recovery contract 的收尾阶段。
 
----
+## 8. xlogreader：读出来不等于 redo
 
-## 5. xlogreader：读出来不等于 redo
 `src/include/access/xlogreader.h` 的文件注释给出 xlogreader 的使用模型。
 调用方分配 `XLogReaderState`。
 用 `XLogBeginRead()` 或 `XLogFindNextRecord()` 定位。
@@ -384,9 +385,8 @@ decode 阶段会做许多通用一致性检查。
 但它不会验证 rmgr-specific payload 的语义。
 例如 heap insert 的 block data 是否真的包含 `SizeOfHeapHeader` 后面的 tuple bytes，是 heap redo 自己检查。
 
----
+## 9. redo 侧怎样访问 decoded record
 
-## 6. redo 侧怎样访问 decoded record
 `xlogreader.h` 在末尾定义了常用 accessor。
 最常用的是：
 
@@ -440,9 +440,8 @@ full-page image 不是 block data。
 它只是给 rmgr 提供已经安全拆包后的指针。
 业务语义仍归 rmgr。
 
----
+## 10. full-page image 的应用顺序
 
-## 7. full-page image 的应用顺序
 FPI 应用的核心在 `xlogutils.c` 和 `xlogreader.c` 两个文件之间。
 `xlogreader.c` 负责 decode image。
 `xlogutils.c` 负责决定 restore image 还是按 page LSN 做增量 redo。
@@ -486,9 +485,8 @@ WAL record 通过了 CRC，数据库 page 未必可信。
 但有少数操作还要在 `BLK_RESTORED` 后继续做额外修改。
 GiST 的 `gistRedoClearFollowRight()` 就是这种例子。
 
----
+## 11. 无 FPI 时的 LSN 判断与幂等性
 
-## 8. 无 FPI 时的 LSN 判断与幂等性
 如果 block 没有要应用的 FPI，`XLogReadBufferForRedoExtended()` 进入普通分支。
 它调用 `XLogReadBufferExtended()` 读取目标 buffer。
 如果 buffer 有效，按需要取得 exclusive lock 或 cleanup lock。
@@ -532,9 +530,8 @@ redo 的幂等性不是简单地“整条 record 执行过就 return”。
 一个 record 修改多个 block 时，某个 block 可能 `BLK_DONE`，另一个 block 可能 `BLK_NEEDS_REDO`。
 btree split 就是多 block redo 的典型场景。
 
----
+## 12. xlogutils 的 buffer 读取 contract
 
-## 9. xlogutils 的 buffer 读取 contract
 `src/backend/access/transam/xlogutils.c` 开头说明：这个文件包含 XLOG replay 使用的支持函数，正常运行路径不用它。
 这里的核心函数是三组。
 第一组是：
@@ -593,9 +590,8 @@ recovery 中 startup process 单独执行物理重放，可以使用特殊 flag 
 这段逻辑解释了为什么 `BLK_NOTFOUND` 不是随便吞掉错误。
 它依赖后续 WAL 证明这个缺页是合法结果。
 
----
+## 13. heap redo 示例：`heap_redo()`
 
-## 10. heap redo 示例：`heap_redo()`
 heap 是最适合入门的 rmgr redo 示例。
 它展示了 main data、block data、page LSN、visibility map、副作用和多 page update。
 入口在 `src/backend/access/heap/heapam_xlog.c:1199` 附近。
@@ -623,6 +619,7 @@ heap 还有 `heap2_redo()`。
 这点很适合说明 rmgr id 是 WAL 编码资源，不是面向对象的“模块类名”。
 
 ### 10.1 `heap_xlog_insert()`
+
 `heap_xlog_insert()` 在 `heapam_xlog.c:366` 附近。
 它先把 main data cast 成：
 
@@ -686,6 +683,7 @@ FSM 不要求完全精确。
 这也是 redo 里“必须恢复 correctness”和“可以接受 approximate metadata”的区别。
 
 ### 10.2 `heap_xlog_update()`
+
 `heap_xlog_update()` 在 `heapam_xlog.c:697` 附近。
 update 比 insert 更能体现多 block contract。
 main data 是 `xl_heap_update`。
@@ -727,9 +725,8 @@ new tuple 的 block data 来自 block 0。
 因此 redo routine 的 buffer 持有顺序也是 contract。
 它不是单纯的性能实现细节。
 
----
+## 14. btree redo 示例：多页 split 的 contract
 
-## 11. btree redo 示例：多页 split 的 contract
 btree redo 入口在 `src/backend/access/nbtree/nbtxlog.c:1004` 附近。
 `btree_redo()` 取 `xl_info` 后 switch。
 分支包括 leaf insert、upper insert、meta insert、split、dedup、vacuum、delete、unlink、newroot、reuse page、meta cleanup。
@@ -775,9 +772,8 @@ redo 复制原 page 的 special area，构造 temp page，按 split 后的物理
 这再次说明 redo contract 不只是“把 bytes 改对”。
 它还包括 hot standby 可见性边界。
 
----
+## 15. GiST 与 GIN：`BLK_RESTORED` 不是总能 return
 
-## 12. GiST 与 GIN：`BLK_RESTORED` 不是总能 return
 多数 redo routine 只在 `BLK_NEEDS_REDO` 时修改 page。
 因为如果返回 `BLK_RESTORED`，FPI 已经包含目标 page 状态。
 但这个规律不是绝对的。
@@ -803,9 +799,8 @@ GIN 则展示另一个边界。
 这类 record 的 redo contract 就是“这个 record 必须携带可应用 full-page image”。
 如果没有，说明 WAL record 不符合 rmgr 语义。
 
----
+## 16. crash recovery 中的 rmgr contract
 
-## 13. crash recovery 中的 rmgr contract
 现在把前面内容合成 recovery contract。
 对通用 recovery 层来说，rmgr redo 是一个函数指针调用。
 但对数据库正确性来说，它是 page state machine 的一部分。
@@ -854,9 +849,8 @@ heap2、xact、standby 等 rmgr 则会影响 snapshot、known assigned xids 和 
 这些属于更高层 recovery contract。
 本节重点先放在物理 page redo。
 
----
+## 17. 错误边界
 
-## 14. 错误边界
 WAL redo 的错误边界比普通 SQL 执行更硬。
 原因是 recovery 不能随便跳过一条 record。
 一条 record 可能是后续所有 page state 的前提。
@@ -911,45 +905,49 @@ page checksum 或 page LSN 看起来正常，不一定能阻止 FPI restore。
 2. record 中可应用的 FPI。
 3. 无 FPI 时才使用数据页 LSN 判断是否已 replay。
 
----
+## 18. 源码跟读练习
 
-## 15. 源码跟读练习
 下面 5 个练习只读源码，不改源码。
 目标不是枚举所有 rmgr，而是把分派、decode、buffer contract 和具体 redo 差异连成一条线。
 
 ### 练习 1：rmgr identity 与函数表
+
 阅读 `src/include/access/rmgr.h`、`src/include/access/rmgrlist.h` 和 `src/backend/access/transam/rmgr.c`。
 确认 `RmgrId` 是 `uint8`，内置 rmgr id 来自 `rmgrlist.h` 顺序，`RmgrTable` 也由同一份 list 展开。
 回答：为什么新 rmgr 要追加到列表末尾，为什么修改顺序可能需要 bump `XLOG_PAGE_MAGIC`，哪些 rmgr 使用 startup/cleanup、mask 或 logical decode 回调。
 
 ### 练习 2：recovery 分派与通用 WAL 校验
+
 阅读 `xlogrecovery.c` 中的 `PerformWalRecovery()`、`RmgrStartup()`、`ApplyWalRecord()`、`rm_redo_error_callback()`，再读 `xlogreader.c` 的 `ValidXLogRecordHeader()`、`ValidXLogRecord()` 和 `DecodeXLogRecord()`。
 画出 `ReadRecord -> ApplyWalRecord -> rm_redo -> progress update` 的顺序。
 回答：CRC 和 `xl_prev` 为什么在 rmgr redo 前验证，redo 错误上下文为什么要包含 rmgr desc 和 block info，`replayEndRecPtr` 与 `lastReplayedEndRecPtr` 分别在 redo 前后表达什么。
 
 ### 练习 3：FPI、page LSN 与 xlogutils contract
+
 阅读 `xlogreader.c` 的 `RestoreBlockImage()`，以及 `xlogutils.c` 的 `XLogReadBufferForRedoExtended()`、`XLogInitBufferForRedo()`、`log_invalid_page()`、`XLogCheckInvalidPages()`。
 把返回值分成 `BLK_RESTORED`、`BLK_NEEDS_REDO`、`BLK_DONE` 三类。
 回答：为什么有可应用 FPI 时不先比较 page LSN，为什么普通路径比较 record end LSN，`BKPBLOCK_WILL_INIT` 和 `XLogInitBufferForRedo()` 为什么必须互相匹配，invalid page 为什么可以暂存但不能在达到一致状态后继续存在。
 
 ### 练习 4：heap redo 的 block contract
+
 阅读 `heapam_xlog.c` 中的 `heap_redo()`、`heap_xlog_insert()` 和 `heap_xlog_update()`。
 标出 main data、block tag、block data 分别提供哪些信息。
 回答：`xlrec->offnum` 与 block tag 怎样组成目标 TID，visibility map clear 为什么在 page action 判断之外，同页 update 为什么复用 buffer/action，prefix/suffix 优化为什么要求 old tuple 可读。
 
 ### 练习 5：index redo 的差异边界
+
 阅读 `nbtxlog.c` 的 `btree_xlog_split()`、`gistxlog.c` 的 `gistRedoClearFollowRight()`、`ginxlog.c` 的 `ginRedoSplit()` 和 `ginRedoVacuumPage()`。
 比较三类边界：btree right page 可由 WAL block data 初始化、GiST 在 `BLK_RESTORED` 后仍可能补做状态更新、GIN 某些 record 把 FPI restore 当作硬 contract。
 回答：哪些 redo routine 只处理 `BLK_NEEDS_REDO`，哪些还处理 `BLK_RESTORED`，哪些要求必须 restore FPI，释放 buffer 的顺序为什么可能影响 Hot Standby 可见性。
 
----
+## 19. 实验
 
-## 16. 实验
 这些实验以观察和验证为主。
 不要修改 PostgreSQL 源码。
 
 ### 实验 1：列出当前基线的 rmgr 顺序
-在 `/home/nail/postgres-lab` 执行：
+
+在 `/home/highgo/postgres` 执行：
 
 ```bash
 nl -ba src/include/access/rmgrlist.h | sed -n '20,80p'
@@ -967,6 +965,7 @@ rg -n "PG_RMGR|RM_HEAP_ID|RM_BTREE_ID|RM_GIN_ID|RM_GIST_ID" src/include/access/r
 - 确认具体 redo 函数名来自同一个 list。
 
 ### 实验 2：从 recovery loop 找到 redo 入口
+
 执行：
 
 ```bash
@@ -979,6 +978,7 @@ rg -n "RmgrStartup|ApplyWalRecord|rm_redo|RmgrCleanup" src/backend/access/transa
 - 标出 redo 前和 redo 后分别更新的 LSN 状态。
 
 ### 实验 3：观察 record decode 的访问边界
+
 执行：
 
 ```bash
@@ -989,7 +989,7 @@ rg -n "DecodeXLogRecord|XLogRecGetData|XLogRecGetBlockData|RestoreBlockImage" sr
 - 确认 decode 函数和 accessor 在同一抽象层。
 - 找出 accessor 不做 rmgr payload 语义校验的地方。
 
-## 17. 常见误区
+## 20. 常见误区
 
 - 把 xlogreader decode 当成 rmgr 语义校验。通用层只校验 WAL 外壳和 block reference，自定义 payload 是否合理仍由 rmgr redo 负责。
 - 把 `BLK_DONE` 理解成“record 已经无意义”。它只说明这个 page 对普通 delta redo 不需要再次修改；某些 AM 仍可能在 `BLK_RESTORED` 或特殊状态上做额外收尾。
@@ -997,7 +997,7 @@ rg -n "DecodeXLogRecord|XLogRecGetData|XLogRecGetBlockData|RestoreBlockImage" sr
 - 把 page LSN 当成唯一兜底。`WILL_INIT`、invalid page table、drop/truncate 和 rmgr 私有状态都可能改变判断边界。
 - 把 `rmgr_id` 当成运行时模块名。它是 WAL 持久化格式的一部分，数值顺序和 record 解释能力必须长期兼容。
 
-## 18. 讨论题
+## 21. 讨论题
 
 1. 为什么 `RmgrId` 是 WAL 持久化格式的一部分，而不是普通运行时 enum？
 2. 通用 WAL 层已经 decode block reference，为什么仍不能解释 heap tuple 或 btree split 的业务语义？
@@ -1008,9 +1008,8 @@ rg -n "DecodeXLogRecord|XLogRecGetData|XLogRecGetBlockData|RestoreBlockImage" sr
 7. recovery 中 invalid page table 是 fallback、延迟报错，还是 correctness 逃生门？达到一致状态后为什么边界改变？
 8. 本节的可迁移规律是什么：怎样在通用日志框架和模块私有状态机之间划出可验证 contract？
 
----
+## 22. 本节小结
 
-## 19. 本节小结
 `RmgrId` 是 WAL record header 的一部分。
 它是持久化格式，不是普通运行时 enum。
 内置 rmgr id 的数值由 `rmgrlist.h` 顺序决定。
