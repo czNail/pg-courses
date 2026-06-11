@@ -804,3 +804,7 @@ RESET enable_hashjoin;
 - 修复建议要说明影响范围和回归风险。
 
 当后续遇到新的 planner 问题时，先定位阶段，再判断边界，最后选择最小修复。
+
+## 下一步建议
+
+如果诊断发现问题发生在 planner 之前，建议阅读待补课程 `56-raw-parser-grammar-node-tags.md` 到 `60-rls-security-barrier-rewrite.md`。如果问题来自 DDL、utility command、event trigger 或 catalog invalidation，建议阅读待补课程 `61-processutility-ddl-dispatch.md` 到 `64-ddl-locking-invalidation-order.md`。如果问题集中在分区表 path 生成和 join/aggregate 合法性，建议阅读待补课程 `65-partition-bound-catalog-model.md` 到 `68-inheritance-expansion-appendrel.md`。

@@ -866,3 +866,7 @@ recheck？
 诊断 executor 问题时，先固定源码基线，再建立状态模型，最后用实验把模型压回运行时事实。
 
 下一节或后续课程会继续沿用这套方法，只是把主对象替换成新的执行节点、观测指标或扩展插桩边界。
+
+## 下一步建议
+
+如果你要继续深入表达式执行，而不是直接进入具体执行节点，建议阅读待补课程 `65-type-input-output-varlena.md` 到 `72-expression-error-memory-cleanup.md`。那组课程会把本节的 `ExprState`、`PARAM_EXEC` 和 `SubPlanState`，接到 type system、fmgr、Datum、detoast、collation 和 JIT 的执行边界上。

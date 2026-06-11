@@ -923,3 +923,7 @@ ANALYZE exec_obs_t;
 1. 这个现象落在哪个 executor 生命周期边界。
 2. 这个边界改变了哪个核心状态，以及 owner 是谁。
 3. 正常路径和 ERROR 路径分别由哪个函数或机制收尾。
+
+## 下一步建议
+
+如果你想把 Portal 边界继续向外追到客户端协议，建议阅读待补课程 `57-frontend-backend-protocol-message-loop.md` 到 `64-plan-cache-executor-boundary.md`。那组课程会解释 simple query、extended query、prepared statement、cached plan、Portal 和 DestReceiver 如何把客户端消息连接到本节的 `ExecutorRun()`。

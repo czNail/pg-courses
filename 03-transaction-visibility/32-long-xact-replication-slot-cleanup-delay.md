@@ -1075,3 +1075,7 @@ pg_class age
 ```
 
 到这里，第三目录从单个 snapshot 的字段，推进到了全实例 cleanup horizon、VACUUM、freeze、visibility map 和复制反馈对可见性清理的共同影响。
+
+## 下一步建议
+
+如果你想继续追“谁在后台触发这些清理动作”，建议阅读待补课程 `39-autovacuum-launcher-worker-scheduling.md` 到 `46-autovacuum-worker-error-retry.md`。那组课程会把本节的 cleanup horizon、freeze age 和 replication slot 影响，放到 autovacuum launcher/worker、维护阈值、cost delay 和错误重试的调度模型中。

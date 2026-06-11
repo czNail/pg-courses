@@ -1690,3 +1690,7 @@ untrusted crash leads to shared memory reset, not local repair.
 ```
 
 下一组基础设施可以进入同步原语：`SpinLock / LWLock / Latch / Condition Variable / Barrier`。在那里会继续看到同一个系统规律，只是关注点从“状态是否可见”切换到“等待、唤醒和互斥边界如何组合”。
+
+## 下一步建议
+
+如果你想先补齐进程从 postmaster 到 backend 的生命周期，再继续读同步原语，建议阅读待补课程 `43-postmaster-bootstrap-supervision.md` 到 `48-process-exit-crash-cleanup.md`。这组课程会把本节的 `PGPROC` cleanup 放回 postmaster 监督、backend bootstrap、signal 和 crash restart 的完整进程模型中。

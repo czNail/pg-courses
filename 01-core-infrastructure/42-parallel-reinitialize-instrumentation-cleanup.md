@@ -758,3 +758,7 @@ break ExecParallelCleanup
 并行执行收尾要把“停止产出、等待工作者、汇总指标、释放动态对象、销毁上下文”拆成有序阶段；
 否则要么丢错误和指标，要么让 worker 卡在无人消费的队列上，要么在下一轮执行中复用脏 shared state。
 ```
+
+## 下一步建议
+
+如果你接下来要进入 planner、executor 或 DDL 课程，建议先补读待补课程 `56-syscache-catcache-lookup-lifetime.md` 到 `64-cache-diagnostics-source-entry.md`。这些课程会解释 relcache、syscache、typcache、shared invalidation 和 dependency 如何把 catalog 元数据变成各模块可复用的运行时事实。

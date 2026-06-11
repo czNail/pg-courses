@@ -1884,3 +1884,7 @@ ERROR 后如何撤销？
 ```
 
 能连续回答这八个问题，基本就能判断一个新共享状态等待点该使用哪种同步原语，以及它们应该如何组合。
+
+## 下一步建议
+
+如果你要继续追“等待某个数据库对象”而不只是等待一个共享 predicate，建议阅读待补课程 `49-locktag-lockmethod-table.md` 到 `55-lock-diagnostics-blocking-chain.md`。那组课程会把本节的 spinlock、LWLock、latch 和 condition variable 组合，推进到 heavyweight lock manager、wait queue、deadlock detector 和 `pg_locks` 诊断。

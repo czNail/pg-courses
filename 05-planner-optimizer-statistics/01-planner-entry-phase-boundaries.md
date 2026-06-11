@@ -905,3 +905,7 @@ gdb 断在 `standard_planner`、`subquery_planner`、`query_planner`、`create_p
 复杂优化器的关键不是把所有规则塞进一个入口，
 而是把语义改写、候选搜索、成本比较和执行契约放在不同生命周期里。
 ```
+
+## 下一步建议
+
+如果你还没有读 SQL 进入 planner 前的路径，建议先跳到待补课程 `56-raw-parser-grammar-node-tags.md` 到 `60-rls-security-barrier-rewrite.md`，再回到本节。那组课程会解释 raw parse tree、parse analysis、type coercion、view/rule rewrite 和 RLS 如何先把 SQL 变成本节默认接收的 `Query`。

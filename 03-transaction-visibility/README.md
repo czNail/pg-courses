@@ -1,6 +1,6 @@
 # 事务与可见性
 
-本目录约 6 个主题组，目标是解释一个 tuple version 为什么当前语句可见、可锁定、可更新或可回收。
+本目录当前 38 节，已生成 6 个主题组；后续建议追加 Autovacuum / maintenance 调度课程，用来把 VACUUM 语义连接到后台执行系统。
 
 课程安排：
 
@@ -10,6 +10,7 @@
 4. Row lock / MultiXact / update conflict。
 5. VACUUM / pruning / freeze / visibility map 与回收边界。
 6. Serializable / predicate lock 与可串行化冲突检测。
+7. Autovacuum / maintenance / analyze 调度。（待补）
 
 第 1 项 `Transaction / CLOG / Subtrans 与事务结果判定` 建议先拆成 6 个独立主题，后续生成课程时按“一个主问题一课”处理：
 
@@ -66,3 +67,18 @@
 4. [SIREAD lock 生命周期与内存压力](36-siread-lock-lifetime.md)：SIREAD lock 为什么不会阻塞写入，却必须在事务结束后继续保留一段时间，什么时候可以安全释放或合并这些 predicate lock？
 5. [索引访问方法与 predicate lock 粒度](37-index-predicate-lock-granularity.md)：btree、heap scan 和缺少合适索引的查询为什么会产生不同粒度的 predicate lock，错误的粒度会如何影响误 abort 和可串行化正确性？
 6. [只读事务、safe snapshot 与 deferrable](38-safe-snapshot-deferrable-readonly.md)：Serializable 只读事务为什么有时可以等待一个 safe snapshot 来避免后续冲突检测，`DEFERRABLE` 读事务在语义上换取了什么？
+
+## 待补插入路径
+
+以下课程只是计划占位，不代表文件已经生成。生成时继续使用追加编号，不重命名已有 01-38。
+
+第 7 项 `Autovacuum / maintenance / analyze 调度` 建议插在第 5 项 VACUUM / freeze / visibility map 之后阅读，再进入 Serializable：
+
+1. 待补 `39-autovacuum-launcher-worker-scheduling.md`：autovacuum launcher 如何扫描 database、调度 worker，并在全局 worker 限制下选择下一个维护目标？
+2. 待补 `40-autovacuum-threshold-scale-factor.md`：insert/update/delete 计数、threshold、scale factor 和 reloptions 如何决定一张表是否触发 vacuum/analyze？
+3. 待补 `41-autovacuum-freeze-wraparound-priority.md`：freeze age、multixact age 和 wraparound danger 如何让 anti-wraparound vacuum 压过普通成本策略？
+4. 待补 `42-vacuum-cost-delay-throttling.md`：vacuum cost accounting、delay 和 worker 平滑策略如何在维护吞吐与前台查询之间折中？
+5. 待补 `43-parallel-vacuum-index-cleanup.md`：parallel vacuum 如何拆分 index cleanup，哪些状态仍必须由 leader 汇总？
+6. 待补 `44-analyze-autovacuum-statistics-refresh.md`：autovacuum analyze 如何刷新 planner 统计信息，为什么统计 stale 会跨到 optimizer 目录的问题域？
+7. 待补 `45-maintenance-diagnostics-age-bloat.md`：如何把 `pg_stat_all_tables`、age、dead tuple、VM、bloat 和 logs 组合成维护诊断路径？
+8. 待补 `46-autovacuum-worker-error-retry.md`：worker ERROR、锁冲突、表被删除和重试节流分别如何收尾？
