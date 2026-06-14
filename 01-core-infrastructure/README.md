@@ -1,6 +1,6 @@
 # 内核基础设施
 
-本目录当前 42 节，已生成 7 个基础主题组；后续建议追加 3 个待补主题组，用来补齐进程生命周期、重量级锁和 catalog/cache 基础设施。
+本目录当前 64 节，已生成 10 个基础主题组；新增的进程生命周期、重量级锁和 catalog/cache 基础设施课程已经补齐。
 
 课程安排：
 
@@ -11,9 +11,9 @@
 5. SpinLock / LWLock / Latch / Condition Variable / Barrier。
 6. DSM / shm_toc / shm_mq / DSA。
 7. ParallelContext 与并行执行基础设施。
-8. Postmaster / backend lifecycle / signal / background worker。（待补）
-9. Heavyweight Lock Manager / Deadlock。（待补）
-10. CatCache / RelCache / Shared Invalidation / Dependency。（待补）
+8. Postmaster / backend lifecycle / signal / background worker。（已生成）
+9. Heavyweight Lock Manager / Deadlock。（已生成）
+10. CatCache / RelCache / Shared Invalidation / Dependency。（已生成）
 
 第 1 项 `Shmem 初始化与 shared state 边界` 建议先拆成 4 个独立主题，后续生成课程时按“一个主问题一课”处理：
 
@@ -78,37 +78,37 @@
 7. [Gather / GatherMerge tuple routing 与 leader participation](41-gather-tuple-routing-leader-participation.md)：`ExecGather()` / `ExecGatherMerge()` 为什么延迟到第一次执行才启动 worker，`ExecParallelSetupTupleQueues()`、`ExecParallelCreateReaders()`、`TupleQueueReader` 和 `parallel_leader_participation` 如何在 worker tuple stream、leader 本地执行、背压和有序 merge 之间取舍？
 8. [parallel rescan、instrumentation 汇总与 cleanup ordering](42-parallel-reinitialize-instrumentation-cleanup.md)：`ExecParallelReinitialize()` 如何支持重新发起一批 worker，`ExecParallelFinish()` / `ExecParallelCleanup()` 为什么要先 detach tuple queue、再等待 worker、再汇总 buffer / WAL / JIT / instrumentation，最后释放 DSA 和 `ParallelContext`？
 
-## 待补插入路径
+## 已生成插入路径
 
-以下课程只是计划占位，不代表文件已经生成。生成时继续使用追加编号，不重命名已有 01-42。
+以下课程文件已经生成，保留在 README 中作为建议阅读路径；编号沿用追加编号，未重命名已有 01-42。
 
 第 8 项 `Postmaster / backend lifecycle / signal / background worker` 建议插在第 1 项 Shmem 之后、第 4 项 PGPROC 之前阅读：
 
-1. 待补 `43-postmaster-bootstrap-supervision.md`：postmaster 如何完成集群级启动、监听、子进程监督和 crash policy？
-2. 待补 `44-backend-fork-exec-bootstrap.md`：客户端连接如何从 postmaster fork/exec 进入 backend bootstrap，哪些状态来自 inherited process image，哪些必须重新 attach？
-3. 待补 `45-auth-database-connection-startup.md`：认证、database attach、role/session 初始化和 GUC startup packet 如何形成 backend-local 初始状态？
-4. 待补 `46-signal-config-reload-interrupts.md`：SIGHUP、SIGTERM、SIGINT、ProcDiePending、QueryCancelPending 和 CHECK_FOR_INTERRUPTS 如何在安全边界处理异步事件？
-5. 待补 `47-bgworker-registration-lifecycle.md`：background worker 如何注册、启动、重启、连接数据库并接入 latch / signal / shared memory？
-6. 待补 `48-process-exit-crash-cleanup.md`：普通退出、FATAL、postmaster death 和 crash restart 分别由谁清理 backend-local 与 shared state？
+1. 已生成 `43-postmaster-bootstrap-supervision.md`：postmaster 如何完成集群级启动、监听、子进程监督和 crash policy？
+2. 已生成 `44-backend-fork-exec-bootstrap.md`：客户端连接如何从 postmaster fork/exec 进入 backend bootstrap，哪些状态来自 inherited process image，哪些必须重新 attach？
+3. 已生成 `45-auth-database-connection-startup.md`：认证、database attach、role/session 初始化和 GUC startup packet 如何形成 backend-local 初始状态？
+4. 已生成 `46-signal-config-reload-interrupts.md`：SIGHUP、SIGTERM、SIGINT、ProcDiePending、QueryCancelPending 和 CHECK_FOR_INTERRUPTS 如何在安全边界处理异步事件？
+5. 已生成 `47-bgworker-registration-lifecycle.md`：background worker 如何注册、启动、重启、连接数据库并接入 latch / signal / shared memory？
+6. 已生成 `48-process-exit-crash-cleanup.md`：普通退出、FATAL、postmaster death 和 crash restart 分别由谁清理 backend-local 与 shared state？
 
 第 9 项 `Heavyweight Lock Manager / Deadlock` 建议插在第 5 项同步原语之后、第 6 项 DSM 之前阅读：
 
-1. 待补 `49-locktag-lockmethod-table.md`：`LOCKTAG`、lock method table 和 lock mode 如何把 relation、page、tuple、transactionid、advisory lock 映射到统一锁管理器？
-2. 待补 `50-heavyweight-lock-acquire-release.md`：`LockAcquireExtended()` / `LockRelease()` 如何在 fast path、main lock table、resource owner 和 wait queue 之间推进？
-3. 待补 `51-fastpath-lock-relation-boundary.md`：relation lock fast path 如何降低轻量访问成本，什么时候必须转入 main lock table？
-4. 待补 `52-lock-wait-queue-deadlock-detector.md`：等待队列、soft edge、deadlock timeout 和 detector 如何判断是否必须 ERROR？
-5. 待补 `53-transactionid-lock-wait.md`：tuple update 冲突为什么常表现为等待 transactionid lock，而不是等待 heap tuple 本身？
-6. 待补 `54-advisory-lock-session-xact.md`：session-level 与 transaction-level advisory lock 的 owner、释放边界和诊断方式有什么不同？
-7. 待补 `55-lock-diagnostics-blocking-chain.md`：如何从 `pg_locks`、`pg_stat_activity` 和 wait event 回到 lock manager 源码等待点？
+1. 已生成 `49-locktag-lockmethod-table.md`：`LOCKTAG`、lock method table 和 lock mode 如何把 relation、page、tuple、transactionid、advisory lock 映射到统一锁管理器？
+2. 已生成 `50-heavyweight-lock-acquire-release.md`：`LockAcquireExtended()` / `LockRelease()` 如何在 fast path、main lock table、resource owner 和 wait queue 之间推进？
+3. 已生成 `51-fastpath-lock-relation-boundary.md`：relation lock fast path 如何降低轻量访问成本，什么时候必须转入 main lock table？
+4. 已生成 `52-lock-wait-queue-deadlock-detector.md`：等待队列、soft edge、deadlock timeout 和 detector 如何判断是否必须 ERROR？
+5. 已生成 `53-transactionid-lock-wait.md`：tuple update 冲突为什么常表现为等待 transactionid lock，而不是等待 heap tuple 本身？
+6. 已生成 `54-advisory-lock-session-xact.md`：session-level 与 transaction-level advisory lock 的 owner、释放边界和诊断方式有什么不同？
+7. 已生成 `55-lock-diagnostics-blocking-chain.md`：如何从 `pg_locks`、`pg_stat_activity` 和 wait event 回到 lock manager 源码等待点？
 
 第 10 项 `CatCache / RelCache / Shared Invalidation / Dependency` 建议插在 ResourceOwner、PGPROC 和锁管理器之后，再进入 planner / executor 之前阅读：
 
-1. 待补 `56-syscache-catcache-lookup-lifetime.md`：syscache lookup 如何从 catalog tuple 构造 cache entry，refcount 与 memory context 如何避免悬挂 tuple？
-2. 待补 `57-relcache-build-invalidation.md`：relcache 如何从 `pg_class`、`pg_attribute`、index、rule、partition 信息构造 `Relation`，shared invalidation 如何让旧描述失效？
-3. 待补 `58-typcache-opclass-cache.md`：typcache、operator cache 和 opclass/opfamily cache 如何支撑表达式、排序、索引和 planner 判断？
-4. 待补 `59-shared-invalidation-message-flow.md`：catalog 更新如何产生 invalidation message，backend 如何在 command boundary 消费并清理本地 cache？
-5. 待补 `60-catalog-snapshot-syscache-consistency.md`：catalog snapshot、syscache 命中和 invalidation 顺序如何共同保证 DDL/DML 看到一致的元数据？
-6. 待补 `61-dependency-recording-drop-cascade.md`：dependency 记录如何支撑 DROP RESTRICT/CASCADE、extension ownership 和对象生命周期？
-7. 待补 `62-relmapper-relfilenode-cache.md`：relfilenode、relmapper 和 mapped relation 如何连接 catalog identity 与物理文件 identity？
-8. 待补 `63-catcache-relcache-error-cleanup.md`：ERROR、transaction abort 和 invalidation 风暴下 cache ref、relcache entry 和 ResourceOwner 如何收尾？
-9. 待补 `64-cache-diagnostics-source-entry.md`：如何从 relcache/syscache 错误、stale metadata 和 invalidation 日志回到源码入口？
+1. 已生成 `56-syscache-catcache-lookup-lifetime.md`：syscache lookup 如何从 catalog tuple 构造 cache entry，refcount 与 memory context 如何避免悬挂 tuple？
+2. 已生成 `57-relcache-build-invalidation.md`：relcache 如何从 `pg_class`、`pg_attribute`、index、rule、partition 信息构造 `Relation`，shared invalidation 如何让旧描述失效？
+3. 已生成 `58-typcache-opclass-cache.md`：typcache、operator cache 和 opclass/opfamily cache 如何支撑表达式、排序、索引和 planner 判断？
+4. 已生成 `59-shared-invalidation-message-flow.md`：catalog 更新如何产生 invalidation message，backend 如何在 command boundary 消费并清理本地 cache？
+5. 已生成 `60-catalog-snapshot-syscache-consistency.md`：catalog snapshot、syscache 命中和 invalidation 顺序如何共同保证 DDL/DML 看到一致的元数据？
+6. 已生成 `61-dependency-recording-drop-cascade.md`：dependency 记录如何支撑 DROP RESTRICT/CASCADE、extension ownership 和对象生命周期？
+7. 已生成 `62-relmapper-relfilenode-cache.md`：relfilenode、relmapper 和 mapped relation 如何连接 catalog identity 与物理文件 identity？
+8. 已生成 `63-catcache-relcache-error-cleanup.md`：ERROR、transaction abort 和 invalidation 风暴下 cache ref、relcache entry 和 ResourceOwner 如何收尾？
+9. 已生成 `64-cache-diagnostics-source-entry.md`：如何从 relcache/syscache 错误、stale metadata 和 invalidation 日志回到源码入口？
