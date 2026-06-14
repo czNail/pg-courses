@@ -1,10 +1,10 @@
 # Planner / Optimizer / Statistics
 
-本目录当前 68 节，已生成 15 个优化器主题组；parser/analyzer/rewrite、ProcessUtility/DDL 和 planner 侧 partitioning 课程已经补齐 planner 之前和 DDL 侧入口。
+本目录当前 68 节，包含 15 个优化器主题组；parser/analyzer/rewrite、ProcessUtility/DDL 和 planner 侧 partitioning 课程已经补齐 planner 之前和 DDL 侧入口。
 
 课程安排：
 
-0. Parser / Analyzer / Rewrite：SQL 如何先变成语义化 `Query`。（已生成）
+0. Parser / Analyzer / Rewrite：SQL 如何先变成语义化 `Query`。
 1. Planner 主流程与 Query / Plan 边界。
 2. Query preprocessing 与 RestrictInfo。
 3. ANALYZE 与 pg_statistic。
@@ -17,8 +17,8 @@
 10. Upper planning：aggregate、sort、limit。
 11. Path 到 Plan：createplan.c。
 12. 慢 SQL Planner 诊断方法。
-13. ProcessUtility / DDL / event trigger。（已生成）
-14. Partitioning planner side。（已生成）
+13. ProcessUtility / DDL / event trigger。
+14. Partitioning planner side。
 
 第 1 项 `Planner 主流程与 Query / Plan 边界` 建议先拆成 4 个独立主题，后续生成课程时按“一个主问题一课”处理：
 
@@ -111,28 +111,28 @@
 4. [索引、Join Order 与 Path 搜索诊断](54-diagnose-index-join-path-search.md)：如何判断 planner 没有使用索引、选错 join 算法或 join order 的原因，是 path 不合法、谓词不可下推、表达式不匹配、统计误导、enable GUC 剪枝还是搜索空间限制？
 5. [可重复的 Planner 调试流程](55-diagnose-repeatable-workflow.md)：面对一条慢 SQL，如何按“收集 EXPLAIN、确认 schema / stats、定位首个估错点、验证替代 path、最小化 SQL、选择修复手段”的顺序形成可复现的优化器诊断报告？
 
-## 已生成插入路径
+## 插入阅读路径
 
-以下课程文件已经生成，保留在 README 中作为建议阅读路径；编号沿用追加编号，未重命名已有 01-55。
+以下课程保留在 README 中作为建议阅读路径；编号沿用追加编号，未重命名已有 01-55。
 
 第 0 项 `Parser / Analyzer / Rewrite` 建议在阅读第 1 项 planner 入口之前先读；如果已经从 planner 开始，也应回补这组以理解 `Query` 从何而来：
 
-1. 已生成 `56-raw-parser-grammar-node-tags.md`：raw parser 如何从 SQL 文本生成 raw parse tree，gram.y、Node tag 和 location 如何服务后续错误定位？
-2. 已生成 `57-parse-analysis-name-resolution.md`：parse analysis 如何解析 range table、列名、namespace、scope 和 `ParseState`？
-3. 已生成 `58-type-coercion-operator-function-lookup.md`：类型推断、隐式 coercion、operator/function lookup 如何把语法表达式变成可执行语义？
-4. 已生成 `59-query-rewrite-view-rule.md`：view/rule rewrite 如何把用户 Query 改写成等价 Query，哪些边界会影响权限和可更新视图？
-5. 已生成 `60-rls-security-barrier-rewrite.md`：RLS、security barrier view 和 leakproof function 如何约束 qual 下推和 planner 搜索空间？
+1. [Raw Parser、Grammar 与 Node Tags](56-raw-parser-grammar-node-tags.md)：raw parser 如何从 SQL 文本生成 raw parse tree，gram.y、Node tag 和 location 如何服务后续错误定位？
+2. [parse analysis 中 range table、namespace 与 name resolution](57-parse-analysis-name-resolution.md)：parse analysis 如何解析 range table、列名、namespace、scope 和 `ParseState`？
+3. [类型转换、操作符与函数查找](58-type-coercion-operator-function-lookup.md)：类型推断、隐式 coercion、operator/function lookup 如何把语法表达式变成可执行语义？
+4. [Query Rewrite / View / Rule](59-query-rewrite-view-rule.md)：view/rule rewrite 如何把用户 Query 改写成等价 Query，哪些边界会影响权限和可更新视图？
+5. [RLS / security barrier rewrite 与 qual 下推边界](60-rls-security-barrier-rewrite.md)：RLS、security barrier view 和 leakproof function 如何约束 qual 下推和 planner 搜索空间？
 
 第 13 项 `ProcessUtility / DDL / event trigger` 建议作为 planner hook / utility hook 边界的补课，放在 planner 主流程之后阅读：
 
-1. 已生成 `61-processutility-ddl-dispatch.md`：`ProcessUtility()` 如何区分 DDL、transaction command、VACUUM、COPY、EXPLAIN 和其它 utility statement？
-2. 已生成 `62-ddl-command-catalog-update.md`：CREATE/ALTER/DROP 如何修改 catalog、记录 dependency、发出 invalidation，并在事务 abort 时回滚？
-3. 已生成 `63-event-trigger-processutility-boundary.md`：event trigger、ProcessUtility hook 和 executor/planner hook 的边界在哪里？
-4. 已生成 `64-ddl-locking-invalidation-order.md`：DDL 为什么必须先拿对象锁，再改 catalog，再发 invalidation，错误顺序会破坏什么？
+1. [ProcessUtility / DDL dispatch](61-processutility-ddl-dispatch.md)：`ProcessUtility()` 如何区分 DDL、transaction command、VACUUM、COPY、EXPLAIN 和其它 utility statement？
+2. [DDL command / catalog update](62-ddl-command-catalog-update.md)：CREATE/ALTER/DROP 如何修改 catalog、记录 dependency、发出 invalidation，并在事务 abort 时回滚？
+3. [Event Trigger / ProcessUtility 边界](63-event-trigger-processutility-boundary.md)：event trigger、ProcessUtility hook 和 executor/planner hook 的边界在哪里？
+4. [DDL locking / invalidation ordering](64-ddl-locking-invalidation-order.md)：DDL 为什么必须先拿对象锁，再改 catalog，再发 invalidation，错误顺序会破坏什么？
 
 第 14 项 `Partitioning planner side` 建议插在第 8 项 Base relation path 和第 9 项 Join search 之间阅读：
 
-1. 已生成 `65-partition-bound-catalog-model.md`：分区表的 bound、partition key、partition descriptor 和 relcache 如何表达分区空间？
-2. 已生成 `66-partition-pruning-planner.md`：planner-time partition pruning 如何根据约束、参数和表达式裁剪 Append 子路径？
-3. 已生成 `67-partitionwise-join-aggregate.md`：partition-wise join / aggregate 何时合法，为什么需要对齐 partition scheme 和 equivalence class？
-4. 已生成 `68-inheritance-expansion-appendrel.md`：inheritance/partition expansion 如何构造 appendrel、child rel 和 Var translation？
+1. [partition bound / catalog model](65-partition-bound-catalog-model.md)：分区表的 bound、partition key、partition descriptor 和 relcache 如何表达分区空间？
+2. [planner-time partition pruning 与 Append 子路径裁剪](66-partition-pruning-planner.md)：planner-time partition pruning 如何根据约束、参数和表达式裁剪 Append 子路径？
+3. [partition-wise join / aggregate](67-partitionwise-join-aggregate.md)：partition-wise join / aggregate 何时合法，为什么需要对齐 partition scheme 和 equivalence class？
+4. [inheritance / partition expansion 与 appendrel Var translation](68-inheritance-expansion-appendrel.md)：inheritance/partition expansion 如何构造 appendrel、child rel 和 Var translation？

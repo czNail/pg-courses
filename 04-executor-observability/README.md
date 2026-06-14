@@ -1,6 +1,6 @@
 # Executor 与可观测性
 
-本目录当前 74 节，已生成 14 个执行器与观测主题组；客户端协议/plan cache、表达式与 FMGR、执行期分区路由课程已经补齐。
+本目录当前 74 节，包含 14 个执行器与观测主题组；客户端协议/plan cache、表达式与 FMGR、执行期分区路由课程已经补齐。
 
 课程安排：
 
@@ -15,9 +15,9 @@
 9. 并行查询观测。
 10. 慢 SQL 从 EXPLAIN 到源码。
 11. 轻量 Executor profiler extension。
-12. Frontend/backend protocol、Portal 与 plan cache。（已生成）
-13. Type / Function / Expression / FMGR / JIT。（已生成）
-14. Partition routing executor side。（已生成）
+12. Frontend/backend protocol、Portal 与 plan cache。
+13. Type / Function / Expression / FMGR / JIT。
+14. Partition routing executor side。
 
 第 1 项 `Executor 生命周期：ExecutorStart / Run / End` 建议先拆成 5 个独立主题，后续生成课程时按“一个主问题一课”处理：
 
@@ -108,33 +108,33 @@
 4. [GUC、采样率与线上保护](55-profiler-guc-sampling-guardrails.md)：如何设计 enable 开关、采样率、最小时长、用户 / database 过滤和最大记录数，让 profiler 能在线上临时开启而不制造新的瓶颈？
 5. [Profiler 结果视图与源码闭环](56-profiler-result-view-source-loop.md)：如何把 profiler 采样结果暴露成 SRF / view，并把节点 id、plan id、source symbol 和 EXPLAIN 输出关联起来，形成从慢 SQL 到源码热点的闭环？
 
-## 已生成插入路径
+## 插入阅读路径
 
-以下课程文件已经生成，保留在 README 中作为建议阅读路径；编号沿用追加编号，未重命名已有 01-56。
+以下课程保留在 README 中作为建议阅读路径；编号沿用追加编号，未重命名已有 01-56。
 
 第 12 项 `Frontend/backend protocol、Portal 与 plan cache` 建议插在第 1 项 Executor 生命周期之前阅读；如果已经读完第 1 项，也可作为 `ExecutorRun` 与外层 session loop 的补课：
 
-1. 已生成 `57-frontend-backend-protocol-message-loop.md`：post-auth backend 如何在 frontend/backend protocol message loop 中分派 simple query 和 extended query？
-2. 已生成 `58-simple-query-transaction-command.md`：simple query 如何进入 transaction command loop、parse/analyze/rewrite/plan/execute，并处理隐式事务边界？
-3. 已生成 `59-extended-query-parse-bind-execute.md`：Parse/Bind/Describe/Execute/Sync 如何把 prepared statement、portal 和 executor 分成多个协议阶段？
-4. 已生成 `60-prepared-statement-plan-cache.md`：prepared statement 如何保存 raw/analyzed query、generic/custom plan 和参数类型？
-5. 已生成 `61-cached-plan-invalidation.md`：catalog invalidation、search_path、GUC 和 relcache 变化如何让 cached plan 失效或重建？
-6. 已生成 `62-portal-lifecycle-suspended-execution.md`：Portal 如何支持 cursor、FETCH、暂停执行、holdable cursor 和 ERROR cleanup？
-7. 已生成 `63-destreceiver-output-protocol.md`：DestReceiver 如何把 executor tuple 输出到客户端、SPI、tuplestore、COPY 或 EXPLAIN？
-8. 已生成 `64-plan-cache-executor-boundary.md`：plan cache 输出的 `PlannedStmt` 如何成为 executor 可执行契约，哪些状态仍必须运行期补齐？
+1. [frontend/backend protocol message loop](57-frontend-backend-protocol-message-loop.md)：post-auth backend 如何在 frontend/backend protocol message loop 中分派 simple query 和 extended query？
+2. [Simple Query 如何进入 transaction command loop](58-simple-query-transaction-command.md)：simple query 如何进入 transaction command loop、parse/analyze/rewrite/plan/execute，并处理隐式事务边界？
+3. [extended query Parse/Bind/Describe/Execute/Sync 边界](59-extended-query-parse-bind-execute.md)：Parse/Bind/Describe/Execute/Sync 如何把 prepared statement、portal 和 executor 分成多个协议阶段？
+4. [prepared statement 与 plan cache](60-prepared-statement-plan-cache.md)：prepared statement 如何保存 raw/analyzed query、generic/custom plan 和参数类型？
+5. [cached plan invalidation](61-cached-plan-invalidation.md)：catalog invalidation、search_path、GUC 和 relcache 变化如何让 cached plan 失效或重建？
+6. [Portal lifecycle / suspended execution](62-portal-lifecycle-suspended-execution.md)：Portal 如何支持 cursor、FETCH、暂停执行、holdable cursor 和 ERROR cleanup？
+7. [DestReceiver / output protocol](63-destreceiver-output-protocol.md)：DestReceiver 如何把 executor tuple 输出到客户端、SPI、tuplestore、COPY 或 EXPLAIN？
+8. [plan cache / executor boundary](64-plan-cache-executor-boundary.md)：plan cache 输出的 `PlannedStmt` 如何成为 executor 可执行契约，哪些状态仍必须运行期补齐？
 
 第 13 项 `Type / Function / Expression / FMGR / JIT` 建议插在第 2 项 PlanState / TupleTableSlot / ExprContext 之后、第 4 项常见执行节点之前阅读：
 
-1. 已生成 `65-type-input-output-varlena.md`：type input/output、typmod、varlena、TOAST/detoast 如何影响 executor 中的 Datum 生命周期？
-2. 已生成 `66-fmgr-function-call-boundary.md`：fmgr 如何用 `FmgrInfo`、`FunctionCallInfo`、strict、set-returning function 和 memory context 调用 C 函数？
-3. 已生成 `67-operator-function-lookup-execution.md`：operator、support function 和 function cache 如何把 catalog metadata 转成可调用执行状态？
-4. 已生成 `68-exec-eval-interpreter.md`：表达式解释器如何把 `ExprState` steps 执行成 Datum / null，短生命周期内存在哪里 reset？
-5. 已生成 `69-expression-deform-detoast.md`：slot deform、attribute cache、detoast 和 pass-by-value/reference 如何放大表达式成本？
-6. 已生成 `70-collation-sort-support.md`：collation、sort support 和 comparison function 如何影响 sort、merge join、btree scan 和 hash equality？
-7. 已生成 `71-jit-expression-deform-boundary.md`：LLVM JIT 何时接管 expression / deform，为什么 JIT startup cost 和 plan cache 状态必须一起判断？
-8. 已生成 `72-expression-error-memory-cleanup.md`：函数 ERROR、SRF 中断和表达式短路如何保证 per-tuple memory、FunctionCallInfo 和 ResourceOwner 收尾？
+1. [type input/output、varlena、TOAST 与 detoast](65-type-input-output-varlena.md)：type input/output、typmod、varlena、TOAST/detoast 如何影响 executor 中的 Datum 生命周期？
+2. [fmgr function call boundary](66-fmgr-function-call-boundary.md)：fmgr 如何用 `FmgrInfo`、`FunctionCallInfo`、strict、set-returning function 和 memory context 调用 C 函数？
+3. [operator/function lookup execution](67-operator-function-lookup-execution.md)：operator、support function 和 function cache 如何把 catalog metadata 转成可调用执行状态？
+4. [ExecEval expression interpreter](68-exec-eval-interpreter.md)：表达式解释器如何把 `ExprState` steps 执行成 Datum / null，短生命周期内存在哪里 reset？
+5. [expression deform / detoast cost](69-expression-deform-detoast.md)：slot deform、attribute cache、detoast 和 pass-by-value/reference 如何放大表达式成本？
+6. [Collation / Sort Support / Comparison Function](70-collation-sort-support.md)：collation、sort support 和 comparison function 如何影响 sort、merge join、btree scan 和 hash equality？
+7. [JIT expression / deform boundary](71-jit-expression-deform-boundary.md)：LLVM JIT 何时接管 expression / deform，为什么 JIT startup cost 和 plan cache 状态必须一起判断？
+8. [expression ERROR 与 memory cleanup](72-expression-error-memory-cleanup.md)：函数 ERROR、SRF 中断和表达式短路如何保证 per-tuple memory、FunctionCallInfo 和 ResourceOwner 收尾？
 
 第 14 项 `Partition routing executor side` 建议插在第 4 项 `ModifyTable` 之后阅读：
 
-1. 已生成 `73-partition-routing-modifytable.md`：INSERT/UPDATE 如何在 executor 中选择目标分区，partition constraint、tuple conversion 和 trigger 顺序如何协作？
-2. 已生成 `74-partition-tuple-conversion-pruning-boundary.md`：执行期 partition pruning、tuple routing 和 row movement 如何与 planner 分区路径、ModifyTable 和 ResultRelInfo 对接？
+1. [partition routing 与 ModifyTable](73-partition-routing-modifytable.md)：INSERT/UPDATE 如何在 executor 中选择目标分区，partition constraint、tuple conversion 和 trigger 顺序如何协作？
+2. [partition tuple conversion 与 pruning boundary](74-partition-tuple-conversion-pruning-boundary.md)：执行期 partition pruning、tuple routing 和 row movement 如何与 planner 分区路径、ModifyTable 和 ResultRelInfo 对接？
