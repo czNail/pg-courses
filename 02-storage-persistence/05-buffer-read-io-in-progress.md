@@ -1,1090 +1,1366 @@
-# PostgreSQL Buffer read I/O 与 BM_IO_IN_PROGRESS
+# PostgreSQL Buffer read I/O、BM_IO_IN_PROGRESS 与等待协议
 
 ## 课程定位
 
-前置知识：已经理解 `BufferTag`、mapping table、pin 与 `BM_TAG_VALID` / `BM_VALID` 的区别，知道 miss 后可能先安装一个 buffer identity，再由后续路径填充 page bytes。
+前置知识：已经理解 `BufferTag`、buffer mapping table、replacement、pin 与 content lock，知道 `BM_TAG_VALID` 只表示 buffer identity 已建立。
 
 本节唯一主问题：
 
 ```text
-同一个 relation fork block 被多个 backend 同时读取时，谁有权发起 I/O，其他 backend 如何等待同一个 buffer 变成 valid？
+多个 backend 同时读取同一个 relation fork block 时，谁负责把 page 从磁盘读入 shared buffer，其他 backend 为什么不会重复读或提前访问未完成的 page？
 ```
 
-核心矛盾：buffer table 必须尽早暴露唯一 tag，防止同一磁盘页出现多个 shared buffer 副本；但 page bytes 在 I/O 完成前不能被任何普通访问者消费。
+核心矛盾：目标 `BufferTag` 必须在 I/O 开始前进入 mapping table，才能保证同一个磁盘 block 只有一个 shared buffer 副本；但此时 page bytes 尚未准备好，普通访问者又绝不能把“找到 buffer”误当成“page 已经可读”。
 
 一句话运行模型：
 
 ```text
-ReadBuffer_common() 先通过 PinBufferForBlock()/BufferAlloc() 建立唯一 buffer identity，再由 StartSharedBufferIO()/StartBufferIO() 设置 BM_IO_IN_PROGRESS 认领 I/O；完成时 TerminateBufferIO() 设置 BM_VALID 或 BM_IO_ERROR 并唤醒等待者，ERROR 时 AbortBufferIO() 清理占用。
+BM_TAG_VALID 建立唯一 identity；BM_IO_IN_PROGRESS 标记唯一 I/O owner；BM_VALID 开放 page contents；BM_IO_ERROR 记录失败并允许后续重试。
 ```
 
-学完后应能判断：为什么 `BM_TAG_VALID` 可以早于 `BM_VALID`；为什么同页并发读不能重复分配 buffer；为什么 I/O owner 必须有明确的状态清理路径。
+学完后应能判断：为什么 `BM_TAG_VALID` 可以早于 `BM_VALID`；`found=false` 为什么不一定是 mapping miss；`StartBufferIO()` 的三个返回值分别要求调用者做什么；I/O owner 正常完成或 ERROR 时如何清状态并唤醒等待者。
 
 源码基线：本课基于本地 `/home/highgo/postgres` 源码，分支 `master`，提交 `bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`。
 
 ## 1. 本节在总主线中的位置
 
-前四节已经把“找到哪个 buffer slot”和“如何安全持有它”讲清楚。本节进入 page bytes 从磁盘进入 shared buffer 的过程：identity 已经可见，但内容还没有 ready。
+前四节已经回答：
 
-这正是 `BM_IO_IN_PROGRESS` 的位置。它不是普通性能提示，而是把“唯一 identity 已建立”和“page 可消费”之间的危险窗口显式编码出来。
+```text
+一个磁盘 block 如何映射到 buffer slot？
+mapping table 如何保证 tag 唯一？
+miss 时如何选择 replacement victim？
+调用者如何用 pin 稳定 buffer identity？
+```
+
+本节继续追问：
+
+```text
+buffer identity 已经稳定之后，page bytes 何时才真正可用？
+```
+
+这段时间可能很短，但它是 buffer manager 的关键并发窗口：
+
+```text
+tag 已安装
+  -> page 尚未读入
+  -> 某个 backend 正在读
+  -> 读完成或失败
+```
+
+`BM_IO_IN_PROGRESS` 就处在“identity 已建立”和“contents 已可用”之间。
+
+下一节会讨论 dirty page 与写出。本节虽然以读为主，但要先知道：`BM_IO_IN_PROGRESS` 同时服务 shared buffer 的读 I/O 和写 I/O。状态位相同，判断“工作是否已经完成”的条件不同。
 
 ## 2. 核心矛盾与一句话运行模型
 
-本节围绕三个问题展开：buffer tag 什么时候进入 buffer table；谁有权真正发起磁盘读；其他 backend 发现读正在进行时如何等待、加入或重试。
+假设 backend A 和 backend B 同时读取 relation R 的 block 42。
 
-先记住这个状态模型：
+错误方案一：等磁盘读完后再把 tag 放入 mapping table。
 
 ```text
-同一个 relation fork block 在 shared buffers 中最多应该有一个 buffer tag 入口；
-这个入口必须在 I/O 开始前可查；
-真正发起 I/O 前必须把 BM_IO_IN_PROGRESS 置位；
-完成 I/O 时必须用 TerminateBufferIO() 原子地清理状态并唤醒等待者；
-错误退出时必须用 ResourceOwner 触发 AbortBufferIO()，避免永久留下 BM_IO_IN_PROGRESS。
+A: lookup miss -> 分配 buffer X -> 读 block 42
+B: lookup miss -> 分配 buffer Y -> 读 block 42
+```
+
+结果是同一个磁盘 block 同时出现在 X 和 Y 两个 shared buffer 中。后续 dirty、WAL、writeback 和 replacement 都无法维持“一个 block 一个缓存身份”的基本不变量。
+
+错误方案二：先放入 tag，但把“lookup 找到”直接当成 page 可读。
+
+```text
+A: 安装 tag -> 开始覆盖 buffer page bytes
+B: lookup hit -> 读取尚未完成的 page bytes
+```
+
+B 可能看到旧 victim 的残留内容、半次 read、尚未验证的 page，或失败 I/O 留下的无效内容。
+
+PostgreSQL 把这两个问题拆成三道门：
+
+```text
+identity gate: BM_TAG_VALID
+I/O ownership gate: BM_IO_IN_PROGRESS
+content readiness gate: BM_VALID
+```
+
+普通单页读的概念流程是：
+
+```text
+ReadBuffer_common()
+  -> PinBufferForBlock()
+  -> BufferAlloc()
+       -> 找到或安装唯一 BufferTag
+       -> 返回 pinned buffer
+  -> StartBufferIO()
+       -> 已 valid：无需 I/O
+       -> 别人在读：加入或等待
+       -> 无人在读：认领 I/O
+  -> smgr/md/AIO read
+  -> completion 验证 page
+  -> TerminateBufferIO()
+       -> 成功：设置 BM_VALID
+       -> 失败：设置 BM_IO_ERROR
+       -> 清 BM_IO_IN_PROGRESS
+       -> 唤醒等待者
+```
+
+一句话记忆：
+
+```text
+先让所有人找到同一个 buffer，再决定一个人读，最后才允许所有人消费 page。
 ```
 
 ## 3. 核心文件分工与阅读顺序
 
 | 阅读顺序 | 文件 | 本节读什么 |
 | --- | --- | --- |
-| 1 | `src/backend/storage/buffer/bufmgr.c` | `ReadBuffer_common()`、`PinBufferForBlock()`、`BufferAlloc()`、`AsyncReadBuffers()`、`WaitReadBuffers()`、`StartBufferIO()`、`TerminateBufferIO()`、`AbortBufferIO()`。 |
-| 2 | `src/include/storage/buf_internals.h` | `BM_VALID`、`BM_IO_IN_PROGRESS`、`BM_IO_ERROR`、`StartBufferIOResult`、`BufferDesc.io_wref`、I/O condition variable。 |
-| 3 | `src/backend/storage/buffer/buf_init.c` | buffer manager 初始化时如何建立 I/O condition variable 数组。 |
-| 4 | `src/backend/storage/buffer/localbuf.c` | local buffer 读路径对照，理解哪些复杂性来自 shared 并发。 |
-| 5 | `src/backend/storage/smgr/smgr.c` | buffer manager 读请求如何进入 storage manager。 |
-| 6 | `src/backend/storage/smgr/md.c` | `mdreadv()`、`mdstartreadv()`、completion callback 如何落到文件层。 |
+| 1 | `src/backend/storage/buffer/buf_init.c` | 为什么 buffer lookup 必须先于 I/O 可见，为什么 I/O 期间必须保持 pin。 |
+| 2 | `src/include/storage/buf_internals.h` | `BM_TAG_VALID`、`BM_VALID`、`BM_IO_IN_PROGRESS`、`BM_IO_ERROR`、`StartBufferIOResult`、`io_wref` 和 I/O condition variable。 |
+| 3 | `src/backend/storage/buffer/bufmgr.c` | `ReadBuffer_common()`、`BufferAlloc()`、`AsyncReadBuffers()`、`WaitReadBuffers()`、`StartSharedBufferIO()`、`WaitIO()`、`TerminateBufferIO()`、`AbortBufferIO()`。 |
+| 4 | `src/backend/storage/smgr/smgr.c` | buffer manager 如何通过 `smgrstartreadv()` 把读请求交给 storage manager。 |
+| 5 | `src/backend/storage/smgr/md.c` | `mdstartreadv()`、`md_readv_complete()` 如何进入文件层并报告 success、partial 或 error。 |
+| 6 | `src/backend/storage/buffer/localbuf.c` | local buffer 的简化对照：没有跨 backend condition variable，也暂不使用 `BM_IO_IN_PROGRESS`。 |
 
-主流程：
+建议第一遍只跟这条线：
 
 ```text
 ReadBuffer_common()
+  -> StartReadBuffer()
+  -> StartReadBuffersImpl()
   -> PinBufferForBlock()
   -> BufferAlloc()
-  -> StartSharedBufferIO() / StartBufferIO()
-  -> smgr/md read
-  -> completion callback
-  -> TerminateBufferIO() 或 AbortBufferIO()
+  -> AsyncReadBuffers()
+  -> StartBufferIO()
+  -> smgrstartreadv()
+  -> buffer_readv_complete_one()
+  -> TerminateBufferIO()
+  -> WaitReadBuffers()
 ```
 
-## 4. 源码坐标与关键状态
+第二遍再补：
 
-先建立源码地图。
-`buf_init.c` 的注释给出了 buffer manager 的两个不变量。
-第一，buffer lookup 必须在 I/O 开始前可见。
-如果不是这样，第二个 backend 读同一 block 时可能分配另一个 buffer。
-那会让 buffer pool 对同一磁盘块拥有两个副本。
-第二，buffer 在 I/O 期间不能被替换。
-所以 buffer 在 I/O 期间会保持 pin。
-这些注释位于 `buf_init.c` 约 45 到 70 行。
-`buf_internals.h` 定义了状态位。
-`BM_VALID` 表示 buffer 中的数据可用。
-`BM_IO_IN_PROGRESS` 表示读或写正在进行。
-`BM_IO_ERROR` 表示前一次 I/O 失败。
-这些定义位于 `buf_internals.h` 约 105 到 116 行。
-同一个头文件还定义了 `StartBufferIOResult`。
-它有三个值：
-`BUFFER_IO_ALREADY_DONE`
-`BUFFER_IO_IN_PROGRESS`
-`BUFFER_IO_READY_FOR_IO`
-这三个返回值是读等待协议的核心语义。
-它们定义在 `buf_internals.h` 约 558 到 569 行。
-`BufferDesc` 的核心字段包括 `tag`、`state`、`wait_backend_pgprocno`、`io_wref` 和 content lock waiters。
-`state` 是一个 `pg_atomic_uint64`，里面同时放 refcount、usagecount、content lock 状态和 `BM_*` 标志。
-`io_wref` 是 AIO wait reference。
-如果 buffer 上存在异步 I/O，其他 backend 可以拿这个引用去等待 AIO handle。
-`BufferIOCVArray` 是每个 shared buffer 对应的 I/O condition variable 数组。
-`BufferDescriptorGetIOCV()` 通过 `buf_id` 找到该 buffer 的 I/O condition variable。
-这些内容位于 `buf_internals.h` 约 326 到 443 行。
-`bufmgr.c` 是本节主角。
-读入口在 `ReadBufferExtended()` 和 `ReadBuffer_common()`。
-buffer 查找和分配在 `PinBufferForBlock()` 与 `BufferAlloc()`。
-批量读准备在 `StartReadBuffersImpl()`。
-实际发起读在 `AsyncReadBuffers()`。
-等待读完成在 `WaitReadBuffers()`。
-buffer I/O 状态协议在 `WaitIO()`、`StartSharedBufferIO()`、`StartBufferIO()`、`TerminateBufferIO()` 和 `AbortBufferIO()`。
-`smgr.c` 把 buffer manager 的读请求转给 storage manager。
-`md.c` 是磁盘文件实现。
-同步读落到 `mdreadv()`。
-异步读落到 `mdstartreadv()` 和 `md_readv_complete()`。
-
-## 5. 读一页的总体调用链
-
-普通调用常见入口是 `ReadBuffer()` 或 `ReadBufferExtended()`。
-`ReadBuffer()` 只是读 `MAIN_FORKNUM` 的包装。
-`ReadBufferExtended()` 允许指定 fork、block、read mode 和 access strategy。
-`ReadBufferExtended()` 内部调用 `ReadBuffer_common()`。
-`ReadBuffer_common()` 是所有 read buffer 变体的公共入口。
-对普通读来说，主线是：
-`ReadBufferExtended()`
-`ReadBuffer_common()`
-`StartReadBuffer()`
-`StartReadBuffersImpl()`
-`PinBufferForBlock()`
-`BufferAlloc()`
-`AsyncReadBuffers()`
-`StartBufferIO()`
-`smgrstartreadv()`
-`mdstartreadv()`
-`FileStartReadV()`
-completion callbacks
-`TerminateBufferIO()`
-`WaitReadBuffers()`
-这条链里最容易误读的是 `StartReadBuffer()`。
-它不是“立刻读完一个 block”。
-它是启动一个读操作，或者发现不需要读。
-如果它返回 false，说明目标 buffer 已经有效，调用者不用等待。
-如果它返回 true，调用者必须调用 `WaitReadBuffers()`，否则不能访问该 buffer 内容。
-`ReadBuffer_common()` 对普通读总是设置 `READ_BUFFERS_SYNCHRONOUSLY`。
-这个 flag 的意思不是完全绕过 AIO 代码。
-在当前源码中，即使同步等待，也复用 AIO 框架。
-它的意思是：调用者马上会等待，所以底层可以把这次 I/O 标记成同步型，减少异步调度开销。
-如果 read mode 是 `RBM_ZERO_ON_ERROR`，还会加 `READ_BUFFERS_ZERO_ON_ERROR`。
-`zero_damaged_pages` 打开时，`AsyncReadBuffers()` 也会在本 backend 发起 I/O 时把该行为编码到 read flags。
-这是因为完成回调可能在其他进程或 I/O worker 中执行，不能依赖完成者本地的 GUC 值。
-
-## 6. ReadBuffer_common 的分支
-
-`ReadBuffer_common()` 位于 `bufmgr.c` 约 1271 到 1368 行。
-这个函数先拒绝读取其他 session 的临时表。
-如果 `rel` 是其他 backend 的 temp relation，会报错。
-原因是 temp relation 使用 local buffers，当前 backend 看不到拥有者 session 的 local buffer 状态。
-然后处理 `blockNum == P_NEW` 的兼容路径。
-`P_NEW` 表示扩展 relation 并返回新 block。
-新的推荐接口是 `ExtendBufferedRel()`。
-但为了兼容旧调用，`ReadBuffer_common()` 遇到 `P_NEW` 会转到 `ExtendBufferedRel()`。
-如果 mode 是 `RBM_ZERO_AND_LOCK` 或 `RBM_ZERO_AND_CLEANUP_LOCK`，会设置扩展时锁住新页的 flag。
-普通 block 读继续向下。
-函数根据 relation 或传入的 `smgr_persistence` 确定 persistence。
-如果 mode 是 `RBM_ZERO_AND_LOCK` 或 `RBM_ZERO_AND_CLEANUP_LOCK`，走特殊路径。
-特殊路径先 `PinBufferForBlock()`。
-然后调用 `ZeroAndLockBuffer()`。
-这个路径不从磁盘读 page。
-如果 buffer 已经 valid，就只加内容锁。
-如果 buffer 还不 valid，就把页面清零，拿内容锁，再把 buffer 标成 valid。
-这样调用者拿到的是一个已锁住、可初始化的新页面。
-除了 zero-and-lock 特殊路径，普通读会构造 `ReadBuffersOperation`。
-字段包括 `smgr`、`rel`、`persistence`、`forknum` 和 `strategy`。
-然后调用单块版本 `StartReadBuffer()`。
-如果 `StartReadBuffer()` 返回 true，马上调用 `WaitReadBuffers()`。
-最后返回 pinned buffer。
-注意：`ReadBuffer_common()` 返回时，buffer 一定已经 pinned。
-但是否持有 content lock 取决于 read mode。
-普通 `RBM_NORMAL` 不返回 content lock。
-`RBM_ZERO_AND_LOCK` 返回 exclusive content lock。
-`RBM_ZERO_AND_CLEANUP_LOCK` 对已 valid buffer 会走 cleanup lock。
-对于新清零的 invalid buffer，源码注释说明 exclusive lock 与 cleanup-strength lock 没有实际区别，因为还没有其他 backend 能看内容。
-
-## 7. PinBufferForBlock 的职责
-
-`PinBufferForBlock()` 位于 `bufmgr.c` 约 1217 到 1268 行。
-它的职责很窄：
-给定 relation fork block，返回一个 pinned buffer。
-它还通过 `foundPtr` 告诉调用者这个 buffer 内容是否已经可用。
-如果 persistence 是 `RELPERSISTENCE_TEMP`，调用 `LocalBufferAlloc()`。
-否则调用 `BufferAlloc()`。
-对于本节核心的 shared buffers，重点是 `BufferAlloc()`。
-`PinBufferForBlock()` 还做统计。
-如果 `foundPtr` 为 true，会调用 `TrackBufferHit()`。
-如果传入了 `rel`，总是调用 `pgstat_count_buffer_read(rel)`。
-这里容易混淆两个统计口径。
-`pgBufferUsage` 的 read counter 只在真正发起 I/O 后增加。
-per-relation 的 buffer read 统计则在进入这条读路径时就计数。
-所以 cache hit、zero-and-lock、甚至后续发现不用读的情况，统计口径可能不同。
-这不是并发协议的一部分，但跟实验观察有关。
-
-## 8. BufferAlloc 的查找协议
-
-`BufferAlloc()` 位于 `bufmgr.c` 约 2178 到 2351 行。
-它是 `PinBufferForBlock()` 对 shared buffers 的核心子过程。
-它做三件事：
-第一，在 buffer mapping table 里查找目标 tag。
-第二，如果找不到，选择并初始化一个 victim buffer。
-第三，保证返回时 buffer 已经 pinned，且 tag 已经对应目标 block。
-`BufferAlloc()` 一开始为当前 resource owner 和 private refcount 预留空间。
-这是因为 pin buffer 可能需要记录资源。
-随后用 relfilenode、forkNum、blockNum 构造 `BufferTag`。
-再计算 hash 和 partition lock。
-buffer mapping table 分区锁用于保护 tag 到 buffer id 的映射。
-第一轮查找使用 `LW_SHARED`。
-如果 `BufTableLookup()` 找到 existing buffer id，就拿到 `BufferDesc`。
-然后调用 `PinBuffer(buf, strategy, false)`。
-`PinBuffer()` 返回一个 bool，表示此刻是否看到 `BM_VALID`。
-如果返回 true，`BufferAlloc()` 认为是 cache hit。
-如果返回 false，说明 hash 里已有 tag，但内容还不能用。
-源码注释列出三种情况：
-有人正在读这个 page。
-前一次读失败。
-有人调用了 `StartReadBuffers()` 但尚未 `WaitReadBuffers()`。
-在这些情况下，`BufferAlloc()` 仍然返回这个 pinned buffer。
-但它把 `foundPtr` 置为 false。
-这很关键。
-`foundPtr=false` 不一定意味着 buffer table 里没有条目。
-它只表示调用者还需要执行 I/O 协议，不能直接访问页面内容。
-如果第一轮没找到，`BufferAlloc()` 释放 partition lock。
-然后调用 `GetVictimBuffer()` 选择一个 victim。
-选择 victim 不持有目标 tag 的 partition lock。
-这样避免在 flush dirty victim 或等锁时长时间占住 mapping lock。
-`GetVictimBuffer()` 返回 pinned victim。
-victim 可能原来有 tag、valid 内容或 dirty 内容。
-如果 dirty，先尝试拿 share-exclusive content lock，然后 `FlushBuffer()` 写出。
-写出时也会用 `BM_IO_IN_PROGRESS` 保护 buffer。
-本节主线是 read，但要知道 `BM_IO_IN_PROGRESS` 同时服务读和写。
-dirty victim 写完后，`GetVictimBuffer()` 会调用 `InvalidateVictimBuffer()` 尝试从 mapping table 删除旧 tag。
-删除前会确认 refcount 仍为 1 且没有被重新 dirty。
-如果中途别人 pin 或 dirty 了这个 victim，就放弃这个 victim，重新找。
-所以被返回给 `BufferAlloc()` 的 victim 满足：
-当前 backend 持有唯一 pin。
-没有 `BM_TAG_VALID`。
-没有 `BM_VALID`。
-没有 `BM_DIRTY`。
-随后 `BufferAlloc()` 重新拿目标 tag 的 partition lock，并尝试 `BufTableInsert()`。
-这里存在并发竞争。
-另一个 backend 可能已经插入了同一个 tag。
-如果插入发现 collision，当前 backend 放弃自己的 victim，转而 pin 已存在的 buffer。
-这条路径的后半段必须与开头“查找到 existing buffer”的逻辑一致。
-如果 `PinBuffer(existing_buf_hdr, strategy, false)` 看到 valid，则 found。
-否则 found false，后续进入等待或重试。
-如果插入成功，`BufferAlloc()` 锁住 victim buffer header。
-它写入新的 `tag`。
-然后设置 `BM_TAG_VALID` 和 usagecount。
-如果 relation 是 permanent，或者 fork 是 init fork，还设置 `BM_PERMANENT`。
-注意此时还不会设置 `BM_VALID`。
-也还没有设置 `BM_IO_IN_PROGRESS`。
-`BufferAlloc()` 的注释明确说：它不读入新页面。
-它只负责让 buffer table 里有一个 pinned、带目标 tag、内容 invalid 的 buffer。
-调用者后续通过 `StartBufferIO()` 取得 I/O 权限。
-这一点正好呼应 `buf_init.c` 的不变量：
-buffer 必须先能被 lookup 到，然后才开始 I/O。
-否则多个 backend 可能给同一个 disk block 分配多个 buffer。
-
-## 9. 正确性状态：BM_VALID、BM_IO_IN_PROGRESS、BM_IO_ERROR
-
-这三个 flag 组成读 I/O 状态机。
-`BM_VALID` 表示 buffer 内容已经可用。
-对读来说，`BM_VALID` 通常在读完成并通过 page 验证后设置。
-对 zero-and-lock 来说，页面被清零后也会设置 `BM_VALID`。
-对 extend 来说，relation 文件扩展成功后，新 zero page 对应的 buffer 会设置 `BM_VALID`。
-`BM_IO_IN_PROGRESS` 表示当前有读或写 I/O 正在进行。
-它阻止其他 backend 同时对同一 buffer 发起另一个 I/O。
-它也阻止其他 backend 在页面内容尚未准备好时把 invalid buffer 当成可用页。
-`BM_IO_ERROR` 表示上一轮 I/O 失败。
-它不是永久故障标记。
-`TerminateBufferIO()` 每次结束 I/O 时都会先清掉旧的 `BM_IO_ERROR`。
-如果本次 I/O 失败，再通过 `set_flag_bits` 把 `BM_IO_ERROR` 设置回来。
-如果本次 I/O 成功，旧错误就被清除。
-所以 `BM_IO_ERROR` 的用途是记录最近一次失败，并影响诊断和重试路径。
-状态可以简化成以下几类。
-初始新分配 buffer：
-`BM_TAG_VALID=1`
-`BM_VALID=0`
-`BM_IO_IN_PROGRESS=0`
-`BM_IO_ERROR=0`
-读 I/O 已被某 backend 认领：
-`BM_TAG_VALID=1`
-`BM_VALID=0`
-`BM_IO_IN_PROGRESS=1`
-读成功：
-`BM_TAG_VALID=1`
-`BM_VALID=1`
-`BM_IO_IN_PROGRESS=0`
-`BM_IO_ERROR=0`
-读失败：
-`BM_TAG_VALID=1`
-`BM_VALID=0`
-`BM_IO_IN_PROGRESS=0`
-`BM_IO_ERROR=1`
-写 I/O 进行中则不同。
-写通常要求 buffer 已 valid 且 dirty。
-写成功会清 dirty，而不需要重新设置 valid。
-写失败会保留 dirty，并设置 `BM_IO_ERROR`。
-本节主线是读，但 `AbortBufferIO()` 中可以看到写失败会特别 warning 多次失败。
-
-## 10. StartBufferIO 和 StartSharedBufferIO
-
-`StartBufferIO()` 位于 `bufmgr.c` 约 7330 到 7345 行。
-它只是 wrapper。
-如果 buffer 是 local buffer，调用 `StartLocalBufferIO()`。
-否则调用 `StartSharedBufferIO()`。
-shared buffer 的真实协议在 `StartSharedBufferIO()`。
-它位于 `bufmgr.c` 约 7211 到 7321 行。
-调用前提是 buffer 已经 pinned。
-`forInput=true` 表示读。
-`forInput=false` 表示写。
-`wait` 表示遇到已有 I/O 时是否可以同步等待。
-`io_wref` 是可选输出参数，用于加入已存在的 AIO。
-函数先 `ResourceOwnerEnlarge(CurrentResourceOwner)`。
-如果它成功把 `BM_IO_IN_PROGRESS` 置位，就会把这次 buffer I/O 记入 resource owner。
-然后进入循环。
-循环中先锁 buffer header。
-如果当前没有 `BM_IO_IN_PROGRESS`，跳出循环，继续检查是否需要 I/O。
-如果已经有 `BM_IO_IN_PROGRESS`，说明别的 backend 或当前 backend 的另一个操作正在处理这个 buffer。
-这时根据参数决定行为。
-第一种情况：调用者传了非 NULL 的 `io_wref`，且 buffer 上的 `buf->io_wref` 有效。
-函数把 buffer 的 wait reference 复制给调用者。
-释放 header lock。
-返回 `BUFFER_IO_IN_PROGRESS`。
-这表示调用者可以异步等待已有 I/O。
-注意这不受 `wait` 参数影响。
-因为拿到 wait reference 比同步睡眠更适合 read stream 和并发扫描。
-第二种情况：调用者没要 wait reference，且 `wait=false`。
-函数释放 header lock。
-返回 `BUFFER_IO_IN_PROGRESS`。
-这常用于尝试合并相邻 block 的读。
-如果第二个 block 已有人在读，就不要等它，停止本次合并即可。
-第三种情况：`wait=true`，但无法通过 wait reference 加入。
-例如调用者传了 `io_wref=NULL`。
-或者另一个 backend 刚设置了 `BM_IO_IN_PROGRESS`，还没把 AIO wait reference 写入 buffer。
-这时只能同步等待。
-等待前会调用 `pgaio_submit_staged()`。
-这是为了避免当前 backend 已经 staged 但未提交的 I/O 卡住别人。
-然后调用 `WaitIO(buf)`。
-`WaitIO()` 返回后回到循环，从头检查状态。
-这点很重要。
-等待结束不等于一定能自己发起 I/O。
-可能别人已经读成功并设置 `BM_VALID`。
-也可能别人读失败，留下 `BM_IO_ERROR`。
-跳出循环时，保证当前 buffer 上没有 active I/O。
-然后检查工作是否已经完成。
-对读来说，如果 `BM_VALID` 已经是 1，就返回 `BUFFER_IO_ALREADY_DONE`。
-对写来说，如果 buffer 已经不 dirty，就返回 `BUFFER_IO_ALREADY_DONE`。
-如果工作还没完成，就通过 `UnlockBufHdrExt()` 设置 `BM_IO_IN_PROGRESS`。
-随后调用 `ResourceOwnerRememberBufferIO()`。
-最终返回 `BUFFER_IO_READY_FOR_IO`。
-这个返回值表示：“你现在是这个 buffer I/O 的拥有者，必须最终调用 `TerminateBufferIO()` 或在错误处理中被 `AbortBufferIO()` 清理。”
-
-## 11. WaitIO 的等待协议
-
-`WaitIO()` 位于 `bufmgr.c` 约 7145 到 7208 行。
-它只用于 shared buffers。
-local buffers 不需要跨进程 condition variable。
-`WaitIO()` 的目标很简单：
-阻塞直到指定 buffer 的 `BM_IO_IN_PROGRESS` 被清掉。
-但当前源码里它有两层等待机制。
-第一层是 buffer 自己的 condition variable。
-`BufferDescriptorGetIOCV(buf)` 从 `BufferIOCVArray` 找到对应 CV。
-第二层是 AIO wait reference。
-如果 buffer 的 `io_wref` 有效，就优先等待 AIO handle。
-函数一开始断言没有 staged AIO。
-这是为了避免进入 AIO 不感知的等待路径时留下未提交 I/O。
-然后 `ConditionVariablePrepareToSleep(cv)`。
-循环中先锁 buffer header。
-在持有 header lock 时读取 `buf->io_wref`。
-这样可以避免与另一个 backend 的 `TerminateBufferIO()` 并发清理 wait reference 产生竞态。
-然后释放 header lock。
-如果 `BM_IO_IN_PROGRESS` 已经清掉，循环结束。
-如果 `io_wref` 有效，调用 `pgaio_wref_wait(&iow)`。
-AIO 子系统内部也使用 condition variable。
-等待 AIO 后，代码重新 `ConditionVariablePrepareToSleep(cv)`，避免因为 AIO 等待过程中被从 buffer CV 的 wait list 移除而多转一次。
-如果 `io_wref` 无效，则调用 `ConditionVariableSleep(cv, WAIT_EVENT_BUFFER_IO)`。
-所以在 `pg_stat_activity.wait_event` 中，等待 buffer I/O 可能看到 `BufferIO`。
-如果等待的是 AIO handle，可能看到 `AioIoCompletion`。
-真正的文件读等待在更低层，使用 `WAIT_EVENT_DATA_FILE_READ`。
-扩展文件使用 `WAIT_EVENT_DATA_FILE_EXTEND`。
-这些 wait event 名称来自 `src/backend/utils/activity/wait_event_names.txt`。
-`WaitIO()` 结束前调用 `ConditionVariableCancelSleep()`。
-等待者不直接修改 buffer 状态。
-它只等发起 I/O 的拥有者清状态并广播。
-
-## 12. TerminateBufferIO 的结束协议
-
-`TerminateBufferIO()` 位于 `bufmgr.c` 约 7348 到 7413 行。
-它是结束 shared buffer I/O 的唯一公共核心函数。
-调用前提：
-当前 I/O 拥有者正在执行 buffer I/O。
-buffer 上设置了 `BM_IO_IN_PROGRESS`。
-buffer 仍然 pinned。
-参数 `clear_dirty` 用于写成功。
-如果 true，会清掉 `BM_DIRTY` 和 `BM_CHECKPOINT_NEEDED`。
-参数 `set_flag_bits` 用来设置结束状态。
-读成功传 `BM_VALID`。
-读失败传 `BM_IO_ERROR`。
-写成功通常传 0。
-写失败传 `BM_IO_ERROR`。
-参数 `forget_owner` 控制是否从当前 resource owner 移除 buffer I/O 记录。
-普通成功路径传 true。
-resource owner 自己清理时传 false。
-参数 `release_aio` 表示是否释放 AIO 子系统持有的 pin 和 wait reference。
-AIO completion callback 中会传 true。
-同步路径或非 AIO owner 路径通常传 false。
-函数锁住 buffer header。
-断言 `BM_IO_IN_PROGRESS` 必须存在。
-它把 `BM_IO_IN_PROGRESS` 加入 unset bits。
-它总是把 `BM_IO_ERROR` 加入 unset bits。
-这意味着任何新一轮 I/O 完成都会清掉旧错误。
-如果本轮失败，`set_flag_bits` 又会把 `BM_IO_ERROR` 设置回来。
-如果 `clear_dirty` 为 true，再清 dirty 相关位。
-如果 `release_aio` 为 true，断言 refcount 大于 0。
-然后把 refcount change 设为 -1。
-同时清掉 `buf->io_wref`。
-接着用 `UnlockBufHdrExt()` 一次性应用 set bits、unset bits 和 refcount change。
-如果 `forget_owner` 为 true，从 resource owner 里忘掉这次 buffer I/O。
-然后 `ConditionVariableBroadcast(BufferDescriptorGetIOCV(buf))`。
-这一步唤醒睡在 `WAIT_EVENT_BUFFER_IO` 上的 waiters。
-如果 AIO pin 的释放可能让 cleanup lock waiter 满足条件，还会 `WakePinCountWaiter(buf)`。
-这说明 buffer I/O 状态和 pin count 等待不是完全独立的。
-AIO 子系统可能持有额外 pin。
-释放这个 pin 后，等待 “sole pin” 的 backend 可能也要被唤醒。
-
-## 13. AbortBufferIO 的错误清理
-
-`AbortBufferIO()` 位于 `bufmgr.c` 约 7415 到 7462 行。
-它是 resource owner 清理 buffer I/O 的回调路径。
-`buffer_io_resowner_desc` 位于 `bufmgr.c` 约 285 到 292 行。
-它的 release phase 是 `RESOURCE_RELEASE_BEFORE_LOCKS`。
-ReleaseResource 是 `ResOwnerReleaseBufferIO()`。
-`ResOwnerReleaseBufferIO()` 会调用 `AbortBufferIO(buffer)`。
-也就是说，如果 backend 在发起 buffer I/O 后发生 ERROR，resource owner 会确保 buffer 不会永远停留在 `BM_IO_IN_PROGRESS`。
-`AbortBufferIO()` 的注释明确说：
-所有 LWLocks 和 content locks 可能已经释放。
-但 buffer pins 还没释放。
-所以 buffer 仍被当前 backend pin 住。
-如果 I/O 正在进行，它总是设置 `BM_IO_ERROR`。
-即使错误本身不一定来自 I/O。
-这是保守选择。
-因为一旦 error unwind 到这里，buffer 内容是否可靠已经不能证明。
-函数先锁 header。
-断言 buffer 至少有 `BM_IO_IN_PROGRESS` 或 `BM_TAG_VALID`。
-如果 buffer 还不是 valid，说明大概率是读入过程中出错。
-它断言 buffer 不 dirty，然后解锁。
-如果 buffer 已经 valid，则对应写 I/O 场景。
-写 I/O 期间 valid page 应该仍 dirty。
-如果之前已经有 `BM_IO_ERROR`，会发 WARNING，提示同一 block 多次写失败，可能是永久写错误。
-最后调用 `TerminateBufferIO(buf_hdr, false, BM_IO_ERROR, false, false)`。
-这会清 `BM_IO_IN_PROGRESS`，清旧 `BM_IO_ERROR` 后再设置新 `BM_IO_ERROR`，广播等待者。
-它不会从 resource owner 忘掉记录。
-因为这正是在 resource owner release 过程中调用的。
-
-## 14. AsyncReadBuffers 如何认领 I/O
-
-`StartReadBuffersImpl()` 位于 `bufmgr.c` 约 1370 到 1592 行。
-`AsyncReadBuffers()` 位于约 1938 到 2174 行。
-普通单页读也会走这套 read buffers 机制。
-`StartReadBuffersImpl()` 先为每个请求 block 调用 `PinBufferForBlock()`。
-如果第一个 block 是 hit，直接返回 false。
-这时不需要 `WaitReadBuffers()`。
-如果后续 block 是 hit，而前面已经需要 I/O，会切分本次 I/O。
-因为一个 readv 必须覆盖连续且都需要 I/O 的 blocks。
-若允许 forwarding，已 pin 的 trailing buffer 可以转交给下一次调用继续处理。
-对第一个 miss，`StartReadBuffersImpl()` 填充 operation。
-然后如果 `io_method != IOMETHOD_SYNC`，会尝试直接调用 `AsyncReadBuffers()` 发起后台 I/O。
-如果是 `IOMETHOD_SYNC`，它只标记 `READ_BUFFERS_SYNCHRONOUSLY`，并让 `WaitReadBuffers()` 中的 retry loop 发起 I/O。
-`AsyncReadBuffers()` 里有一个非常关键的顺序。
-它必须先取得 AIO handle，再调用 `StartBufferIO()`。
-源码注释说明原因：
-`pgaio_io_acquire()` 可能阻塞。
-不能在设置 `BM_IO_IN_PROGRESS` 后再做可能阻塞的 handle 获取。
-否则其他 backend 会看到 I/O in progress，却迟迟等不到真正提交。
-如果非阻塞 acquire 失败，会先 `pgaio_submit_staged()`。
-然后再阻塞 acquire。
-拿到 handle 后，清空 operation 的 foreign_io 和 io_wref。
-然后对第一个待读 buffer 调用：
-`StartBufferIO(buffers[nblocks_done], true, true, &operation->io_wref)`
-这里 `forInput=true`。
-`wait=true`。
-并传入 `io_wref`。
-所以如果另一个 backend 已经开始 AIO 且 wait reference 可用，当前 backend 会加入那个 I/O，而不是另起 I/O。
-如果返回 `BUFFER_IO_ALREADY_DONE`，说明别人已经完成读。
-当前 backend 把 `nblocks_done` 加 1，并把这次当作 hit 统计。
-如果返回 `BUFFER_IO_IN_PROGRESS`，说明有 foreign I/O。
-此时 operation 标记 `foreign_io=true`。
-`WaitReadBuffers()` 后续等待别人完成。
-如果返回 `BUFFER_IO_READY_FOR_IO`，当前 backend 成为 I/O owner。
-它把 buffer page 地址放进 `io_pages[0]`。
-然后尝试合并后续相邻 buffers。
-对后续 buffers 调用：
-`StartBufferIO(buffers[i], true, false, NULL)`
-这里 `wait=false` 且不要 wait reference。
-因为这只是试探是否能把它并入同一次 readv。
-如果某个后续 buffer 已经 valid 或已有 I/O，停止合并。
-不会为合并而等待别人。
-确定本次 readv 的 buffers 后，当前 backend 从 AIO handle 获取 wait reference。
-把 buffer 列表写入 handle data。
-注册 buffer read completion callbacks。
-然后调用 `smgrstartreadv()`。
-`smgrstartreadv()` 往下进入 `mdstartreadv()` 和 `FileStartReadV()`。
-发起 I/O 后，`pgBufferUsage.shared_blks_read` 增加。
-vacuum cost 也在发起 I/O 时计数，而不是等 I/O 完成时。
-
-## 15. AIO staging 与 buffer pin
-
-AIO read 的 completion callback 需要知道哪些 buffer 被这次 I/O 覆盖。
-`buffer_stage_common()` 位于 `bufmgr.c` 约 8276 到 8391 行。
-这个函数在 AIO handle staging 阶段执行。
-它遍历 handle data 中的 buffer 列表。
-对 shared buffer，它锁住 buffer header。
-断言 read 场景下：
-`BM_TAG_VALID` 必须存在。
-`BM_VALID` 必须不存在。
-`BM_DIRTY` 必须不存在。
-`BM_IO_IN_PROGRESS` 必须存在。
-然后把 `buf_hdr->io_wref` 设置为当前 AIO wait reference。
-接着给 buffer 增加一个 refcount。
-这个 pin 是 AIO 子系统持有的 pin。
-原因是发起 I/O 的 backend 可能在 I/O 完成前发生 ERROR。
-resource owner cleanup 可能释放该 backend 自己的 buffer pin。
-如果没有 AIO pin，buffer 可能在底层 I/O 仍在写入时被替换。
-这会破坏内存和 buffer pool 一致性。
-因此 AIO 子系统持 pin 到 completion 阶段。
-这个 pin 会在 `TerminateBufferIO(..., release_aio=true)` 中释放。
-同时 staging 阶段会调用 `ResourceOwnerForgetBufferIO()`。
-因为 I/O 的生命周期已转交给 AIO 子系统。
-这也解释了为什么 `TerminateBufferIO()` 有 `release_aio` 参数。
-非 AIO 同步路径不需要释放 AIO pin。
-AIO completion 路径必须释放它并清 wait reference。
-
-## 16. WaitReadBuffers 的完成与重试
-
-`WaitReadBuffers()` 位于 `bufmgr.c` 约 1752 到 1917 行。
-它等待由 `StartReadBuffers()` 或 `StartReadBuffer()` 启动的读完成。
-返回值表示是否真的等待或做了额外 retry 工作。
-它先根据 persistence 和 strategy 确定 I/O statistics 的 object/context。
-如果 operation 没有 valid io_wref 且 `io_method != IOMETHOD_SYNC`，这是错误。
-因为异步路径必须已经有可等待的 I/O。
-然后进入 retry loop。
-如果 operation 有 valid `io_wref`，先检查是否已经完成。
-如果没完成，调用 `pgaio_wref_wait()`。
-这个等待可能显示为 `AioIoCompletion`。
-等待结束后，如果 operation 是 foreign I/O，处理逻辑与 own I/O 不同。
-foreign I/O 表示这次读是别人发起的。
-当前 backend 没有自己的 `PgAioReturn`。
-因此它读取 buffer state。
-如果 buffer 已经 `BM_VALID`，说明别人读成功。
-它把 `nblocks_done` 加 1。
-并把这次对当前 backend 统计为 hit。
-如果 foreign I/O 失败，buffer 仍不是 valid。
-这时 `nblocks_done` 不增加。
-后面的 retry loop 会调用 `AsyncReadBuffers()`，让当前 backend 自己尝试读。
-own I/O 则调用 `ProcessReadBuffersResult()`。
-该函数位于约 1713 到 1750 行。
-它检查 AIO result。
-如果是 `PGAIO_RS_ERROR`，用 `pgaio_result_report(..., ERROR)` 报错。
-如果是 `PGAIO_RS_WARNING`，用 WARNING 报告。
-如果是 `PGAIO_RS_PARTIAL`，以 DEBUG 级别记录，并准备 retry。
-如果成功，result 中的 block 数会加入 `nblocks_done`。
-如果 `nblocks_done == nblocks`，等待完成。
-否则说明有 partial read、某些 buffer 被别人读完、或本次 I/O 覆盖范围被限制。
-循环会设置 `needed_wait=true`，然后再次调用 `AsyncReadBuffers()`。
-这里不会缩短 operation 的总 `nblocks`。
-因为调用者期望 `WaitReadBuffers()` 返回时整个 operation 完成或报错。
-这套重试逻辑解释了一个重要行为：
-如果 backend A 等待 backend B 的 foreign I/O，而 B 读失败留下 invalid buffer，A 不会直接把失败视为自己的最终失败。
-A 会尝试自己重新发起读。
-只有自己发起的 I/O 结果被 `ProcessReadBuffersResult()` 报成 ERROR，才会让当前 query 报错。
-
-## 17. completion callback 如何设置 BM_VALID 或 BM_IO_ERROR
-
-readv 的 buffer completion 主逻辑在 `buffer_readv_complete_one()`。
-它位于 `bufmgr.c` 约 8533 到 8676 行。
-进入该函数时，shared read buffer 应该满足：
-`BM_TAG_VALID=1`
-`BM_VALID=0`
-`BM_IO_IN_PROGRESS=1`
-`BM_DIRTY=0`
-如果底层 I/O 没失败，会调用 `PageIsVerified()` 检查页面。
-checksum 失败、页面头无效等都在这里处理。
-如果 flags 里有 `READ_BUFFERS_ZERO_ON_ERROR`，验证失败时会把 buffer 内容清零。
-然后把 `zeroed_buffer` 置 true。
-这种情况下该 buffer 仍可以被标成 `BM_VALID`。
-如果不能 zero on error，验证失败会把 `buffer_invalid` 置 true，并把 `failed` 置 true。
-最后决定结束 flag：
-`set_flag_bits = failed ? BM_IO_ERROR : BM_VALID`
-shared buffer 调用：
-`TerminateBufferIO(buf_hdr, false, set_flag_bits, false, true)`
-这里 `forget_owner=false`，因为 AIO staging 已经把 I/O ownership 从当前 resource owner 转交出去。
-`release_aio=true`，因为 completion 要释放 AIO pin 并清 wait reference。
-读成功会设置 `BM_VALID`。
-读失败会设置 `BM_IO_ERROR`，但不会设置 `BM_VALID`。
-无论成功还是失败，`TerminateBufferIO()` 都会清 `BM_IO_IN_PROGRESS` 并广播 condition variable。
-所以所有等待者都会被唤醒。
-唤醒后它们根据 `BM_VALID` 判断是可以消费还是需要重试。
-
-## 18. 多个 backend 同读一个 block
-
-现在把协议串成一个并发故事。
-假设 backend A 和 backend B 同时读 relation R 的 block 42。
-一开始 buffer pool 中没有这个 tag。
-A 进入 `BufferAlloc()`。
-A 查 mapping table，未找到。
-A 选择 victim。
-A 在 mapping table 插入 tag `(R, MAIN_FORKNUM, 42)`。
-A 设置 victim 的 `BM_TAG_VALID`。
-A 返回 pinned buffer，`foundPtr=false`。
-B 稍晚进入 `BufferAlloc()`。
-B 查 mapping table，已经找到同一个 tag。
-B pin 这个 buffer。
-因为 A 还没完成 I/O，B 的 `PinBuffer()` 通常会看到 `BM_VALID=0`。
-B 得到同一个 buffer，`foundPtr=false`。
-此时两个 backend 都不会直接访问页面内容。
-A 先进入 `AsyncReadBuffers()`。
-A 调用 `StartBufferIO(buffer, true, true, &operation->io_wref)`。
-此时没有 `BM_IO_IN_PROGRESS` 且没有 `BM_VALID`。
-A 设置 `BM_IO_IN_PROGRESS`。
-A 成为 I/O owner。
-A 发起 `smgrstartreadv()`。
-AIO staging 会把 `buf->io_wref` 填好，并增加 AIO pin。
-B 也进入 `AsyncReadBuffers()`。
-B 调用同样的 `StartBufferIO()`。
-如果 A 已经设置 `BM_IO_IN_PROGRESS` 且 `io_wref` 有效，B 会复制 wait reference。
-B 返回 `BUFFER_IO_IN_PROGRESS`。
-B 标记 `foreign_io=true`。
-B 不会发起另一个 read。
-如果 B 来得更早，看到 `BM_IO_IN_PROGRESS` 但 `io_wref` 尚未设置，且它传了 `wait=true`，那它会走 `WaitIO()`。
-这是一段很窄的窗口。
-源码注释明确提到这种情况：
-另一个 backend 已经 started IO，但还没 set wait reference。
-此时没有办法异步加入，只能等到 I/O 完成或状态改变。
-A I/O 成功后 completion 设置 `BM_VALID`，清 `BM_IO_IN_PROGRESS`，广播。
-B 的 `WaitReadBuffers()` 发现 foreign buffer 已 valid。
-B 把它作为 hit 统计并返回。
-两个 backend 最终引用的是同一个 shared buffer。
-没有重复读成两个副本。
-如果 A I/O 失败，completion 设置 `BM_IO_ERROR`，清 `BM_IO_IN_PROGRESS`，不设 `BM_VALID`，广播。
-B 被唤醒后看到 foreign buffer 仍 invalid。
-B 不增加 `nblocks_done`。
-B 的 retry loop 调 `AsyncReadBuffers()`。
-这一次 `StartBufferIO()` 看到没有 I/O in progress，且 `BM_VALID=0`。
-虽然 `BM_IO_ERROR=1`，但这不会阻止重试。
-B 设置 `BM_IO_IN_PROGRESS`，自己发起读。
-如果 B 成功，`TerminateBufferIO()` 清旧 `BM_IO_ERROR` 并设置 `BM_VALID`。
-这就是 I/O 错误后的状态恢复路径。
-
-## 19. 为什么不能只靠 content lock
-
-`BM_IO_IN_PROGRESS` 不是 content lock 的替代品。
-content lock 保护的是页面内容访问。
-buffer header lock 保护的是 descriptor 元数据。
-`BM_IO_IN_PROGRESS` 是一个状态协议位。
-它告诉所有 backend：“这个 buffer 的页面内容还不能被解释为 relation block 的有效内容。”
-`ZeroAndLockBuffer()` 的注释特别说明：
-即使不做真实磁盘 I/O，也要获取 `BM_IO_IN_PROGRESS`。
-原因是调用者要把页面清零，然后初始化。
-如果只拿 exclusive content lock，不足以防止其他 backend 后续使用这个 pin 住的 page。
-PostgreSQL 的 buffer access rules 允许读者在判定 tuple 可见后释放 content lock，但继续基于 pin 使用某些信息。
-在 zero-and-lock 场景中，必须防止别人看到“清零但尚未由调用者初始化”的 page。
-所以代码先 `StartSharedBufferIO()`。
-这让其他 backend 按 I/O in progress 规则等待。
-当前 backend 清零。
-当前 backend 在设置 `BM_VALID` 前拿 content lock。
-然后 `TerminateBufferIO(..., BM_VALID, ...)` 唤醒别人。
-这样别人醒来后即使看到 `BM_VALID`，也会被 content lock 阻挡，直到调用者初始化并释放锁。
-这就是 zero-and-lock 中 `BM_IO_IN_PROGRESS` 与 content lock 的组合意义。
-
-## 20. ZeroAndLockBuffer 细读
-
-`ZeroAndLockBuffer()` 位于 `bufmgr.c` 约 1131 到 1215 行。
-调用前 buffer 已经 pinned。
-mode 必须是 `RBM_ZERO_AND_LOCK` 或 `RBM_ZERO_AND_CLEANUP_LOCK`。
-如果调用者已经知道 buffer valid，函数不再启动 I/O 协议。
-它只需要按 mode 加锁。
-如果不是 already valid，则区分 local 和 shared。
-local buffer 调 `StartLocalBufferIO()`。
-shared buffer 调 `StartSharedBufferIO(bufHdr, true, true, NULL)`。
-这里 `forInput=true`。
-虽然没有真实磁盘 input。
-但从状态机角度，它是在把 invalid buffer 变成 valid page。
-所以复用 input I/O 协议。
-它传 `wait=true`。
-如果别人已经在读或 zero 这个 buffer，就等对方结束。
-它传 `io_wref=NULL`。
-因为 zero-and-lock 需要立刻知道是否该清零，不做异步 join。
-如果返回 `BUFFER_IO_READY_FOR_IO`，当前 backend 负责清零。
-如果返回 `BUFFER_IO_ALREADY_DONE`，说明别人已经让 buffer valid。
-断言不会返回 `BUFFER_IO_IN_PROGRESS`，因为 wait=true 且没有要求异步 wait ref。
-需要清零时，函数 `memset(BufferGetPage(buffer), 0, BLCKSZ)`。
-然后在设置 valid 前加 content lock。
-shared buffer 用 `LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE)`。
-不能用 `LockBufferForCleanup()`。
-因为这些函数会断言 buffer 已 valid。
-此时 buffer 还未 valid。
-最后调用 `TerminateBufferIO(..., BM_VALID, ...)`。
-如果 buffer 已 valid，shared buffer 根据 mode 加 exclusive lock 或 cleanup lock。
-local buffer 不需要跨进程锁语义。
-
-## 21. smgrreadv、mdreadv、mdstartreadv
-
-buffer manager 不直接读文件。
-它通过 storage manager 抽象层。
-`smgrreadv()` 位于 `smgr.c` 约 710 到 728 行。
-它接收 relation、fork、起始 block、buffer 数组和 block 数。
-它调用当前 smgr implementation 的 `smgr_readv`。
-md storage manager 下就是 `mdreadv()`。
-`smgrstartreadv()` 位于 `smgr.c` 约 731 到 762 行。
-它是异步版本。
-注释强调 compared to `smgrreadv()`，调用者承担更多职责：
-partial reads 需要上层重新发起 I/O。
-smgr 可能只向 server log 记录一些问题。
-高层负责把 warning/error 报给用户。
-`mdreadv()` 位于 `md.c` 约 856 到 991 行。
-它按 segment 边界处理读。
-当前实现要求一次 readv 不跨 segment boundary。
-如果 `nblocks_this_segment != nblocks`，会 `elog(ERROR, "read crosses segment boundary")`。
-上层通过 `smgrmaxcombine()` 限制合并范围，避免跨 segment。
-`mdreadv()` 用 `FileReadV(..., WAIT_EVENT_DATA_FILE_READ)` 发起文件读。
-如果 `nbytes < 0`，报文件访问错误。
-如果读到 0，说明 EOF 或 partial block at EOF。
-正常情况下，读不存在的 block 是错误。
-只有 `zero_damaged_pages` 或 recovery 下会把剩余 buffers 清零。
-但当前注释说明这条逻辑在 recovery 中被认为不可达，并且在 `zero_damaged_pages` 下也不完整。
-PG 18 代码中还放了 `Assert(false)`，未来倾向移除这段逻辑。
-如果短读但不是 0，`mdreadv()` 会调整 offset 和 iovec 继续读。
-直到读满本次请求或确认 EOF。
-`mdstartreadv()` 位于 `md.c` 约 994 到 1061 行。
-它准备异步读。
-它设置 smgr target data。
-注册 `PGAIO_HCB_MD_READV` callback。
-然后调用 `FileStartReadV(..., WAIT_EVENT_DATA_FILE_READ)`。
-注意 `mdstartreadv()` 没有复制 `mdreadv()` 里 `zero_damaged_pages` 对 EOF 清零的逻辑。
-源码注释解释：这会受 definer 和 completor 的 GUC 差异影响，而且这段旧逻辑本身就有问题。
-异步读完成后，`md_readv_complete()` 处理低层结果。
-它位于 `md.c` 约 1987 到 2047 行。
-如果低层 result 小于 0，转换为 `PGAIO_RS_ERROR`。
-如果读到 0 个 block，也视为 error。
-如果读到的 block 数小于请求数，则设置 `PGAIO_RS_PARTIAL`。
-partial read 由 `WaitReadBuffers()` 的 retry loop 重新发起。
-这解释了为什么 buffer manager 的 read wait 协议必须支持多次 `AsyncReadBuffers()`。
-底层不保证一次异步 readv 就读完所有 blocks。
-
-## 22. I/O 错误后的重试与状态恢复
-
-读错误可能来自几类地方。
-第一，md 层文件读错误。
-例如 `FileStartReadV()` 启动失败或实际读返回 errno。
-第二，读到了 EOF 或 partial read 且无法补齐。
-第三，读成功但 page verification 失败。
-第四，checksum 失败且不能忽略或修复。
-在异步路径中，md 层错误先变成 `PGAIO_RS_ERROR` 或 `PGAIO_RS_PARTIAL`。
-buffer read completion 再逐 buffer 做 page verification。
-失败的 buffer 最终通过 `TerminateBufferIO(..., BM_IO_ERROR, ..., release_aio=true)` 结束。
-这会留下：
-`BM_TAG_VALID=1`
-`BM_VALID=0`
-`BM_IO_IN_PROGRESS=0`
-`BM_IO_ERROR=1`
-此时 buffer table 中仍有 tag。
-这是有意的。
-如果立刻删除 tag，等待者和已经 pin 住 buffer 的 backend 会更难协调。
-保持 tag 让后续读者找到同一个 buffer，并通过状态机重新发起 I/O。
-下一次读同一 block 时，`BufferAlloc()` 发现 mapping table 中有 tag。
-它 pin buffer。
-`PinBuffer()` 返回 false，因为没有 `BM_VALID`。
-`BufferAlloc()` 把 `foundPtr=false` 返回。
-`AsyncReadBuffers()` 调 `StartBufferIO()`。
-`StartSharedBufferIO()` 看到没有 `BM_IO_IN_PROGRESS`。
-对 read 来说，由于 `BM_VALID=0`，工作还没完成。
-它不因为 `BM_IO_ERROR` 而拒绝。
-它设置 `BM_IO_IN_PROGRESS`，记入 resource owner，并返回 `BUFFER_IO_READY_FOR_IO`。
-如果重试成功，completion 调 `TerminateBufferIO(..., BM_VALID, ...)`。
-`TerminateBufferIO()` 会先清旧 `BM_IO_ERROR`。
-然后设置 `BM_VALID`。
-状态恢复为可用 buffer。
-如果重试仍失败，新的 `TerminateBufferIO()` 继续留下 `BM_IO_ERROR`。
-如果失败发生在当前 backend 发起 I/O 后但 completion 前，且 ERROR unwinds，resource owner 会调用 `AbortBufferIO()`。
-这条路径也会清 `BM_IO_IN_PROGRESS` 并设置 `BM_IO_ERROR`。
-所以不会出现永久等待。
-这是 buffer I/O 协议的关键安全网。
-等待者永远不应该依赖“发起者正常返回”。
-它们只依赖 buffer state 和 condition variable broadcast。
-
-## 23. local buffer 的对照
-
-本节重点是 shared buffer。
-但 `StartBufferIO()` wrapper 也覆盖 local buffer。
-local buffer 的实现位于 `localbuf.c`。
-`LocalBufferAlloc()` 与 `BufferAlloc()` 类似，但不需要跨 backend 锁。
-因为 local buffers 只属于当前 backend。
-`StartLocalBufferIO()` 位于 `localbuf.c` 约 531 到 580 行。
-它支持 AIO wait reference。
-但注释明确说：
-`BM_IO_IN_PROGRESS` 当前不用于 local buffers。
-local buffers 也不通过 resource owner 跟踪 buffer I/O。
-如果 local buffer 有有效 `io_wref`，说明当前 backend 内已经有 AIO 在进行。
-可以返回 `BUFFER_IO_IN_PROGRESS` 或等待 `pgaio_wref_wait()`。
-`TerminateLocalBufferIO()` 位于 `localbuf.c` 约 585 到 616 行。
-它只调整 flags。
-它清旧 `BM_IO_ERROR`。
-需要时清 dirty。
-如果 release_aio，释放 AIO pin 并清 `io_wref`。
-local buffers 不使用 I/O condition variable。
-因为没有其他进程能看到该 buffer。
-local extend 路径 `ExtendBufferedRelLocal()` 也会清零 buffers 并调用 `smgrzeroextend()`。
-但它不需要 relation extension lock 来协调其他 backend。
-这组对照能帮助我们理解：
-`BM_IO_IN_PROGRESS` 的主要价值是 shared buffer 的跨 backend 协议。
-
-## 24. 成本、观测与诊断入口
-
-这条读路径的成本不只来自磁盘读。
-第一层成本是 buffer table lookup。
-`BufferAlloc()` 需要按 `BufferTag` 计算 hash，进入对应 mapping partition lock。
-命中时成本主要是 pin、usagecount 和统计更新。
-miss 时要离开 mapping lock，进入 victim selection。
-第二层成本是 I/O ownership。
-同一个 block 的并发读会被收敛到一个 buffer tag 上。
-只有拿到 `BUFFER_IO_READY_FOR_IO` 的 backend 发起底层读。
-其他 backend 要么拿 AIO wait reference，要么睡 `WAIT_EVENT_BUFFER_IO`。
-第三层成本是 partial/error retry。
-`mdstartreadv()` 的异步结果可能是 partial。
-`WaitReadBuffers()` 需要把没有完成的部分重新送回 `AsyncReadBuffers()`。
-因此一次上层 read operation 不等于一次底层 readv。
-第四层成本是 verification。
-读完成后还要检查 page header、checksum、zero-on-error mode。
-失败会留下 `BM_IO_ERROR`，后续读同一 tag 时重试。
-能直接观察的入口：
-- `pg_stat_io`：按 backend type、object、context 看 relation read 次数和时间。
-- `pg_stat_activity.wait_event = BufferIO`：看到当前 backend 等 buffer I/O，但看不到它等待的是 read 还是 write。
-- `EXPLAIN (ANALYZE, BUFFERS)`：看到单 query 的 shared read/hit，但看不到 `BM_IO_IN_PROGRESS`。
-- gdb 断点：`StartSharedBufferIO()`、`WaitIO()`、`TerminateBufferIO()` 能直接看到状态位。
-- tracepoints：`TRACE_POSTGRESQL_BUFFER_READ_START/DONE` 与 `SMGR_MD_READ_START/DONE` 能连接 buffer 层和 md 层。
-只能推断的入口：
-- “同一个 block 是否只分配一个 buffer”通常要结合 `BufferAlloc()` 断点或 instrumentation。
-- AIO wait reference 是否被成功 join，SQL 层没有直接指标。
-- page verification 失败后的 retry 是否发生，需要断点或日志增强。
-这也是本节的 runtime truth：
-看到 `BufferIO` 或 shared read 延迟时，不要只问磁盘慢不慢。
-先问同一个 tag 是否已经存在、谁拥有 `BM_IO_IN_PROGRESS`、等待者醒来后看到的是 `BM_VALID` 还是 `BM_IO_ERROR`。
-
-## 25. 实验 1：源码定位
-
-在 `/home/highgo/postgres` 中确认基线：
-
-```bash
-git -C /home/highgo/postgres rev-parse HEAD
-git -C /home/highgo/postgres branch --show-current
+```text
+WaitIO()
+AbortBufferIO()
+buffer_stage_common()
+mdstartreadv()
+md_readv_complete()
+ZeroAndLockBuffer()
 ```
 
-期望看到：
-`bd4bd30ce6a7f08e95390c3fa068f2bfbe9fcee8`
-`master`
-定位 read buffer 入口：
+第一遍按业务主线读，第二遍按等待和异常路径读，比按文件中的函数排列顺序读更容易建立整体模型。
 
-```bash
-rg -n "ReadBuffer_common|StartReadBuffer|WaitReadBuffers|AsyncReadBuffers" \
-  src/backend/storage/buffer/bufmgr.c
+## 4. 入口问题：找到 buffer 为什么不等于 page 已可读
+
+`ReadBuffer()` 返回的是 pinned buffer。
+
+正常返回时，调用者拿到的 page 已经可用；但在它内部，“找到 buffer”和“读完 page”是两个不同阶段。
+
+`BufferAlloc()` 的职责不是读取磁盘。
+
+它只负责：
+
+```text
+查找目标 BufferTag；
+如果没有，选择并准备 victim；
+把目标 tag 唯一地安装到 mapping table；
+返回一个已经 pinned 的 buffer；
+通过 foundPtr 告诉上层 page contents 是否已经 valid。
 ```
 
-定位 I/O 状态协议：
+所以 `BufferAlloc()` 的返回结果有两类：
 
-```bash
-rg -n "WaitIO|StartSharedBufferIO|StartBufferIO|TerminateBufferIO|AbortBufferIO" \
-  src/backend/storage/buffer/bufmgr.c
+```text
+found=true
+  mapping 中有目标 tag
+  并且 PinBuffer() 看到了 BM_VALID
+  page 可以跳过 read I/O
+
+found=false
+  page 还不能用
+  上层必须进入 I/O ownership / wait 协议
 ```
 
-定位状态位：
+这里最容易犯的错误是把 `found=false` 翻译成“hash table 里没找到”。
+
+实际上它至少覆盖两种情况。
+
+第一种，真正的 mapping miss：
+
+```text
+mapping table 中没有目标 tag
+  -> 选 victim
+  -> 插入 tag
+  -> 设置 BM_TAG_VALID
+  -> 尚未设置 BM_VALID
+  -> found=false
+```
+
+第二种，mapping hit 但 contents invalid：
+
+```text
+mapping table 已有目标 tag
+  -> pin 同一个 buffer
+  -> BM_VALID=0
+  -> found=false
+```
+
+第二种情况可能意味着：
+
+- 另一个 backend 正在读这个 page。
+- 前一次读失败，留下 `BM_IO_ERROR`。
+- 某个 read operation 已经准备了 buffer，但 page 还没完成。
+
+因此 `foundPtr` 表达的不是：
+
+```text
+tag 是否存在？
+```
+
+而是：
+
+```text
+调用者是否还需要走“让 page 变 valid”的协议？
+```
+
+新 victim 安装目标 identity 时，状态大致是：
+
+```text
+BM_TAG_VALID=1
+BM_VALID=0
+BM_IO_IN_PROGRESS=0
+BM_IO_ERROR=0
+```
+
+这个状态完全合法。
+
+它表示：
+
+```text
+所有 backend 已经可以 lookup 到同一个 buffer；
+但还没有 backend 取得 I/O ownership；
+任何 backend 都不能消费 page contents。
+```
+
+接下来不是由 `BufferAlloc()` 直接“默认自己负责读”，而是调用 `StartBufferIO()` 竞争 I/O ownership。
+
+这一步不可省略。
+
+即使 A 是最早插入 tag 的 backend，在 A 离开 `BufferAlloc()` 到调用 `StartBufferIO()` 的窗口中，B 也可能 pin 到同一 buffer，并先认领 I/O。
+
+所以：
+
+```text
+谁安装 tag
+```
+
+和：
+
+```text
+谁最终发起 I/O
+```
+
+不一定是同一个 backend。
+
+这正是 mapping uniqueness 与 I/O ownership 必须分开的原因。
+
+`ReadBuffer_common()` 在普通读中使用 `StartReadBuffer()` 和 `WaitReadBuffers()`。
+
+`StartReadBuffer()` 这个名字也容易误导。
+
+它的返回语义不是“page 已读完”，而是：
+
+```text
+false: buffer 已经 valid，不需要 WaitReadBuffers()
+true: 本次 operation 还需要等待、发起或加入 I/O，必须调用 WaitReadBuffers()
+```
+
+普通 `ReadBuffer_common()` 会设置 `READ_BUFFERS_SYNCHRONOUSLY`，因为调用者马上就要等结果。
+
+这个 flag 不表示绕开 AIO 框架。
+
+在本基线中，普通同步等待路径仍复用 read operation、AIO handle 和 completion callback。flag 只是告诉底层：调用者会立即等待，不必为了后台并发而承担不必要的异步调度开销。
+
+因此入口处应先建立三个判断：
+
+```text
+1. mapping 中是否已经有唯一 tag？
+2. 这个 tag 对应的 buffer 是否 BM_VALID？
+3. 如果还不 valid，是否已经有人持有 BM_IO_IN_PROGRESS？
+```
+
+后续所有分支都从这三个问题展开。
+
+## 5. 状态：identity、I/O ownership、completion
+
+本节最重要的四个状态位是：
+
+| 状态位 | 表达的事实 | 不表达什么 |
+| --- | --- | --- |
+| `BM_TAG_VALID` | `BufferDesc.tag` 已经是可查找的 buffer identity。 | 不保证 page bytes 可用。 |
+| `BM_VALID` | buffer 中的 page contents 已完成构造并可由正常访问路径使用。 | 不保证当前没有写 I/O。 |
+| `BM_IO_IN_PROGRESS` | shared buffer 当前有一个 I/O owner，其他 backend 不能重复认领。 | 单独看不出是读还是写。 |
+| `BM_IO_ERROR` | 最近一轮 I/O 失败。 | 不是永久禁止重试的状态。 |
+
+对于读路径，常见状态转移是：
+
+| 阶段 | `TAG_VALID` | `VALID` | `IO_IN_PROGRESS` | `IO_ERROR` | 含义 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 新 identity 已安装 | 1 | 0 | 0 | 0 | page 尚未读，任何 backend 可竞争 I/O ownership。 |
+| 读已被认领 | 1 | 0 | 1 | 0 或 1 | 一个 owner 正在读，其他 backend 加入或等待。 |
+| 读成功 | 1 | 1 | 0 | 0 | page 可用。 |
+| 读失败 | 1 | 0 | 0 | 1 | page 不可用，后续 backend 可以重试。 |
+| 失败后重试中 | 1 | 0 | 1 | 1 | 新 owner 已认领；旧 error 会在本轮结束时更新。 |
+| 重试成功 | 1 | 1 | 0 | 0 | `TerminateBufferIO()` 清旧 error 并设置 valid。 |
+
+表中“读已被认领”允许旧 `BM_IO_ERROR` 暂时仍存在。
+
+`StartSharedBufferIO()` 认领新一轮 I/O 时，核心动作是设置 `BM_IO_IN_PROGRESS`。旧 `BM_IO_ERROR` 在 `TerminateBufferIO()` 中统一清理；如果本轮仍失败，再重新设置。
+
+这说明：
+
+```text
+BM_IO_ERROR 是上一轮结果；
+BM_IO_IN_PROGRESS 是当前 ownership；
+BM_VALID 才是读者能否消费 page 的最终门槛。
+```
+
+`StartBufferIO()` 返回 `StartBufferIOResult`：
+
+| 返回值 | 当前事实 | 调用者下一步 |
+| --- | --- | --- |
+| `BUFFER_IO_ALREADY_DONE` | 对读来说已经 `BM_VALID`；对写来说已经不 dirty。 | 不要重复发起 I/O。 |
+| `BUFFER_IO_IN_PROGRESS` | 已有 owner；可能同时返回可等待的 `io_wref`。 | 加入已有 I/O、稍后等待，或在非等待探测中停止合并。 |
+| `BUFFER_IO_READY_FOR_IO` | 当前调用者刚设置 `BM_IO_IN_PROGRESS`，成为 owner。 | 必须发起 I/O，并最终 terminate 或由错误清理 abort。 |
+
+这三个返回值比一个简单 bool 更重要。
+
+因为“不是我来读”至少有两种原因：
+
+```text
+page 已经读完
+```
+
+和：
+
+```text
+page 仍未读完，但别人正在读
+```
+
+前者可以立即继续，后者必须等待。
+
+shared buffer I/O 还涉及三种 ownership。
+
+第一，caller 的普通 pin。
+
+调用者从 `BufferAlloc()` 返回时持有 pin。这个 pin保证 I/O 协议执行期间 buffer slot 不能被 replacement 改成另一个 tag。
+
+第二，buffer I/O ownership。
+
+成功设置 `BM_IO_IN_PROGRESS` 后，`StartSharedBufferIO()` 用 `ResourceOwnerRememberBufferIO()` 记录这次 ownership。
+
+如果在真正移交给 AIO 子系统前发生 ERROR，resource owner 能调用 `AbortBufferIO()`。
+
+第三，AIO 子系统的 pin 和 wait reference。
+
+`buffer_stage_common()` 在 I/O staging 时：
+
+```text
+把 AIO wait reference 写入 buf->io_wref；
+为 AIO 子系统增加一个额外 pin；
+把 buffer I/O ownership 从当前 ResourceOwner 转交给 AIO；
+```
+
+额外 pin 很关键。
+
+发起 I/O 的 backend 可能在 I/O 完成前 ERROR，并释放自己的普通 pin。底层 I/O 仍可能在向 buffer memory 写数据。如果 AIO 自己不持 pin，这个 slot 可能被 replacement 复用，完成回调就会写坏另一个 page。
+
+completion 最终通过：
+
+```text
+TerminateBufferIO(..., release_aio=true)
+```
+
+清 `io_wref` 并释放 AIO pin。
+
+等待机制也有两层。
+
+`buf->io_wref` 让 AIO-aware 调用者直接等待已有 AIO handle。
+
+每个 shared buffer 还有一个 I/O condition variable：
+
+```text
+BufferDescriptorGetIOCV(buf)
+```
+
+当已有 `BM_IO_IN_PROGRESS`，但还没有可用的 `io_wref`，或者调用者不准备异步加入时，`WaitIO()` 会在这个 condition variable 上等待。
+
+因此：
+
+```text
+io_wref: 等待具体 AIO operation
+buffer I/O CV: 等待 BM_IO_IN_PROGRESS 被清除
+```
+
+两者实现不同，但正确性检查相同：
+
+```text
+醒来后重新读取 buffer state。
+```
+
+condition variable broadcast 和 AIO completion 都只是“状态可能变化”的通知，不是“page 一定成功”的承诺。
+
+## 6. 主流程：lookup、认领、读取、完成、重试
+
+从普通 `ReadBuffer()` 读一个 shared block 开始。
+
+`ReadBuffer()` 最终进入 `ReadBuffer_common()`。
+
+对普通 block，它构造 `ReadBuffersOperation`，调用：
+
+```text
+StartReadBuffer()
+```
+
+如果需要 I/O，再立即调用：
+
+```text
+WaitReadBuffers()
+```
+
+所以最外层语义仍然很简单：
+
+```text
+ReadBuffer_common() 正常返回时，buffer 已 pinned，page 已 valid。
+```
+
+复杂性被封装在 start/wait 之间。
+
+第一阶段：lookup 或安装唯一 identity。
+
+`StartReadBuffersImpl()` 调用 `PinBufferForBlock()`。
+
+shared buffer 进入 `BufferAlloc()`。
+
+如果 mapping lookup 命中：
+
+```text
+pin existing buffer
+  -> 看到 BM_VALID：found=true
+  -> 没看到 BM_VALID：found=false
+```
+
+如果 mapping lookup miss：
+
+```text
+释放目标 partition lock
+  -> GetVictimBuffer()
+  -> 处理 victim 的 dirty/writeback/invalidation
+  -> 重新取得目标 partition lock
+  -> BufTableInsert(target tag)
+```
+
+重新插入时可能发生 collision。
+
+因为选择和清理 victim 期间没有一直持有目标 tag 的 partition lock，另一个 backend 可能已经插入相同 tag。
+
+当前 backend 不能再使用自己的 victim 创建第二个副本。
+
+它必须：
+
+```text
+放弃当前 victim
+  -> pin collision 返回的 existing buffer
+  -> 根据 BM_VALID 返回 found=true 或 false
+```
+
+如果插入成功，`BufferAlloc()` 写入新 tag，设置 `BM_TAG_VALID`，但不设置 `BM_VALID`，也不负责读磁盘。
+
+返回时 buffer 已 pinned。
+
+这同时守住两个不变量：
+
+```text
+I/O 开始前，所有 backend 已能 lookup 到同一个 identity；
+I/O 期间，pin 防止这个 identity 被 replacement 改掉。
+```
+
+第二阶段：竞争 I/O ownership。
+
+page 还不 valid 时，`AsyncReadBuffers()` 调用：
+
+```text
+StartBufferIO(buffer, true, true, &operation->io_wref)
+```
+
+`forInput=true` 表示这是让 invalid buffer 变 valid 的 input operation。
+
+`StartBufferIO()` 对 shared buffer 转到 `StartSharedBufferIO()`。
+
+`StartSharedBufferIO()` 在 header state 下循环检查。
+
+如果已经有 `BM_IO_IN_PROGRESS` 且 `buf->io_wref` 有效：
+
+```text
+复制 wait reference
+  -> 返回 BUFFER_IO_IN_PROGRESS
+```
+
+当前 backend 只是加入已有 I/O，不发起第二次读。
+
+如果已经有 `BM_IO_IN_PROGRESS`，调用者不愿等待：
+
+```text
+返回 BUFFER_IO_IN_PROGRESS
+```
+
+批量读用这个分支探测相邻 block。某个 block 已有人读时，不值得为了把它并入本次 `readv` 而停下来。
+
+如果已经有 `BM_IO_IN_PROGRESS`，调用者愿意等待，但暂时拿不到 `io_wref`：
+
+```text
+提交本 backend 已 staged 的 I/O
+  -> WaitIO(buf)
+  -> 醒来后重新循环检查
+```
+
+“已设置 `BM_IO_IN_PROGRESS`，但 AIO staging 还没写入 wait reference”是一个很窄但必须正确处理的窗口。
+
+等待结束后，函数不能直接认为自己可以读。
+
+它重新判断：
+
+```text
+别人成功了：BM_VALID=1 -> BUFFER_IO_ALREADY_DONE
+别人失败了：BM_VALID=0 -> 当前 backend 可再次竞争 ownership
+```
+
+如果当前没有 active I/O，对 input operation 检查 `BM_VALID`。
+
+已经 valid：
+
+```text
+返回 BUFFER_IO_ALREADY_DONE
+```
+
+还不 valid：
+
+```text
+设置 BM_IO_IN_PROGRESS
+  -> ResourceOwnerRememberBufferIO()
+  -> 返回 BUFFER_IO_READY_FOR_IO
+```
+
+从这个返回点开始，当前调用者承担明确义务：
+
+```text
+要么让 I/O 完成并调用 TerminateBufferIO()；
+要么在 ERROR unwind 中由 AbortBufferIO() 清理。
+```
+
+第三阶段：准备并发起实际读。
+
+`AsyncReadBuffers()` 在调用 `StartBufferIO()` 前先取得 AIO handle。
+
+顺序必须是：
+
+```text
+先取得可能阻塞的 AIO handle
+  -> 再设置 BM_IO_IN_PROGRESS
+  -> 尽快调用 smgrstartreadv()
+```
+
+如果先设置 `BM_IO_IN_PROGRESS`，再阻塞等待 handle，其他 backend 会看到“有人正在 I/O”，但 owner 实际上还没把请求提交到底层。
+
+这不会自动造成 correctness bug，却会把一个本可避免的资源等待放大成整个 hot buffer 的等待。
+
+对本次 read operation 的第一个 block，`AsyncReadBuffers()` 允许等待或加入 foreign I/O。
+
+如果得到：
+
+```text
+BUFFER_IO_ALREADY_DONE
+```
+
+说明竞争期间别人已读完。当前 backend 把它作为 hit 继续。
+
+如果得到：
+
+```text
+BUFFER_IO_IN_PROGRESS
+```
+
+operation 记录：
+
+```text
+foreign_io=true
+io_wref=已有 I/O 的 wait reference
+```
+
+后续由 `WaitReadBuffers()` 等别人。
+
+如果得到：
+
+```text
+BUFFER_IO_READY_FOR_IO
+```
+
+当前 backend 成为 owner，并尝试把后续连续 blocks 合并进同一次 `readv`。
+
+对后续 block 使用：
+
+```text
+StartBufferIO(buffer, true, false, NULL)
+```
+
+这里 `wait=false`。
+
+原因是批量合并只是优化，不是正确性要求。后续 block 已 valid 或已有 owner 时，停止扩大本次 I/O 即可，不能为了凑更大的 readv 而同步等待。
+
+准备好 buffer/page 数组后，调用：
+
+```text
+smgrstartreadv()
+  -> mdstartreadv()
+  -> FileStartReadV()
+```
+
+storage manager 负责 relation/fork/block 抽象。
+
+`md` 层负责 segment file、offset 和文件 I/O。
+
+一次合并读不能越过 storage manager 给出的边界，例如 relation segment boundary。上层通过 `smgrmaxcombine()` 限制可合并 block 数。
+
+第四阶段：AIO staging 稳定 buffer lifetime。
+
+真正执行 I/O 前，`buffer_stage_common()` 逐个检查目标 shared buffer：
+
+```text
+BM_TAG_VALID=1
+BM_VALID=0
+BM_DIRTY=0
+BM_IO_IN_PROGRESS=1
+refcount >= 1
+```
+
+然后为 AIO 增加 pin，写入 `io_wref`，转移 ownership。
+
+此后即使原 backend cancel 或 ERROR，AIO completion 仍可以安全访问 buffer memory。
+
+第五阶段：completion 验证并发布 page。
+
+底层读完成后，`buffer_readv_complete_one()` 处理每个 buffer。
+
+成功拿到 `BLCKSZ` 字节还不等于 page 可以发布。
+
+completion 还要调用 `PageIsVerified()` 检查 page header、checksum 等。
+
+如果启用了相应 zero-on-error 行为，验证失败可以把 page 清零并继续作为 valid page 返回。
+
+否则该 buffer 保持 invalid，并把本轮结果标成失败。
+
+最终：
+
+```text
+成功：
+  TerminateBufferIO(..., set_flag_bits=BM_VALID, release_aio=true)
+
+失败：
+  TerminateBufferIO(..., set_flag_bits=BM_IO_ERROR, release_aio=true)
+```
+
+`TerminateBufferIO()` 在 buffer header state 下：
+
+```text
+清 BM_IO_IN_PROGRESS；
+清旧 BM_IO_ERROR；
+根据本轮结果设置 BM_VALID 或重新设置 BM_IO_ERROR；
+需要时释放 AIO pin 并清 io_wref；
+需要时从 ResourceOwner 忘记 I/O ownership；
+```
+
+然后广播 buffer I/O condition variable。
+
+如果释放 AIO pin 后可能满足 cleanup lock 的 sole-pin 条件，还会检查是否需要唤醒 pin-count waiter。
+
+最关键的发布顺序是：
+
+```text
+page bytes 已写完并验证
+  -> 设置 BM_VALID
+  -> 清 BM_IO_IN_PROGRESS
+  -> 唤醒等待者
+```
+
+不能先唤醒，再设置 valid。
+
+第六阶段：等待者处理 own I/O 或 foreign I/O。
+
+`WaitReadBuffers()` 等待整个 `ReadBuffersOperation` 完成。
+
+如果 operation 等的是自己发起的 I/O，完成后通过 `ProcessReadBuffersResult()` 处理 success、warning、partial 或 error。
+
+如果 operation 等的是 foreign I/O，它没有自己的 I/O result 可消费。
+
+它只能重新读取目标 buffer state：
+
+```text
+BM_VALID=1
+  -> 别人读成功
+  -> 当前 backend 把该 block 作为 hit
+
+BM_VALID=0
+  -> 别人读失败
+  -> 不增加 nblocks_done
+  -> retry loop 再调用 AsyncReadBuffers()
+```
+
+这解释了为什么等待者不能把“foreign I/O 已结束”直接等同于“page 已成功”。
+
+`WaitReadBuffers()` 还处理 partial read。
+
+如果一次 `readv` 只完成了部分 blocks，它推进 `nblocks_done`，再对剩余部分调用 `AsyncReadBuffers()`。
+
+重试期间还可能遇到其他 backend 已经读完某些 block，因此下一次实际 I/O 范围可能继续缩小。
+
+对调用者来说，`WaitReadBuffers()` 的 contract 不变：
+
+```text
+整个 operation 完成，或者报告 ERROR。
+```
+
+内部可以经历多次 I/O、foreign join 和 partial retry。
+
+把上述流程压缩成两个 backend 的时间线：
+
+```text
+backend A                              backend B
+---------                              ---------
+BufferAlloc(): mapping miss
+安装 tag，BM_TAG_VALID=1
+                                       BufferAlloc(): mapping hit
+                                       pin 同一个 buffer
+                                       看到 BM_VALID=0
+StartBufferIO()
+设置 BM_IO_IN_PROGRESS
+发起 read
+                                       StartBufferIO()
+                                       看到已有 owner
+                                       取得 io_wref 或进入 WaitIO
+completion 写完并验证 page
+TerminateBufferIO()
+设置 BM_VALID
+清 BM_IO_IN_PROGRESS
+广播
+                                       醒来，重新检查 BM_VALID
+                                       成功后使用 page
+```
+
+如果 A 失败，最后三行改为：
+
+```text
+A 设置 BM_IO_ERROR，保持 BM_VALID=0，清 BM_IO_IN_PROGRESS；
+B 醒来看到 page 仍 invalid；
+B 再次调用 StartBufferIO()，可能成为新的 owner。
+```
+
+## 7. 正确性边界：唯一 identity、唯一 owner、valid 发布
+
+第一条边界：mapping identity 必须早于 I/O 可见。
+
+`BM_TAG_VALID` 在 read I/O 前设置，不是因为 page 已经可用，而是为了让并发 backend 收敛到同一个 `BufferDesc`。
+
+如果把 tag 安装推迟到读完成之后，就无法防止两个 backend 分别选择 victim、分别读取同一个磁盘 block。
+
+第二条边界：I/O 期间必须持有 pin。
+
+`BM_IO_IN_PROGRESS` 只表达“这个 buffer 上有 I/O owner”。
+
+真正阻止 replacement 改变 slot identity 的仍是 pin/refcount。
+
+普通 caller 在进入协议时有 pin；AIO staging 又取得自己的 pin，保证异步 completion 不依赖原 caller 的正常生命周期。
+
+第三条边界：`BM_IO_IN_PROGRESS` 只允许一个 owner。
+
+对同一 shared buffer，`StartSharedBufferIO()` 在 header state 下检查和设置该位。
+
+其他 backend 要么发现工作已经完成，要么加入已有 I/O，要么等待。它们不会同时返回 `BUFFER_IO_READY_FOR_IO`。
+
+第四条边界：`BM_VALID` 是 page consumption gate。
+
+`BM_TAG_VALID` 不能开放 page contents。
+
+`BM_IO_IN_PROGRESS` 清除也不能开放 page contents。
+
+读失败时完全可能出现：
+
+```text
+BM_TAG_VALID=1
+BM_IO_IN_PROGRESS=0
+BM_VALID=0
+BM_IO_ERROR=1
+```
+
+只有 `BM_VALID=1` 才说明普通读路径可以继续。
+
+第五条边界：等待通知不是成功结果。
+
+condition variable 和 AIO wait reference 都只告诉等待者：
+
+```text
+你关心的 operation 或状态发生了变化。
+```
+
+等待者醒来必须重新检查 `BM_IO_IN_PROGRESS`、`BM_VALID` 或 operation result。
+
+这与 PostgreSQL 中常见的 condition-variable 用法一致：先 prepare，循环检查 predicate，睡眠，醒来后重新检查。
+
+第六条边界：`BM_IO_ERROR` 不封死 buffer identity。
+
+读失败后保留 tag，可以让已经 pin 住或随后 lookup 的 backend 继续围绕同一个 buffer 协调。
+
+后续 `StartSharedBufferIO()` 看到：
+
+```text
+没有 active I/O
+并且 BM_VALID=0
+```
+
+就能认领新一轮 input I/O。
+
+重试成功时，`TerminateBufferIO()` 清旧 `BM_IO_ERROR`，设置 `BM_VALID`。
+
+第七条边界：I/O handle 必须在 ownership 前准备。
+
+成功设置 `BM_IO_IN_PROGRESS` 后，应尽量少做可能阻塞或失败的准备工作。
+
+所以 `AsyncReadBuffers()` 先 acquire AIO handle，再认领 buffer。
+
+这是“发布正在工作”前先准备必要资源的通用并发原则。
+
+第八条边界：page verification 属于 valid 发布之前。
+
+磁盘 read syscall 成功，只说明字节被搬到内存。
+
+page header 或 checksum 验证失败时，不能设置 `BM_VALID`，除非 read mode 明确允许 zero-on-error 并已经把 page 替换为合法的 zero page。
+
+第九条边界：`BM_IO_IN_PROGRESS` 与 content lock 不能互相替代。
+
+I/O protocol 解决：
+
+```text
+谁把 invalid buffer 变成 valid？
+其他人如何等待？
+```
+
+content lock 解决：
+
+```text
+valid page 的 bytes 如何并发读写？
+```
+
+普通读 miss 期间，其他 backend 不能靠 content lock 抢先查看 invalid page。
+
+page valid 之后，访问方法仍要按自己的协议取得 shared/exclusive content lock。
+
+第十条边界：zero-and-lock 虽不读磁盘，也要复用 input ownership。
+
+`RBM_ZERO_AND_LOCK` 和 `RBM_ZERO_AND_CLEANUP_LOCK` 在 buffer 尚未 valid 时调用 `ZeroAndLockBuffer()`。
+
+它通过：
+
+```text
+StartSharedBufferIO(buf, true, true, NULL)
+```
+
+取得“把 invalid page 变 valid”的唯一资格。
+
+如果当前 backend 成为 owner：
+
+```text
+memset(page, 0, BLCKSZ)
+  -> 在发布 BM_VALID 前取得 exclusive content lock
+  -> TerminateBufferIO(..., BM_VALID, ...)
+```
+
+先拿 content lock、再设置 valid 很重要。
+
+等待者看到 `BM_VALID` 后可能立刻尝试访问 page。exclusive content lock 会挡住它们，直到当前调用者完成新 page 的初始化。
+
+这里不能只用 exclusive content lock 代替 I/O ownership。
+
+因为 access method 的 buffer access rules 允许某些读者在持 pin 的同时释放 content lock，并继续保留与 page 内容有关的信息。对 invalid-to-valid 转换，必须先阻止所有竞争者把未初始化内容当成正式 page。
+
+第十一条边界：批量读的合并不能改变单 buffer ownership。
+
+一次 `readv` 可以覆盖多个连续 buffers。
+
+但每个 buffer 都必须分别取得 `BM_IO_IN_PROGRESS`。
+
+遇到已 valid 或已有 owner 的中间 block，就停止本次合并；不能因为底层希望连续 I/O，就绕过单 buffer 的状态机。
+
+第十二条边界：read 和 write 共享状态位，但完成条件不同。
+
+input operation 检查：
+
+```text
+BM_VALID 是否已经设置
+```
+
+output operation 检查：
+
+```text
+BM_DIRTY 是否已经清除
+```
+
+写 I/O 通常在 `BM_VALID=1`、`BM_DIRTY=1` 的 buffer 上进行。
+
+所以只看到 `BM_IO_IN_PROGRESS`，不能断言这是 read wait。`wait_event = BufferIO` 也不能独立区分 read 和 write。
+
+第十三条边界：local buffer 只有相同目标，没有相同跨进程机制。
+
+local buffers 只对当前 backend 可见，不需要 shared condition variable 或跨 backend `BM_IO_IN_PROGRESS`。
+
+本基线中 `StartLocalBufferIO()` 主要借助 `io_wref` 协调同一 backend 内的异步操作，`BM_IO_IN_PROGRESS` 暂不用于 local buffer。
+
+但 local AIO 仍需要 pin，仍需要在 completion 时设置 `BM_VALID` 或 `BM_IO_ERROR`。
+
+稳定语义是：
+
+```text
+I/O 期间 buffer identity 必须稳定；
+同一个 buffer 的 invalid-to-valid 转换必须只有一个 owner；
+完成后才能发布 valid 或 error。
+```
+
+具体 shared/local 等待实现可以不同。
+
+## 8. 异常：等待、ERROR 和错误用法
+
+异常路径一：已有 I/O，但 wait reference 尚未发布。
+
+owner 已设置 `BM_IO_IN_PROGRESS`，AIO staging 还没把 `io_wref` 写入 `BufferDesc`。
+
+另一个 backend 这时无法异步加入具体 handle。
+
+如果它允许等待，`StartSharedBufferIO()` 会先提交本 backend 已 staged 的 I/O，再进入 `WaitIO()`。
+
+`WaitIO()` 循环：
+
+```text
+准备睡眠
+  -> 在 header state 下读取 BM_IO_IN_PROGRESS 和 io_wref
+  -> 已结束：退出
+  -> 有 io_wref：等待 AIO handle
+  -> 无 io_wref：睡 buffer I/O condition variable
+  -> 醒来重新检查
+```
+
+这避免错过 owner 在检查与睡眠之间发出的 broadcast。
+
+异常路径二：foreign I/O 失败。
+
+等待 foreign I/O 的 backend 没有资格把别人的底层 result 当成自己的最终结果。
+
+它等待结束后检查 `BM_VALID`。
+
+如果仍 invalid，`WaitReadBuffers()` 不推进完成位置，而是重新调用 `AsyncReadBuffers()`。
+
+于是新的 backend 可以成为 owner 并重试。
+
+异常路径三：I/O owner 在正常 terminate 前 ERROR。
+
+成功设置 `BM_IO_IN_PROGRESS` 后，shared buffer I/O 被记入 `CurrentResourceOwner`。
+
+在 ownership 尚未转交 AIO 时，如果 ERROR 跳过正常完成路径，resource owner callback 调用：
+
+```text
+AbortBufferIO()
+```
+
+它保守地把本轮标为 `BM_IO_ERROR`，再通过 `TerminateBufferIO()`：
+
+```text
+清 BM_IO_IN_PROGRESS
+  -> 保持 page invalid 或 dirty 状态
+  -> 广播等待者
+```
+
+这保证等待者不依赖 owner 正常返回。
+
+没有这条路径，一个 ERROR 就可能留下永久的 `BM_IO_IN_PROGRESS`，所有后续 backend 都会等待一个已经不存在的 owner。
+
+异常路径四：ownership 已转交 AIO 后，原 backend ERROR。
+
+这时 AIO 子系统自己的 pin 保护 buffer。
+
+completion 可以在合适的执行者中继续完成验证和 `TerminateBufferIO()`，不依赖原 backend 的普通 pin。
+
+这就是 `buffer_stage_common()` 转移 ownership 的意义。
+
+异常路径五：底层返回 partial read。
+
+`md_readv_complete()` 可以把结果标为 partial。
+
+`ProcessReadBuffersResult()` 推进已完成 block 数，`WaitReadBuffers()` 对剩余 blocks 重试。
+
+因此：
+
+```text
+一次 ReadBuffersOperation
+```
+
+不保证只对应：
+
+```text
+一次底层 readv
+```
+
+异常路径六：文件读成功但 page verification 失败。
+
+completion 在设置 `BM_VALID` 前执行 `PageIsVerified()`。
+
+不能修复或清零时：
+
+```text
+BM_VALID 保持 0
+BM_IO_ERROR 设置为 1
+BM_IO_IN_PROGRESS 清为 0
+```
+
+等待者醒来后必须走失败或重试逻辑，不能访问该 page。
+
+异常路径七：把 `BM_IO_ERROR` 当永久故障锁。
+
+`BM_IO_ERROR` 记录最近一次失败。
+
+它不会阻止 `StartSharedBufferIO()` 在 page invalid 且当前无 active I/O 时认领重试。
+
+真正决定 input 是否 already done 的是 `BM_VALID`。
+
+异常路径八：把 `found=false` 当作“我一定负责读”。
+
+多个 backend 都可能从 `BufferAlloc()` 得到同一个 pinned、invalid buffer，并都看到 `found=false`。
+
+只有拿到 `BUFFER_IO_READY_FOR_IO` 的 backend 才是 owner。
+
+其他 backend 不能直接调用 storage manager 读入 page。
+
+异常路径九：等待结束后直接访问 page。
+
+不论等待的是 buffer CV 还是 AIO wait reference，都要重新检查 `BM_VALID` 或 read operation result。
+
+“I/O 不再进行”可能表示成功，也可能表示失败。
+
+异常路径十：把 content lock 当 I/O completion。
+
+持有 exclusive content lock 不会自动设置 `BM_VALID`，也不会清 `BM_IO_IN_PROGRESS` 或唤醒 I/O waiters。
+
+反过来，page 读成功并设置 `BM_VALID`，也不意味着调用者自动持有 content lock。
+
+异常路径十一：在设置 `BM_IO_IN_PROGRESS` 后做长时间无关工作。
+
+从 ownership 发布到 `smgrstartreadv()` 之间，其他 backend 已经会等待。
+
+这段路径应尽量短。
+
+如果要增加日志、统计或资源获取，应先判断它是否可能阻塞，以及能否移到 ownership 之前或 I/O 提交之后。
+
+排查读 I/O 协议时，按以下顺序问：
+
+```text
+目标 tag 是否已经在 mapping table 中？
+当前 buffer 是否 pinned？
+BM_VALID 是否已经设置？
+BM_IO_IN_PROGRESS 是否已有 owner？
+当前调用者拿到哪个 StartBufferIOResult？
+等待的是 io_wref 还是 buffer I/O CV？
+completion 最终设置了 BM_VALID 还是 BM_IO_ERROR？
+ERROR 时 ownership 仍在 ResourceOwner，还是已经转交 AIO？
+等待者醒来后是否重新检查了状态？
+```
+
+这比从“磁盘是不是慢”开始排查更接近真实协议。
+
+## 9. 诊断与实验
+
+本节可观测的 runtime truth 是：
+
+```text
+BufferIO 等待只说明某个 shared buffer 的 I/O 尚未结束；
+它不直接说明这是读还是写，也不说明最终一定成功。
+```
+
+能直接观察：
+
+- `pg_stat_activity.wait_event = 'BufferIO'`：backend 正在等待 buffer 的 I/O 状态变化。
+- `AioIoCompletion`：backend 正在等待 AIO completion；具体名称以本基线的 wait event 定义为准。
+- `DataFileRead`：更低层的 relation data file read 等待。
+- `pg_stat_io`：按 backend type、object、context 观察 read 次数、字节和时间。
+- `EXPLAIN (ANALYZE, BUFFERS)`：观察 query 级 shared hit/read，但看不到具体 `BM_IO_IN_PROGRESS` ownership。
+- gdb：直接查看 `BufferDesc.state`、`io_wref` 和 `StartSharedBufferIO()` 返回值。
+- buffer/smgr tracepoints：连接 buffer read start/done 与 md read start/done。
+
+只能结合源码或 instrumentation 推断：
+
+- 哪个 backend 最先安装 tag，哪个 backend 最终成为 I/O owner。
+- 等待者是加入了现有 `io_wref`，还是落入 buffer condition variable。
+- 某次 shared read 是首次 miss、foreign I/O 后的重试，还是 partial read 的后续片段。
+- 短暂 `BM_IO_ERROR` 曾存在多久。
+- 同一 block 的竞争是否来自并发 scan、read-ahead 重叠，还是失败重试。
+
+诊断时不要过度解释单个指标。
+
+`shared_blks_read` 增加表示当前 backend 发起了物理读计数，不表示每个等待者都重复读了一次。
+
+等待 foreign I/O 成功的 backend 会把自己的结果按 hit 跟踪，而真正 owner 记录 read。
+
+`BufferIO` 也可能来自 buffer 写出，因为 `BM_IO_IN_PROGRESS` 和 I/O condition variable 同时服务读写。
+
+实验 1：按状态变化跟读源码。
+
+在 `/home/highgo/postgres` 中确认课程基线：
 
 ```bash
-rg -n "BM_VALID|BM_IO_IN_PROGRESS|BM_IO_ERROR|StartBufferIOResult" \
+git rev-parse --abbrev-ref HEAD
+git rev-parse HEAD
+```
+
+定位状态和枚举：
+
+```bash
+rg -n "BM_TAG_VALID|BM_VALID|BM_IO_IN_PROGRESS|BM_IO_ERROR|StartBufferIOResult" \
   src/include/storage/buf_internals.h
 ```
 
-定位 smgr/md 读：
+定位主状态机：
 
 ```bash
-rg -n "smgrreadv|smgrstartreadv|mdreadv|mdstartreadv|md_readv_complete" \
-  src/backend/storage/smgr src/backend/storage/buffer
+rg -n "BufferAlloc\\(|StartSharedBufferIO\\(|WaitIO\\(|TerminateBufferIO\\(|AbortBufferIO\\(" \
+  src/backend/storage/buffer/bufmgr.c
 ```
 
-第一遍跟读建议按这个顺序：
-`buf_init.c` 的 buffer lookup 注释。
-`buf_internals.h` 的 flag 定义。
-`ReadBuffer_common()`。
-`PinBufferForBlock()`。
-`BufferAlloc()`。
-`StartReadBuffersImpl()`。
-`AsyncReadBuffers()`。
-`StartSharedBufferIO()`。
-`WaitIO()`。
-`TerminateBufferIO()`。
-`buffer_readv_complete_one()`。
-`WaitReadBuffers()`。
-`smgrstartreadv()`。
-`mdstartreadv()`。
-`md_readv_complete()`。
-第二遍跟读时，不要按函数出现顺序读。
-按状态变化读。
-先找谁设置 `BM_TAG_VALID`。
-再找谁设置 `BM_IO_IN_PROGRESS`。
-再找谁设置 `BM_VALID`。
-再找谁设置 `BM_IO_ERROR`。
-最后找谁清掉这些位。
+不要先按函数的文件位置顺读。
 
-## 26. 实验 2：画状态转移表
+按以下四次搜索跟状态：
 
-准备一张表，列为：
-场景。
-函数。
-进入状态。
-动作。
-退出状态。
-等待者如何继续。
-第一行写新 block miss。
-函数是 `BufferAlloc()`。
-进入状态是 mapping table 无 tag。
-动作是选择 victim、插入 tag、设置 `BM_TAG_VALID`。
-退出状态是 tag valid 但 page invalid。
-等待者如果此时进入，可以找到同一个 tag。
-第二行写 read owner 认领。
-函数是 `StartSharedBufferIO()`。
-进入状态是 `BM_VALID=0` 且 `BM_IO_IN_PROGRESS=0`。
-动作是设置 `BM_IO_IN_PROGRESS`。
-退出状态是 I/O in progress。
-等待者会进入 join 或 sleep。
-第三行写 read success。
-函数是 `buffer_readv_complete_one()` 加 `TerminateBufferIO()`。
-进入状态是 I/O in progress。
-动作是验证 page，设置 `BM_VALID`，清 `BM_IO_IN_PROGRESS`。
-退出状态是 valid。
-等待者把它作为 hit。
-第四行写 read failure。
-动作是设置 `BM_IO_ERROR`，不设置 `BM_VALID`。
-等待者 retry。
-第五行写 retry success。
-动作是新 backend 再次 `StartSharedBufferIO()`，然后 `TerminateBufferIO(..., BM_VALID, ...)`。
-退出状态是 `BM_IO_ERROR=0` 且 `BM_VALID=1`。
-这张表要自己手写。
-手写的价值在于确认 `BM_IO_ERROR` 不阻止 `StartSharedBufferIO()`。
-它只是前一次失败的痕迹。
+```text
+谁设置 BM_TAG_VALID？
+谁设置 BM_IO_IN_PROGRESS？
+谁设置 BM_VALID？
+谁清 BM_IO_IN_PROGRESS 并广播？
+```
 
-## 27. 实验 3：两个 backend 同读
+观察结果：
 
-目标是观察“两个 session 同读同一冷 block”时，为什么只会有一个 buffer tag。
-可选方法一是用 gdb 或 rr。
-在一个 debug build 上给以下函数打断点：
+- `BufferAlloc()` 安装 identity，不读 page。
+- `StartSharedBufferIO()` 认领 I/O，不发布 valid。
+- completion 决定 `BM_VALID` 或 `BM_IO_ERROR`。
+- `TerminateBufferIO()` 统一结束 ownership 并唤醒等待者。
+
+实验 2：观察两个 backend 同读一个冷 block。
+
+目标不是证明每次都能看到某个 wait event，而是确认：
+
+```text
+两个 backend pin 到同一个 BufferDesc；
+只有一个 backend 拿到 BUFFER_IO_READY_FOR_IO。
+```
+
+debug build 中可设置断点：
 
 ```gdb
 break BufferAlloc
 break StartSharedBufferIO
 break WaitIO
-break TerminateBufferIO
 break buffer_readv_complete_one
+break TerminateBufferIO
 ```
 
-让 session A 执行一个会读冷数据页的查询。
-在 A 命中 `StartSharedBufferIO()` 并设置 `BM_IO_IN_PROGRESS` 后停住。
-让 session B 执行相同查询。
-观察 B 是否在 `BufferAlloc()` 中找到 existing tag。
-继续观察 B 的 `StartSharedBufferIO()` 返回值。
-如果 AIO wait reference 已经就绪，B 会拿到 `BUFFER_IO_IN_PROGRESS`。
-如果窗口较早，B 可能进入 `WaitIO()`。
-这个实验的重点不是稳定复现某个等待事件。
-重点是看到 B 不会分配另一个 buffer。
-可选方法二是加临时 instrumentation。
-只在本地实验分支加日志，不要提交到课程文件。
-在 `StartSharedBufferIO()` 的三个返回点打 `elog(LOG, ...)`。
-分别记录 buffer id、blockNum、返回值、flags。
-用很小的 `shared_buffers` 和两个并发顺序扫描制造 miss。
-观察同一 block 的返回值变化。
-如果不想改源码，可以使用 DTrace/SystemTap/eBPF tracepoints。
-源码中有 `TRACE_POSTGRESQL_BUFFER_READ_START` 和 `TRACE_POSTGRESQL_BUFFER_READ_DONE`。
-也有 `TRACE_POSTGRESQL_SMGR_MD_READ_START` 和 DONE。
-跟踪同一 relfilenode block 是否出现重复底层 read。
-注意并发场景和 read-ahead 会让输出顺序不完全线性。
+准备一张足够大的表，用较小 `shared_buffers` 或扫描其他数据把目标 block 变冷。
 
-## 28. 常见误区
+session A 读取目标范围，并在 `StartSharedBufferIO()` 认领后暂停。
 
-误区一：`BM_TAG_VALID` 等同于 `BM_VALID`。
-不是。
-`BM_TAG_VALID` 表示 mapping table 中这个 buffer 代表某个 block。
-`BM_VALID` 表示 buffer 内容可读。
-read miss 后，tag 会先 valid，但内容还 invalid。
-误区二：`foundPtr=false` 只表示没有找到 buffer。
-不是。
-`BufferAlloc()` 找到 existing tag 但 `BM_VALID=0` 时，也返回 `foundPtr=false`。
-调用者必须进入 I/O 协议。
-误区三：`BM_IO_ERROR` 会阻止后续读。
-不是。
-它记录前一次失败。
-后续 `StartSharedBufferIO()` 只关心是否 already done。
-对读来说 already done 是 `BM_VALID=1`。
-只要 `BM_VALID=0` 且没有 active I/O，就可以重试。
-误区四：等待者被唤醒后一定能访问 page。
-不是。
-等待者醒来后必须重新检查 `BM_VALID`。
-如果 foreign I/O 失败，page 仍 invalid。
-等待者会 retry，而不是访问内容。
-误区五：zero-and-lock 不做磁盘 I/O，所以不需要 `BM_IO_IN_PROGRESS`。
-不是。
-它也在把 invalid buffer 转成 valid buffer。
-这段期间其他 backend 必须按 I/O 协议等待。
-误区六：extend 只要 `smgrzeroextend()` 成功就行。
-不是。
-必须先把即将新增的 blocks 放进 buffer table，并设置 I/O in progress。
-否则文件变大到 buffer table 可见之间有竞态窗口。
-误区七：condition variable 是唯一等待机制。
-不是。
-当前源码里，如果有 AIO wait reference，会优先 `pgaio_wref_wait()`。
-只有没有 wait reference 时才睡 buffer 的 I/O condition variable。
+session B 读取相同范围。
 
-## 29. 一页读入的最小伪代码
+观察：
 
-下面伪代码不是源码翻译，而是抽取协议骨架。
+- B 的 `BufferAlloc()` 是否命中 A 安装的 tag。
+- A、B 的 buffer id 是否相同。
+- B 的 `StartSharedBufferIO()` 是返回 `BUFFER_IO_IN_PROGRESS`，还是进入 `WaitIO()`。
+- A 完成后，B 是否重新检查 `BM_VALID`。
 
-```c
-buf = BufferAlloc(tag, &found);
-if (found)
-    return pinned_valid_buffer;
-status = StartBufferIO(buf, true, true, &wref);
-if (status == BUFFER_IO_ALREADY_DONE)
-    return pinned_valid_buffer;
-if (status == BUFFER_IO_IN_PROGRESS)
-{
-    wait(wref or BufferIOCV);
-    if (buf is valid)
-        return pinned_valid_buffer;
-    else
-        retry;
-}
-if (status == BUFFER_IO_READY_FOR_IO)
-{
-    smgrstartreadv(...);
-    wait own io;
-    completion sets BM_VALID or BM_IO_ERROR;
-    if success
-        return pinned_valid_buffer;
-    else
-        throw or retry depending on caller/result path;
-}
+AIO staging 很快，`WaitIO()` 的窄窗口不一定稳定复现。
+
+复现不到 `BufferIO` 不代表协议不存在。B 可能直接取得 `io_wref` 并等待 `AioIoCompletion`，也可能在运行到该点前 A 已经完成。
+
+实验 3：手工推演失败与重试。
+
+先写下初始状态：
+
+```text
+TAG_VALID=1
+VALID=0
+IO_IN_PROGRESS=1
+IO_ERROR=0
 ```
 
-真实源码更复杂。
-它要处理 readv 合并。
-它要处理 AIO handle 生命周期。
-它要处理 partial reads。
-它要处理 checksum 和 page verification。
-它要处理 local buffers。
-它要处理 resource owner cleanup。
-但核心状态机就是这几步。
+然后分别推演：
 
-## 30. 讨论题
+```text
+读成功
+读 syscall 失败
+page verification 失败
+foreign I/O 失败后另一个 backend 重试成功
+owner 在 ownership 转交 AIO 前 ERROR
+```
 
-1. 为什么 `BufferAlloc()` 可以在 page 内容还没有读入时先把 tag 放进 buffer table？
-2. `BM_TAG_VALID=1`、`BM_VALID=0`、`BM_IO_IN_PROGRESS=0`、`BM_IO_ERROR=1` 这组状态对下一次读意味着什么？
-3. 为什么等待者被唤醒后不能假设 page 已经可读，而必须重新检查 `BM_VALID`？
-4. 如果读 owner 在 `smgrstartreadv()` 之后 ERROR，哪个 cleanup 路径负责清 `BM_IO_IN_PROGRESS`？
-5. `WaitIO()` 等 condition variable 与等 AIO wait reference 的语义差异是什么？
-6. 为什么 zero-and-lock 没有真实磁盘读，仍然复用 `StartSharedBufferIO(..., forInput=true, ...)`？
-7. SQL 层看到 `wait_event = BufferIO` 时，哪些事实可以直接判断，哪些只能通过断点或 tracepoint 推断？
-8. 如果要改 `mdstartreadv()` 的 partial read 行为，你需要回到 `WaitReadBuffers()` 核对哪两个 retry 假设？
+期望状态：
 
-## 31. 本节小结
+| 场景 | 结束状态 | 等待者下一步 |
+| --- | --- | --- |
+| 读成功 | `VALID=1, IO_IN_PROGRESS=0, IO_ERROR=0` | 使用 page。 |
+| 读失败 | `VALID=0, IO_IN_PROGRESS=0, IO_ERROR=1` | 报错或重试。 |
+| foreign 读失败 | 同上 | 当前 backend 再次竞争 ownership。 |
+| 重试成功 | `VALID=1, IO_IN_PROGRESS=0, IO_ERROR=0` | 使用 page。 |
+| owner 提前 ERROR | `AbortBufferIO()` 清 in-progress 并设置 error | 等待者被唤醒，不永久睡眠。 |
 
-PostgreSQL 读 shared buffer 的核心不是“读磁盘”本身。
-核心是先建立唯一 buffer 身份，再用状态位协调谁读、谁等、谁重试。
-`BM_TAG_VALID` 让其他 backend 能找到同一个 buffer。
-`BM_IO_IN_PROGRESS` 给一个 backend 独占 I/O 权限，并让其他 backend 等待或加入。
-`BM_VALID` 是读者可以访问页面内容的门槛。
-`BM_IO_ERROR` 是失败痕迹，不是永久禁止重试的锁。
-`StartSharedBufferIO()` 是状态机入口。
-它要么发现已经完成，要么发现正在进行，要么把当前 backend 变成 I/O owner。
-`WaitIO()` 和 `WaitReadBuffers()` 是等待层。
-前者等待单个 buffer 的 in-progress 位清除。
-后者等待 read operation 完成，并处理 foreign I/O、partial read 和 retry。
-`TerminateBufferIO()` 是正常完成和失败完成的统一出口。
-它必须广播 condition variable。
-`AbortBufferIO()` 是异常路径保险丝。
-它保证 ERROR 发生后等待者不会永久睡眠。
-zero-and-lock 不读磁盘，但仍然需要 I/O 协议。
-因为它也把 invalid buffer 变成 valid page。
-extend 场景也需要 I/O 协议。
-因为文件变大前必须先让即将新增的 blocks 在 buffer table 中可见，并阻止别人抢读。
-`smgrreadv/mdreadv` 是真正文件读的下层。
-当前异步读的 partial/error 需要 buffer manager 的 retry 和 reporting 配合。
-理解这一节后，再看 checkpoint 写回、buffer replacement、read stream readahead，会更容易判断哪些代码是在做 I/O，哪些代码是在维护 buffer pool 的并发一致性。
+这个练习的重点是确认：
+
+```text
+清 BM_IO_IN_PROGRESS
+```
+
+不等于：
+
+```text
+设置 BM_VALID
+```
+
+实验 4：检查 zero-and-lock 的发布顺序。
+
+定位：
+
+```bash
+rg -n "ZeroAndLockBuffer|StartSharedBufferIO|TerminateBufferIO" \
+  src/backend/storage/buffer/bufmgr.c
+```
+
+确认 invalid buffer 的顺序：
+
+```text
+取得 input ownership
+  -> 清零 page
+  -> 获取 exclusive content lock
+  -> 设置 BM_VALID 并唤醒等待者
+```
+
+然后回答：
+
+```text
+为什么 content lock 必须在 BM_VALID 之前取得？
+```
+
+答案不是“保护 memset 不被并发执行”这么简单。
+
+I/O ownership 已经保证只有一个 backend 清零。content lock 的作用是：page 一旦被发布为 valid，仍不允许其他访问者在调用者完成初始化前看到它。
+
+常见误区：
+
+- 把 `BM_TAG_VALID` 当成 `BM_VALID`。
+- 把 `found=false` 当成纯 mapping miss。
+- 认为安装 tag 的 backend 一定是 I/O owner。
+- 认为等待结束就表示读成功。
+- 认为 `BM_IO_ERROR` 会永久阻止重试。
+- 认为 AIO completion 可以只依赖发起 backend 的普通 pin。
+- 认为 zero-and-lock 没有真实磁盘 I/O，所以不需要 I/O ownership。
+- 认为 content lock 能代替 `BM_IO_IN_PROGRESS`。
+- 认为 `BufferIO` wait event 一定是磁盘读慢。
+
+## 10. 讨论题
+
+1. 为什么 `BufferAlloc()` 必须先设置 `BM_TAG_VALID`，却不能同时设置 `BM_VALID`？
+2. 两个 backend 都从 `BufferAlloc()` 得到 `found=false` 时，什么机制保证只有一个 backend 发起实际读？
+3. `BUFFER_IO_ALREADY_DONE` 与 `BUFFER_IO_IN_PROGRESS` 为什么不能合并成同一个返回值？
+4. 等待 foreign I/O 的 backend 被唤醒后，为什么必须检查 `BM_VALID`？
+5. `BM_IO_ERROR=1`、`BM_VALID=0`、`BM_IO_IN_PROGRESS=0` 对下一次读意味着什么？
+6. AIO 子系统为什么要取得额外 pin，并在 staging 后接管 I/O ownership？
+7. `ZeroAndLockBuffer()` 为什么先拿 exclusive content lock，再发布 `BM_VALID`？
+8. 看到 `wait_event = BufferIO` 时，哪些事实可以直接判断，哪些仍需结合 buffer state、I/O statistics 或断点？
+
+## 11. 本节小结
+
+本节核心链路是：
+
+```text
+BufferAlloc()
+  -> 安装或找到唯一 BufferTag
+  -> pin buffer
+  -> StartBufferIO()
+  -> join / wait / become owner
+  -> smgr/md/AIO read
+  -> page verification
+  -> TerminateBufferIO()
+  -> valid 或 error
+  -> wake and recheck
+```
+
+核心状态是：
+
+- `BM_TAG_VALID`：buffer identity 已经进入 mapping protocol。
+- `BM_IO_IN_PROGRESS`：当前有唯一 shared buffer I/O owner。
+- `BM_VALID`：page contents 可以被正常访问。
+- `BM_IO_ERROR`：最近一轮 I/O 失败，后续仍可重试。
+- `io_wref`：AIO-aware 等待者加入已有 operation。
+- buffer I/O condition variable：等待 `BM_IO_IN_PROGRESS` 发生变化。
+- caller/AIO pin：I/O 期间稳定 buffer slot identity 和 memory lifetime。
+
+ownership 规则是：
+
+```text
+安装 tag 不等于拥有 I/O；
+found=false 不等于必须由我读取；
+只有 BUFFER_IO_READY_FOR_IO 才授予 I/O ownership；
+取得 ownership 后必须 terminate，ERROR 时必须 abort；
+AIO staging 后由 AIO pin 和 completion 接管生命周期。
+```
+
+等待规则是：
+
+```text
+已有 io_wref 就加入具体 AIO；
+没有 io_wref 时可以等待 buffer I/O condition variable；
+无论等哪一种，醒来后都必须重新检查；
+只有 BM_VALID 才代表 input operation 成功。
+```
+
+失败规则是：
+
+```text
+失败时保持 page invalid；
+设置 BM_IO_ERROR；
+清 BM_IO_IN_PROGRESS；
+唤醒所有等待者；
+允许后续 backend 重新认领并重试。
+```
+
+可迁移规律：
+
+```text
+共享缓存填充通常需要三阶段发布：
+先发布唯一 identity，
+再发布单一 initializer ownership，
+最后发布 initialized/valid 状态。
+```
+
+这条规律不只适用于 PostgreSQL buffer manager。
+
+任何“先注册对象、后台填充内容、并发读者等待”的共享缓存，都必须把：
+
+```text
+对象存在
+正在初始化
+初始化成功
+初始化失败
+```
+
+分成可检查、可等待、可清理的不同状态。
